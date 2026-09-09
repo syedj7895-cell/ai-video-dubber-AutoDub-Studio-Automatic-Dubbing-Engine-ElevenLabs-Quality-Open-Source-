@@ -272,11 +272,11 @@ def _checklist(items: dict) -> str:
 
 
 def _fp(f):
-    """Gradio File value → local path string (handles str / object / None)."""
+    """Gradio File value → plain builtin str path (NamedString-safe)."""
     if f is None:
         return None
     if isinstance(f, str):
-        return f or None
+        return str(f) or None          # NamedString → plain builtin str
     for attr in ("name", "path"):
         p = getattr(f, attr, None)
         if p:

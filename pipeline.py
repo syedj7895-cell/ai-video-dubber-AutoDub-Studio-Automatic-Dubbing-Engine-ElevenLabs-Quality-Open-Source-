@@ -816,6 +816,7 @@ def run_import_and_analysis(media_path: str,
     """TAB 1 · Steps 1–2: extract audio → Demucs vocal/music split."""
     log = Log()
     state = PipelineState.load()
+    media_path = str(media_path)      # Gradio may hand us NamedString
     src_name = Path(media_path).name
     try:
         yield log("═" * 62)
@@ -858,6 +859,9 @@ def run_script_matching(hf_token: Optional[str],
     """TAB 2 · Steps 3–5: diarization → emotion scan → script assembly."""
     log = Log()
     state = PipelineState.load()
+    hf_token = str(hf_token) if hf_token else ""        # NamedString-safe
+    original_srt_path = str(original_srt_path) if original_srt_path else None
+    translated_srt_path = str(translated_srt_path) if translated_srt_path else None
     try:
         yield log("═" * 62)
         yield log(" 🧬 TAB 2 · SCRIPT MATCHING & ASSEMBLY — steps 3 · 4 · 5")

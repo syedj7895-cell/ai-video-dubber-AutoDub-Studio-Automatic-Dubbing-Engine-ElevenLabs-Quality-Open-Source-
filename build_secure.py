@@ -71,7 +71,12 @@ def main() -> int:
             [ext],
             compiler_directives={
                 "language_level": "3",
-                "binding": False,        # leaner, harder to introspect
+                "binding": False,          # leaner, harder to introspect
+                "annotation_typing": False,  # CRITICAL: the binary must behave
+                                             # EXACTLY like the Python module —
+                                             # never enforce `str`-style type
+                                             # annotations (Gradio passes
+                                             # NamedString, a str subclass)
                 "boundscheck": False,
                 "wraparound": False,
             },
