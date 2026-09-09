@@ -567,7 +567,7 @@ def build_ui() -> gr.Blocks:
                 script_df = gr.DataFrame(
                     headers=["#", "Start", "End", "Speaker", "Emotion",
                              "Translated line", "Original line"],
-                    interactive=False, wrap=True, max_height=420,
+                    interactive=False,
                     elem_classes=["glass"])
                 with gr.Row():
                     with gr.Column(elem_classes=["glass", "pad"]):
