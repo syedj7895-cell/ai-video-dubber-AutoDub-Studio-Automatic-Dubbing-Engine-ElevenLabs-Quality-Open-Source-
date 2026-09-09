@@ -1,0 +1,11 @@
+# ══════════════════════════════════════════════════════════════════
+#  AUTO-DUB STUDIO · remote Colab tunnel address (desktop bridge)
+# ══════════════════════════════════════════════════════════════════
+#  1 ▸ start your Colab runtime (python app.py) and copy the public
+#     URL it prints, e.g.  https://a1b2c3d4e5.gradio.live
+#  2 ▸ paste that URL on a NEW line below (replace the example line)
+#  3 ▸ save this file, then double-click  Launcher.bat (Windows)
+#     or  Launcher.command (macOS) — your browser opens when the
+#     tunnel answers. That's it.
+# ══════════════════════════════════════════════════════════════════
+https://REPLACE-ME.gradio.live

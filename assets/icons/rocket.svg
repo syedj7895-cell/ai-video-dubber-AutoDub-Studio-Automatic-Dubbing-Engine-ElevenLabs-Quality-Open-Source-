@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="url(#g-rocket)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <defs>
+    <linearGradient id="g-rocket" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3d519c"/>
+      <stop offset="1" stop-color="#7fa0e6"/>
+    </linearGradient>
+  </defs>
+  <path d="M12 2.8c3.3 1.9 5.2 5.3 5.2 9.1l-2.6 2.6H9.4l-2.6-2.6c0-3.8 1.9-7.2 5.2-9.1z"/>
+  <circle cx="12" cy="9.8" r="1.9"/>
+  <path d="M8.3 14.9l-2.1 4.3 3.2-1.2"/>
+  <path d="M15.7 14.9l2.1 4.3-3.2-1.2"/>
+  <path d="M12 15.6v5.6"/>
+</svg>

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime artifacts (user media, model outputs, pipeline state)
+uploads/
+outputs/
+
+# Gradio temp
+.gradio/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
