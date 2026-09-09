@@ -167,6 +167,25 @@ def clear_gpu_cache(*models) -> str:
     return msg
 
 
+def _torchaudio_compat() -> None:
+    """
+    Bleeding-edge torchaudio (≥ 2.9 — Colab's default) removed the deprecated
+    `set_audio_backend` / `list_audio_backends` APIs that some audio/ML
+    libraries still call at import time (e.g. pyannote's dependency chain).
+    Install harmless no-op shims so those code paths keep working with the
+    modern auto-backend loader. Idempotent — safe to call before every
+    heavy import.
+    """
+    try:
+        import torchaudio
+    except ImportError:
+        return
+    if not hasattr(torchaudio, "set_audio_backend"):
+        torchaudio.set_audio_backend = lambda *a, **k: None
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+
 def log_memory() -> str:
     """One-line VRAM / device report for the pipeline console."""
     try:
@@ -523,7 +542,7 @@ def step3_diarization(hf_token: Optional[str],
 
     try:
         import torch
-        from pyannote.audio import Pipeline
+        import torchaudio
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
@@ -531,6 +550,14 @@ def step3_diarization(hf_token: Optional[str],
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  then  "
             "pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
+    _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9 BEFORE pyannote
+    try:
+        from pyannote.audio import Pipeline
+    except ImportError as e:
+        missing = getattr(e, "name", None) or str(e)
+        raise RuntimeError(
+            f"Step 3 needs the ML stack — module '{missing}' is not installed here. "
+            "Fix:  pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log(f"🧠 Loading Pyannote 3.1 · {PYANNOTE_MODEL} · device={device}")
@@ -646,7 +673,7 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
 
     try:
         import torch
-        from funasr import AutoModel
+        import torchaudio
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
@@ -654,6 +681,14 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  then  "
             "pip install funasr modelscope  ·  Or run on Google Colab (T4).") from e
+    _torchaudio_compat()   # shim removed APIs before funasr's import chain
+    try:
+        from funasr import AutoModel
+    except ImportError as e:
+        missing = getattr(e, "name", None) or str(e)
+        raise RuntimeError(
+            f"Step 4 needs the ML stack — module '{missing}' is not installed here. "
+            "Fix:  pip install funasr modelscope  ·  Or run on Google Colab (T4).") from e
 
     diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
     cues = diar["cues"]
@@ -1068,6 +1103,7 @@ def _ensure_prompt_transcripts(log: Log) -> Dict[str, str]:
 
     log("🈳 Transcribing clone prompts for zero-shot conditioning (SenseVoice) …")
     import torch
+    _torchaudio_compat()
     from funasr import AutoModel
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModel(model=SENSEVOICE_MODEL, vad_model="fsmn-vad",
