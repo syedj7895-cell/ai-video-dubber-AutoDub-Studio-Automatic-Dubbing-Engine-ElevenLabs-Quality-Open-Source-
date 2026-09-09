@@ -16,7 +16,7 @@ demucs>=4.0.1                # Step 2 · Meta Demucs v4 vocal separation
 pyannote.audio~=3.1.0        # Step 3 · Pyannote 3.1 speaker diarization
 funasr>=1.1.4                # Step 4 · SenseVoice-Small emotion engine
 modelscope>=1.17.0           # model hub used by FunASR downloads
-huggingface_hub>=0.20,<0.25  # Pyannote 3.1 needs legacy use_auth_token API (removed in ≥0.25)
+huggingface_hub>=0.25        # Gradio 6.x requires ≥0.25; Pyannote works via _hf_hub_compat() patch
 
 # ── Media & data glue ───────────────────────────────────────────────
 numpy
