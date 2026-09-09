@@ -86,6 +86,18 @@ SENSEVOICE_EMO_MAP = {
 LANG_MAP = {"zh": "Chinese", "en": "English", "yue": "Cantonese",
             "ja": "Japanese", "ko": "Korean"}
 
+# Dubbing languages offered in the UI · (code, label) — consumed by Steps 4 & 7
+DUBBING_LANGUAGES = [
+    ("auto", "🌐 Auto-detect"),
+    ("en", "English"),
+    ("hi", "हिन्दी · Hindi"),
+    ("es", "Español · Spanish"),
+    ("zh", "中文 · Chinese"),
+    ("yue", "粵語 · Cantonese"),
+    ("ja", "日本語 · Japanese"),
+    ("ko", "한국어 · Korean"),
+]
+
 # CosyVoice-3 friendly instruct hints (consumed by the later TTS phase)
 EMOTION_INSTRUCT = {
     "happy": "in a happy, upbeat tone",
@@ -184,6 +196,30 @@ def _torchaudio_compat() -> None:
         torchaudio.set_audio_backend = lambda *a, **k: None
     if not hasattr(torchaudio, "list_audio_backends"):
         torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+
+def _numpy2_compat() -> None:
+    """
+    NumPy 2.0 removed legacy aliases (np.NaN, np.float_, …) that older ML
+    libraries in our stack still reference. Reinstall them on the shared
+    numpy module so pyannote/funasr keep working on Colab's NumPy 2.x.
+    Idempotent — only adds aliases that are actually missing.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    aliases = {
+        "NaN": np.nan, "NAN": np.nan,
+        "Inf": np.inf, "Infinity": np.inf, "PINF": np.inf, "NINF": -np.inf,
+        "float_": np.float64, "complex_": np.complex128,
+        "string_": np.bytes_, "unicode_": np.str_,
+        "bool8": np.bool_, "int0": np.intp, "uint0": np.uintp,
+        "object0": np.object_,
+    }
+    for name, value in aliases.items():
+        if not hasattr(np, name):
+            setattr(np, name, value)
 
 
 def log_memory() -> str:
@@ -551,6 +587,7 @@ def step3_diarization(hf_token: Optional[str],
             "--index-url https://download.pytorch.org/whl/cpu  then  "
             "pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
     _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9 BEFORE pyannote
+    _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
     try:
         from pyannote.audio import Pipeline
     except ImportError as e:
@@ -682,6 +719,7 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
             "--index-url https://download.pytorch.org/whl/cpu  then  "
             "pip install funasr modelscope  ·  Or run on Google Colab (T4).") from e
     _torchaudio_compat()   # shim removed APIs before funasr's import chain
+    _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
     try:
         from funasr import AutoModel
     except ImportError as e:
@@ -692,6 +730,9 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
 
     diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
     cues = diar["cues"]
+    asr_language = (PipelineState.load().artifacts.get("source_lang")
+                    or "auto")
+    log(f"🌐 ASR / emotion-scan language: {asr_language}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log(f"🧠 Loading SenseVoice-Small · {SENSEVOICE_MODEL} · device={device}")
@@ -720,7 +761,7 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
         else:
             try:
                 res = model.generate(input=seg, cache={},
-                                     language="auto", use_itn=False,
+                                     language=asr_language, use_itn=False,
                                      merge_vad=False)
                 raw = res[0].get("text", "") if res else ""
                 tags = tag_re.findall(raw)
@@ -799,6 +840,8 @@ def step5_assemble_script(translated_srt_path: str,
     emotions = {g["index"]: g for g in
                 json.loads(EMOTION_GRID_JSON.read_text(encoding="utf-8"))}
     speakers_info = diar.get("speakers", {})
+    target_language = (PipelineState.load().artifacts.get("target_lang")
+                       or "en")
 
     n = len(o_cues)
     log(f"🧩 Aligning {len(t_cues)} translated cues ⇄ {n} analysed cues …")
@@ -830,6 +873,7 @@ def step5_assemble_script(translated_srt_path: str,
             "emotion": emotion,
             "instruct": EMOTION_INSTRUCT.get(emotion, "in a calm, neutral tone"),
             "language": g.get("language", "en"),
+            "target_language": target_language,
             "clone_prompt": prompts[0] if prompts else "",
             "original_text": oc.get("text", ""),
             "translated_text": tc["text"],
@@ -847,7 +891,9 @@ def step5_assemble_script(translated_srt_path: str,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_import_and_analysis(media_path: str,
-                            force: bool = False) -> Generator[str, None, None]:
+                            force: bool = False,
+                            source_lang: str = "auto",
+                            target_lang: str = "en") -> Generator[str, None, None]:
     """TAB 1 · Steps 1–2: extract audio → Demucs vocal/music split."""
     log = Log()
     state = PipelineState.load()
@@ -867,6 +913,11 @@ def run_import_and_analysis(media_path: str,
         state.artifacts["source"] = src_name
         # remember the real path so Step 8 can remux video containers later
         state.artifacts["source_path"] = str(media_path)
+        # dubbing language choices (consumed by Steps 4 & 7)
+        state.artifacts["source_lang"] = str(source_lang or "auto")
+        state.artifacts["target_lang"] = str(target_lang or "en")
+        yield log(f"🌐 Languages · original: {state.artifacts['source_lang']}"
+                  f" → dub: {state.artifacts['target_lang']}")
 
         yield log("─" * 62)
         audio = step1_extract_audio(media_path, log, force=force)
@@ -1104,6 +1155,7 @@ def _ensure_prompt_transcripts(log: Log) -> Dict[str, str]:
     log("🈳 Transcribing clone prompts for zero-shot conditioning (SenseVoice) …")
     import torch
     _torchaudio_compat()
+    _numpy2_compat()
     from funasr import AutoModel
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModel(model=SENSEVOICE_MODEL, vad_model="fsmn-vad",

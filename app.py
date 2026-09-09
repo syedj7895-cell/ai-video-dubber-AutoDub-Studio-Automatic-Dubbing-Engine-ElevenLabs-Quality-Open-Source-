@@ -158,10 +158,6 @@ footer { display: none !important; }
   background: rgba(255,255,255,.55); border: 1px solid rgba(255,255,255,.7);
 }
 .hero p { margin: 10px auto 0; color: var(--ink-soft); max-width: 660px; font-size: .98rem; }
-.hero .beam { margin: 18px auto 0; height: 3px; width: 220px; border-radius: 99px;
-  background: linear-gradient(90deg, transparent, #7d9be0, #cfe0ff, #7d9be0, transparent);
-  background-size: 200% 100%; animation: beamSlide 3.2s linear infinite; }
-@keyframes beamSlide { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* ---- tabs (three visual stages) ---- */
 .tab-nav { border: none !important; gap: 6px; }
@@ -212,7 +208,7 @@ footer { display: none !important; }
 ::-webkit-scrollbar-thumb { background: rgba(120, 140, 190, 0.35); border-radius: 99px; }
 
 @media (prefers-reduced-motion: reduce) {
-  .gradio-container::before, .hero .beam, .chip .dot, .tabitem { animation: none !important; }
+  .gradio-container::before, .chip .dot, .tabitem { animation: none !important; }
 }
 """
 
@@ -245,7 +241,6 @@ HERO = f"""
   </div>
   <p>Drop in a video + subtitles — AutoDub isolates the voices, maps every speaker and
      emotion, and prepares a cloned multilingual performance over the original score.</p>
-  <div class="beam"></div>
 </div>
 """
 
@@ -290,7 +285,7 @@ def _fp(f):
 #  UI ⇄ pipeline callback generators (streaming console)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_analysis(media, srt_o, srt_t, token):
+def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t):
     """TAB 1 · steps 1–2 → (console, vocals preview, music preview, status)."""
     media_path = _fp(media)
     if not media_path:
@@ -300,7 +295,10 @@ def _run_analysis(media, srt_o, srt_t, token):
     yield "⏳ Booting import & analysis …", None, None, _chip("run", "Steps 1–2 in progress")
     last = ""
     try:
-        for line in pipeline.run_import_and_analysis(media_path, force=False):
+        for line in pipeline.run_import_and_analysis(
+                media_path, force=False,
+                source_lang=lang_o or "auto",
+                target_lang=lang_t or "en"):
             last = line
             yield line, None, None, _chip("run", "Steps 1–2 in progress")
         state = pipeline.PipelineState.load()
@@ -413,6 +411,19 @@ def build_ui() -> gr.Blocks:
                                                   file_types=[".srt"])
                             srt_trans_in = gr.File(label="🌍 Translated SRT",
                                                    file_types=[".srt"])
+                        with gr.Row():
+                            lang_orig_in = gr.Dropdown(
+                                choices=[(lbl, code) for code, lbl
+                                         in pipeline.DUBBING_LANGUAGES],
+                                value="auto", label="🎙 Original language",
+                                info="Language of the source audio — used by "
+                                     "the emotion/ASR scan")
+                            lang_target_in = gr.Dropdown(
+                                choices=[(lbl, code) for code, lbl
+                                         in pipeline.DUBBING_LANGUAGES],
+                                value="en", label="🌍 Target / dub language",
+                                info="Language of your Translated SRT — the "
+                                     "cloned voices speak this")
                         with gr.Accordion("🔑 Advanced — Hugging Face token "
                                           "(Pyannote diarization)", open=False):
                             hf_token_in = gr.Textbox(
@@ -522,7 +533,8 @@ def build_ui() -> gr.Blocks:
         # ── event wiring ────────────────────────────────────────────────────
         analyze_btn.click(
             fn=_run_analysis,
-            inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in],
+            inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
+                    lang_orig_in, lang_target_in],
             outputs=[import_log, vocals_preview, music_preview, analysis_status],
         )
         match_btn.click(
