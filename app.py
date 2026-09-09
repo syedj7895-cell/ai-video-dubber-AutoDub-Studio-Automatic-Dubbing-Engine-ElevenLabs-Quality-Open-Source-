@@ -21,11 +21,17 @@ from __future__ import annotations
 
 import html
 import json
+import threading
+import time
 from pathlib import Path
 
 import gradio as gr
 
 import pipeline
+
+# ── global stop signal for the auto-pilot ──────────────────────────────────
+# Set by the STOP button; checked by _run_full_auto between every stage.
+_stop_event = threading.Event()
 
 # Gradio 6 moved theme/css/head from Blocks() to launch() and dropped
 # show_copy_button — detect once so the app runs on Gradio 4.x / 5.x / 6.x.
@@ -207,6 +213,28 @@ footer { display: none !important; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: rgba(120, 140, 190, 0.35); border-radius: 99px; }
 
+/* dropdown popups must sit above the background & capture clicks */
+body > * { pointer-events: auto !important; }
+/* ── dropdown z-index fix — popups render above glass panels ── */
+gradio-dropdown, .gradio-dropdown, [data-testid="dropdown"],
+.svelte-1m15bcr, .svelte-vt1mxs,
+[data-testid="dropdown"], [class*="dropdown"], [class*="container"] {
+  z-index: 9999 !important; position: relative; }
+/* dropdown option list — force above everything */
+[id*="dropdown"] [class*="options"], [class*="dropdown"] [class*="options"],
+[role="listbox"], [role="option"], .svelte-1m15bcr [class*="options"],
+.svelte-vt1mxs [class*="options"] {
+  z-index: 10000 !important; position: absolute !important; }
+/* dropdown arrow — larger clickable area */
+[class*="dropdown"] [class*="arrow"], [class*="dropdown"] [class*="icon"],
+[aria-label="Clear"] {
+  min-width: 28px !important; min-height: 28px !important;
+  padding: 6px !important; cursor: pointer !important;
+  font-size: 1.2rem !important; }
+/* ensure the dropdown container doesn't clip the popup */
+.form, .gradio-dropdown, [data-testid="dropdown"] {
+  overflow: visible !important; }>>>>>>> REPLACE
+
 @media (prefers-reduced-motion: reduce) {
   .gradio-container::before, .chip .dot, .tabitem { animation: none !important; }
 }
@@ -333,6 +361,68 @@ def _run_matching(token, srt_o, srt_t):
 def _run_readiness():
     """TAB 3 · artifact-chain pre-flight."""
     return _checklist(pipeline.render_readiness())
+
+
+def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
+    """AUTO-PILOT · chains Tab1 → Tab2 → Tab3 with 30 s review pauses.
+
+    Honours the global _stop_event: if set during a review pause or between
+    stages, the pipeline halts gracefully instead of ploughing on."""
+    global _stop_event
+    _stop_event.clear()
+    log = []
+    def emit(text, status):
+        log.append(text)
+        return "\n".join(log), None, None, None, None, _chip(status, text)
+
+    # ── helper: 30 s interruptible countdown ─────────────────────────────
+    def pause_or_stop(label: str, seconds: int = 30):
+        """Yields status updates each second; stops early if user hits STOP."""
+        for remaining in range(seconds, 0, -1):
+            if _stop_event.is_set():
+                return
+            yield emit(f"⏸ {label} · {remaining} s to review — "
+                       "click STOP to halt", "ok")
+            time.sleep(1)
+
+    yield emit("⏳ Auto-pilot engaged · Tab 1 — extract & split …", "run")
+    for line in pipeline.run_import_and_analysis(_fp(media), force=False,
+                                                 source_lang=lang_o or "auto",
+                                                 target_lang=lang_t or "en"):
+        yield emit(line, "run")
+    if _stop_event.is_set():
+        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        return
+    yield from pause_or_stop("Tab 1 review")
+    if _stop_event.is_set():
+        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        return
+
+    yield emit("⏳ Auto-pilot · Tab 2 — diarization, emotions & script …", "run")
+    for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
+                                             force=False):
+        yield emit(line, "run")
+    if _stop_event.is_set():
+        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        return
+    yield from pause_or_stop("Tab 2 review")
+    if _stop_event.is_set():
+        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        return
+
+    yield emit("⏳ Auto-pilot · Tab 3 — rendering the dub …", "run")
+    for line in pipeline.run_rendering(force=False):
+        yield emit(line, "run")
+    if _stop_event.is_set():
+        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        return
+    yield emit("🏁 Auto-pilot complete — download the master below.", "ok")
+
+
+def _stop_auto():
+    """Callback for the STOP button — flips the global stop flag."""
+    _stop_event.set()
+    return _chip("err", "STOP signalled — halting after current stage")
 
 
 def _run_rendering():
@@ -497,6 +587,21 @@ def build_ui() -> gr.Blocks:
             with gr.Tab("🚀 Rendering Engine"):
                 with gr.Row():
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
+                        gr.Markdown("### ⚡ Auto-pilot (one-click)")
+                        gr.Markdown("Runs the **entire pipeline end-to-end** — "
+                                    "analysis → matching → render — with 30 s "
+                                    "review pauses between stages.")
+                        with gr.Row():
+                            auto_btn = gr.Button(value="", icon=icon("rocket"),
+                                                 variant="primary",
+                                                 elem_classes=["icon-btn"],
+                                                 scale=4)
+                            stop_btn = gr.Button(value="🛑 STOP",
+                                                 variant="secondary",
+                                                 elem_classes=["icon-btn"],
+                                                 scale=1)
+                        gr.HTML('<div class="btn-caption">🚀 Auto-pilot — runs all 3 '
+                                'tabs automatically · 🛑 STOP halts between stages</div>')
                         gr.Markdown("### 🎙 Render the dub")
                         gr.Markdown("**Step 6** splits the script into per-speaker "
                                     "TTS-safe channels · **Step 7** clones every line "
@@ -541,6 +646,13 @@ def build_ui() -> gr.Blocks:
             fn=_run_matching,
             inputs=[hf_token_in, srt_orig_in, srt_trans_in],
             outputs=[match_log, script_df, emotion_log_tb, clone_files, match_status],
+        )
+        auto_btn.click(
+            fn=_run_full_auto,
+            inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
+                    lang_orig_in, lang_target_in],
+            outputs=[render_log, final_audio, final_video, render_status,
+                     match_status, analysis_status],
         )
         render_btn.click(
             fn=_run_rendering,

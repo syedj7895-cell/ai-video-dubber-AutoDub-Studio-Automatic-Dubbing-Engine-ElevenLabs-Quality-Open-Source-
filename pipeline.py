@@ -179,6 +179,38 @@ def clear_gpu_cache(*models) -> str:
     return msg
 
 
+def _hf_hub_compat() -> None:
+    """
+    huggingface_hub ≥ 0.25 removed the deprecated `use_auth_token` parameter
+    from `hf_hub_download` — but Pyannote 3.1's internal code still passes it.
+    Monkey-patch the function to accept (and silently convert) the old kwarg
+    into the modern `token` parameter. Idempotent — safe to call before every
+    Pyannote import.
+    """
+    try:
+        import huggingface_hub
+        from huggingface_hub import hf_hub_download as _orig_hf_hub_download
+    except ImportError:
+        return
+
+    if getattr(_orig_hf_hub_download, "_autodub_patched", False):
+        return  # already patched
+
+    def _patched_hf_hub_download(*args, **kwargs):
+        if "use_auth_token" in kwargs and "token" not in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+        return _orig_hf_hub_download(*args, **kwargs)
+
+    _patched_hf_hub_download._autodub_patched = True
+    huggingface_hub.hf_hub_download = _patched_hf_hub_download
+    # also patch the re-exported reference some libraries cache
+    try:
+        import huggingface_hub.file_download as _fd
+        _fd.hf_hub_download = _patched_hf_hub_download
+    except Exception:
+        pass
+
+
 def _torchaudio_compat() -> None:
     """
     Bleeding-edge torchaudio (≥ 2.9 — Colab's default) removed the deprecated
@@ -588,6 +620,7 @@ def step3_diarization(hf_token: Optional[str],
             "pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
     _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9 BEFORE pyannote
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
+    _hf_hub_compat()       # patch hf_hub_download to accept use_auth_token (Pyannote compat)
     try:
         from pyannote.audio import Pipeline
     except ImportError as e:
@@ -599,8 +632,14 @@ def step3_diarization(hf_token: Optional[str],
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log(f"🧠 Loading Pyannote 3.1 · {PYANNOTE_MODEL} · device={device}")
 
-    kwargs = {"use_auth_token": hf_token.strip()} if (hf_token or "").strip() else {}
+    token = (hf_token or "").strip()
+    # huggingface_hub ≥ 0.25 dropped `use_auth_token` in favour of `token`;
+    # the _hf_hub_compat() patch above also silences Pyannote's internal usage.
     try:
+        pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, token=token) if token \
+            else Pipeline.from_pretrained(PYANNOTE_MODEL)
+    except TypeError:
+        kwargs = {"use_auth_token": token} if token else {}
         pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, **kwargs)
     except Exception as e:
         raise RuntimeError(
