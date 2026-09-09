@@ -635,6 +635,7 @@ def step3_diarization(hf_token: Optional[str],
     token = (hf_token or "").strip()
     # huggingface_hub ≥ 0.25 dropped `use_auth_token` in favour of `token`;
     # the _hf_hub_compat() patch above also silences Pyannote's internal usage.
+    pipe = None
     try:
         pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, token=token) if token \
             else Pipeline.from_pretrained(PYANNOTE_MODEL)
@@ -648,6 +649,17 @@ def step3_diarization(hf_token: Optional[str],
             "the user conditions with the SAME account that owns the token; "
             "② paste the token in Tab 1 ▸ Advanced. Detail: " + str(e)[:300]
         ) from e
+
+    if pipe is None:
+        raise RuntimeError(
+            "Pyannote returned None — the model files could not be loaded. "
+            "Checklist: ① visit huggingface.co/pyannote/speaker-diarization-3.1 "
+            "AND huggingface.co/pyannote/segmentation-3.1 and click 'Agree and "
+            "access repository' with the SAME account that owns the token; "
+            "② paste a READ token (hf_…) in Tab 1 ▸ Advanced; "
+            "③ if you already did both, the token may be expired — generate a "
+            "new one at huggingface.co/settings/tokens."
+        )
 
     pipe.to(torch.device(device))
     log("🎙 Diarizing the isolated vocal track …")
