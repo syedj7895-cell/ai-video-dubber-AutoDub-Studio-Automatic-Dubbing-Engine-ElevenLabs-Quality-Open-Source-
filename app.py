@@ -313,7 +313,7 @@ def _fp(f):
 #  UI ⇄ pipeline callback generators (streaming console)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t):
+def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
     """TAB 1 · steps 1–2 → (console, vocals preview, music preview, status)."""
     media_path = _fp(media)
     if not media_path:
@@ -326,7 +326,8 @@ def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t):
         for line in pipeline.run_import_and_analysis(
                 media_path, force=False,
                 source_lang=lang_o or "auto",
-                target_lang=lang_t or "en"):
+                target_lang=lang_t or "en",
+                diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, _chip("run", "Steps 1–2 in progress")
         state = pipeline.PipelineState.load()
@@ -339,13 +340,14 @@ def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t):
         yield f"❌ Unexpected error: {e}", None, None, _chip("err", "Unexpected error")
 
 
-def _run_matching(token, srt_o, srt_t):
+def _run_matching(token, srt_o, srt_t, diagnostic):
     """TAB 2 · steps 3–5 → (console, dataframe, emotion log, clones, status)."""
     yield "⏳ Booting speaker matching …", None, None, None, _chip("run", "Steps 3–5 in progress")
     last = ""
     try:
         for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
-                                                 force=False):
+                                                 force=False,
+                                                 diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, None, _chip("run", "Steps 3–5 in progress")
         state = pipeline.PipelineState.load()
@@ -363,7 +365,7 @@ def _run_readiness():
     return _checklist(pipeline.render_readiness())
 
 
-def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
+def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
     """AUTO-PILOT · chains Tab1 → Tab2 → Tab3 with 15 s review pauses.
 
     Honours the global _stop_event: if set during a review pause or between
@@ -388,7 +390,8 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
     yield emit("⏳ Auto-pilot engaged · Tab 1 — extract & split …", "run")
     for line in pipeline.run_import_and_analysis(_fp(media), force=False,
                                                  source_lang=lang_o or "auto",
-                                                 target_lang=lang_t or "en"):
+                                                 target_lang=lang_t or "en",
+                                                 diagnostic=bool(diagnostic)):
         yield emit(line, "run")
     if _stop_event.is_set():
         yield emit("🛑 Auto-pilot stopped by user.", "err")
@@ -400,7 +403,8 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
 
     yield emit("⏳ Auto-pilot · Tab 2 — diarization, emotions & script …", "run")
     for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
-                                             force=False):
+                                             force=False,
+                                             diagnostic=bool(diagnostic)):
         yield emit(line, "run")
     if _stop_event.is_set():
         yield emit("🛑 Auto-pilot stopped by user.", "err")
@@ -411,7 +415,7 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
         return
 
     yield emit("⏳ Auto-pilot · Tab 3 — rendering the dub …", "run")
-    for line in pipeline.run_rendering(force=False):
+    for line in pipeline.run_rendering(force=False, diagnostic=bool(diagnostic)):
         yield emit(line, "run")
     if _stop_event.is_set():
         yield emit("🛑 Auto-pilot stopped by user.", "err")
@@ -425,12 +429,12 @@ def _stop_auto():
     return _chip("err", "STOP signalled — halting after current stage")
 
 
-def _run_rendering():
+def _run_rendering(diagnostic):
     """TAB 3 · steps 6–8 → (console, final mix, final video, status)."""
     yield "⏳ Booting render engine …", None, None, _chip("run", "Steps 6–8 rendering")
     last = ""
     try:
-        for line in pipeline.run_rendering(force=False):
+        for line in pipeline.run_rendering(force=False, diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, _chip("run", "Steps 6–8 rendering")
         state = pipeline.PipelineState.load()
@@ -524,6 +528,14 @@ def build_ui() -> gr.Blocks:
                                 placeholder="hf_xxxxxxxxxxxx  (or set HUGGING_FACE_HUB_TOKEN)",
                                 info="Accept the terms at huggingface.co/pyannote/"
                                      "speaker-diarization-3.1 first.")
+                            diag_in = gr.Checkbox(
+                                value=False,
+                                label="🩺 Diagnostic Mode — collect ALL errors "
+                                      "in one run (skip dependent steps, print "
+                                      "full report at end)",
+                                info="ON = pipeline runs to the finish line and "
+                                     "shows every error at once. OFF = halt at "
+                                     "the first error (production mode).")
                         analyze_btn = gr.Button(value="", icon=icon("analyze"),
                                                 variant="primary",
                                                 elem_classes=["icon-btn"])
@@ -641,24 +653,24 @@ def build_ui() -> gr.Blocks:
         analyze_btn.click(
             fn=_run_analysis,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in],
+                    lang_orig_in, lang_target_in, diag_in],
             outputs=[import_log, vocals_preview, music_preview, analysis_status],
         )
         match_btn.click(
             fn=_run_matching,
-            inputs=[hf_token_in, srt_orig_in, srt_trans_in],
+            inputs=[hf_token_in, srt_orig_in, srt_trans_in, diag_in],
             outputs=[match_log, script_df, emotion_log_tb, clone_files, match_status],
         )
         auto_btn.click(
             fn=_run_full_auto,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in],
+                    lang_orig_in, lang_target_in, diag_in],
             outputs=[render_log, final_audio, final_video, render_status,
                      match_status, analysis_status],
         )
         render_btn.click(
             fn=_run_rendering,
-            inputs=None,
+            inputs=[diag_in],
             outputs=[render_log, final_audio, final_video, render_status],
         )
         preflight_btn.click(

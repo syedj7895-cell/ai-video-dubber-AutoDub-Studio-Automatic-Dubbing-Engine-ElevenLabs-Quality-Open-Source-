@@ -980,6 +980,24 @@ def step5_assemble_script(translated_srt_path: str,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  🩺 DIAGNOSTIC MODE — collect ALL errors in one run instead of halting
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _render_diagnostic(errors: List[Tuple[str, str]]) -> str:
+    """Render a summary report of every error collected during a run."""
+    lines = ["═" * 62,
+             " 🩺 DIAGNOSTIC REPORT — all errors collected this run",
+             "═" * 62]
+    for step, err in errors:
+        lines.append(f"❌ {step}")
+        lines.append(f"   └─ {err[:250]}")
+    lines.append(f"→ {len(errors)} error(s) found. Fix and re-run — "
+                 "cached steps auto-skip.")
+    lines.append("═" * 62)
+    return "\n".join(lines)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  ORCHESTRATORS — generator functions that stream a cumulative console log
 #  to the Gradio UI while enforcing strict sequential execution.
 # ═════════════════════════════════════════════════════════════════════════════
@@ -987,12 +1005,19 @@ def step5_assemble_script(translated_srt_path: str,
 def run_import_and_analysis(media_path: str,
                             force: bool = False,
                             source_lang: str = "auto",
-                            target_lang: str = "en") -> Generator[str, None, None]:
-    """TAB 1 · Steps 1–2: extract audio → Demucs vocal/music split."""
+                            target_lang: str = "en",
+                            diagnostic: bool = False) -> Generator[str, None, None]:
+    """TAB 1 · Steps 1–2: extract audio → Demucs vocal/music split.
+
+    In diagnostic mode, errors are collected instead of halting — dependent
+    steps are skipped and a full report prints at the end."""
     log = Log()
     state = PipelineState.load()
     media_path = str(media_path)      # Gradio may hand us NamedString
     src_name = Path(media_path).name
+    errors: List[Tuple[str, str]] = []
+    if diagnostic:
+        yield log("🩺 DIAGNOSTIC MODE — errors collected, pipeline runs to finish")
     try:
         yield log("═" * 62)
         yield log(" 🔬 TAB 1 · IMPORT & ANALYSIS — sequential T4-safe run")
@@ -1013,17 +1038,43 @@ def run_import_and_analysis(media_path: str,
         yield log(f"🌐 Languages · original: {state.artifacts['source_lang']}"
                   f" → dub: {state.artifacts['target_lang']}")
 
+        # ── Step 1 · extract audio ─────────────────────────────────────────
         yield log("─" * 62)
-        audio = step1_extract_audio(media_path, log, force=force)
-        state.mark("step1", audio=audio.name)
-        state.save()
-        yield log("   " + log_memory())
+        audio: Optional[Path] = None
+        try:
+            audio = step1_extract_audio(media_path, log, force=force)
+            state.mark("step1", audio=audio.name)
+            state.save()
+            yield log("   " + log_memory())
+        except Exception as e:
+            if diagnostic:
+                errors.append(("Step 1 · extract_audio", str(e)))
+                yield log(f"❌ Step 1 failed: {e}")
+            else:
+                raise
 
-        yield log("─" * 62)
-        vocals, music = step2_separate_vocals(log, force=force)
-        state.mark("step2", vocals=vocals.name, music=music.name)
-        state.save()
-        yield log("🎬 Analysis complete — switch to Tab 2 for speaker matching.")
+        # ── Step 2 · separate vocals (depends on Step 1) ──────────────────
+        if audio is not None:
+            yield log("─" * 62)
+            try:
+                vocals, music = step2_separate_vocals(log, force=force)
+                state.mark("step2", vocals=vocals.name, music=music.name)
+                state.save()
+                yield log("🎬 Analysis complete — switch to Tab 2 for speaker matching.")
+            except Exception as e:
+                if diagnostic:
+                    errors.append(("Step 2 · separate_vocals", str(e)))
+                    yield log(f"❌ Step 2 failed: {e}")
+                else:
+                    raise
+        else:
+            yield log("⏭ Step 2 · separate_vocals SKIPPED (Step 1 failed)")
+
+        # ── diagnostic report ──────────────────────────────────────────────
+        if diagnostic and errors:
+            yield log(_render_diagnostic(errors))
+        elif not errors:
+            pass  # normal completion message already emitted
     except Exception as e:
         yield log(f"❌ Step failed: {e}")
         yield log("   Pipeline halted — fix the issue and re-run "
@@ -1035,13 +1086,20 @@ def run_import_and_analysis(media_path: str,
 def run_script_matching(hf_token: Optional[str],
                         original_srt_path: Optional[str],
                         translated_srt_path: Optional[str],
-                        force: bool = False) -> Generator[str, None, None]:
-    """TAB 2 · Steps 3–5: diarization → emotion scan → script assembly."""
+                        force: bool = False,
+                        diagnostic: bool = False) -> Generator[str, None, None]:
+    """TAB 2 · Steps 3–5: diarization → emotion scan → script assembly.
+
+    In diagnostic mode, errors are collected instead of halting — dependent
+    steps are skipped and a full report prints at the end."""
     log = Log()
     state = PipelineState.load()
     hf_token = str(hf_token) if hf_token else ""        # NamedString-safe
     original_srt_path = str(original_srt_path) if original_srt_path else None
     translated_srt_path = str(translated_srt_path) if translated_srt_path else None
+    errors: List[Tuple[str, str]] = []
+    if diagnostic:
+        yield log("🩺 DIAGNOSTIC MODE — errors collected, pipeline runs to finish")
     try:
         yield log("═" * 62)
         yield log(" 🧬 TAB 2 · SCRIPT MATCHING & ASSEMBLY — steps 3 · 4 · 5")
@@ -1049,26 +1107,68 @@ def run_script_matching(hf_token: Optional[str],
         if not VOCALS_WAV.exists():
             raise RuntimeError("Run Tab 1 first — outputs/vocals.wav not found.")
 
+        # ── Step 3 · diarization ───────────────────────────────────────────
         yield log("─" * 62)
-        diar = step3_diarization(hf_token, original_srt_path, log, force=force)
-        state.mark("step3", speakers=str(len(diar.get("speakers", {}))))
-        state.save()
-        yield log("   " + log_memory())
+        diar: Optional[dict] = None
+        try:
+            diar = step3_diarization(hf_token, original_srt_path, log, force=force)
+            state.mark("step3", speakers=str(len(diar.get("speakers", {}))))
+            state.save()
+            yield log("   " + log_memory())
+        except Exception as e:
+            if diagnostic:
+                errors.append(("Step 3 · diarization", str(e)))
+                yield log(f"❌ Step 3 failed: {e}")
+            else:
+                raise
 
-        yield log("─" * 62)
-        step4_emotion_analysis(log, force=force)
-        state.mark("step4")
-        state.save()
-        yield log("   " + log_memory())
+        # ── Step 4 · emotion scan (depends on Step 3) ─────────────────────
+        if diar is not None:
+            yield log("─" * 62)
+            try:
+                step4_emotion_analysis(log, force=force)
+                state.mark("step4")
+                state.save()
+                yield log("   " + log_memory())
+            except Exception as e:
+                if diagnostic:
+                    errors.append(("Step 4 · emotion_scan", str(e)))
+                    yield log(f"❌ Step 4 failed: {e}")
+                else:
+                    raise
+        else:
+            yield log("⏭ Step 4 · emotion_scan SKIPPED (Step 3 failed)")
 
-        yield log("─" * 62)
-        if not translated_srt_path or not Path(translated_srt_path).exists():
-            raise RuntimeError("Translated SRT missing — upload it in Tab 1 "
-                               "to assemble the dubbing script.")
-        rows = step5_assemble_script(translated_srt_path, log, force=force)
-        state.mark("step5", rows=str(len(rows)))
-        state.save()
-        yield log("🧬 Script assembled — switch to Tab 3 to verify render readiness.")
+        # ── Step 5 · script assembly (depends on Steps 3–4) ───────────────
+        if diar is not None and EMOTION_GRID_JSON.exists():
+            yield log("─" * 62)
+            if not translated_srt_path or not Path(translated_srt_path).exists():
+                if diagnostic:
+                    errors.append(("Step 5 · script_assembly",
+                                   "Translated SRT missing — upload it in Tab 1"))
+                    yield log("❌ Step 5: Translated SRT missing — upload it in Tab 1")
+                else:
+                    raise RuntimeError("Translated SRT missing — upload it in Tab 1 "
+                                       "to assemble the dubbing script.")
+            else:
+                try:
+                    rows = step5_assemble_script(translated_srt_path, log, force=force)
+                    state.mark("step5", rows=str(len(rows)))
+                    state.save()
+                    yield log("🧬 Script assembled — switch to Tab 3 to verify "
+                              "render readiness.")
+                except Exception as e:
+                    if diagnostic:
+                        errors.append(("Step 5 · script_assembly", str(e)))
+                        yield log(f"❌ Step 5 failed: {e}")
+                    else:
+                        raise
+        else:
+            yield log("⏭ Step 5 · script_assembly SKIPPED (Step 3/4 failed)")
+
+        # ── diagnostic report ──────────────────────────────────────────────
+        if diagnostic and errors:
+            yield log(_render_diagnostic(errors))
     except Exception as e:
         yield log(f"❌ Step failed: {e}")
         yield log("   Pipeline halted — fix the issue and re-run "
@@ -1579,10 +1679,17 @@ def step8_mixdown(log: Log, force: bool = False, duck_db: float = -6.0,
 #  TAB 3 ORCHESTRATOR — Steps 6 · 7 · 8
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_rendering(force: bool = False) -> Generator[str, None, None]:
-    """TAB 3 · split → CosyVoice TTS → ducked mixdown → video remux."""
+def run_rendering(force: bool = False,
+                  diagnostic: bool = False) -> Generator[str, None, None]:
+    """TAB 3 · split → CosyVoice TTS → ducked mixdown → video remux.
+
+    In diagnostic mode, errors are collected instead of halting — dependent
+    steps are skipped and a full report prints at the end."""
     log = Log()
     state = PipelineState.load()
+    errors: List[Tuple[str, str]] = []
+    if diagnostic:
+        yield log("🩺 DIAGNOSTIC MODE — errors collected, pipeline runs to finish")
     try:
         yield log("═" * 62)
         yield log(" 🚀 TAB 3 · RENDERING ENGINE — steps 6 · 7 · 8")
@@ -1590,22 +1697,59 @@ def run_rendering(force: bool = False) -> Generator[str, None, None]:
         if not FINAL_SCRIPT_JSON.exists():
             raise RuntimeError("Run Tab 2 first — final_script.json missing.")
 
+        # ── Step 6 · split speaker scripts ─────────────────────────────────
         yield log("─" * 62)
-        step6_split_speaker_scripts(log, force=force)
-        state.mark("step6")
-        state.save()
+        scripts_ok = False
+        try:
+            step6_split_speaker_scripts(log, force=force)
+            state.mark("step6")
+            state.save()
+            scripts_ok = True
+        except Exception as e:
+            if diagnostic:
+                errors.append(("Step 6 · split_speaker_scripts", str(e)))
+                yield log(f"❌ Step 6 failed: {e}")
+            else:
+                raise
 
-        yield log("─" * 62)
-        step7_synthesize(log, force=force)
-        state.mark("step7")
-        state.save()
-        yield log("   " + log_memory())
+        # ── Step 7 · CosyVoice TTS (depends on Step 6) ─────────────────────
+        if scripts_ok:
+            yield log("─" * 62)
+            try:
+                step7_synthesize(log, force=force)
+                state.mark("step7")
+                state.save()
+                yield log("   " + log_memory())
+            except Exception as e:
+                if diagnostic:
+                    errors.append(("Step 7 · cosyvoice_tts", str(e)))
+                    yield log(f"❌ Step 7 failed: {e}")
+                else:
+                    raise
+        else:
+            yield log("⏭ Step 7 · cosyvoice_tts SKIPPED (Step 6 failed)")
 
-        yield log("─" * 62)
-        result = step8_mixdown(log, force=force)
-        state.mark("step8", output="video" if result.get("video") else "audio-only")
-        state.save()
-        yield log("🏁 Render complete — download the master below.")
+        # ── Step 8 · mixdown (depends on Steps 2, 6, 7) ────────────────────
+        if scripts_ok and TTS_REPORT_JSON.exists():
+            yield log("─" * 62)
+            try:
+                result = step8_mixdown(log, force=force)
+                state.mark("step8",
+                           output="video" if result.get("video") else "audio-only")
+                state.save()
+                yield log("🏁 Render complete — download the master below.")
+            except Exception as e:
+                if diagnostic:
+                    errors.append(("Step 8 · mixdown", str(e)))
+                    yield log(f"❌ Step 8 failed: {e}")
+                else:
+                    raise
+        else:
+            yield log("⏭ Step 8 · mixdown SKIPPED (Step 6/7 failed)")
+
+        # ── diagnostic report ──────────────────────────────────────────────
+        if diagnostic and errors:
+            yield log(_render_diagnostic(errors))
     except Exception as e:
         yield log(f"❌ Step failed: {e}")
         yield log("   Pipeline halted — fix the issue and re-run "
