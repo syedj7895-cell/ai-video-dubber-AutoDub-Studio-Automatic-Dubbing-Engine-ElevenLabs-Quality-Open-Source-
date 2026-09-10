@@ -215,11 +215,13 @@ def _torchaudio_compat() -> None:
     """
     Bleeding-edge torchaudio (≥ 2.9 — Colab's default) removed the deprecated
     `set_audio_backend` / `list_audio_backends` / `get_audio_backend` APIs
-    that some audio/ML libraries still call at import time (e.g. pyannote's
-    dependency chain). Install harmless no-op shims so those code paths keep
-    working with the modern auto-backend loader. Idempotent — safe to call
-    before every heavy import.
+    AND the `torchaudio.backend` submodule entirely. Some audio/ML libraries
+    (e.g. pyannote's dependency chain) still call these at import time.
+    Install harmless no-op shims + a dummy `torchaudio.backend` module so
+    those code paths keep working. Idempotent — safe to call before every
+    heavy import.
     """
+    import sys
     try:
         import torchaudio
     except ImportError:
@@ -230,18 +232,19 @@ def _torchaudio_compat() -> None:
         torchaudio.list_audio_backends = lambda: ["soundfile"]
     if not hasattr(torchaudio, "get_audio_backend"):
         torchaudio.get_audio_backend = lambda: "soundfile"
-    # also patch the backend submodule — some libs access it via
-    # torchaudio.backend.get_audio_backend() instead of the top-level module
-    try:
-        import torchaudio.backend as _tb
-        if not hasattr(_tb, "get_audio_backend"):
-            _tb.get_audio_backend = lambda: "soundfile"
-        if not hasattr(_tb, "set_audio_backend"):
-            _tb.set_audio_backend = lambda *a, **k: None
-        if not hasattr(_tb, "list_audio_backends"):
-            _tb.list_audio_backends = lambda: ["soundfile"]
-    except Exception:
-        pass
+
+    # torchaudio ≥ 2.9 removed the `backend` submodule — register a dummy
+    # module in sys.modules so `import torchaudio.backend` doesn't crash.
+    if "torchaudio.backend" not in sys.modules:
+        try:
+            import types
+            _dummy = types.ModuleType("torchaudio.backend")
+            _dummy.get_audio_backend = lambda: "soundfile"
+            _dummy.set_audio_backend = lambda *a, **k: None
+            _dummy.list_audio_backends = lambda: ["soundfile"]
+            sys.modules["torchaudio.backend"] = _dummy
+        except Exception:
+            pass
 
 
 def _numpy2_compat() -> None:

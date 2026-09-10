@@ -364,7 +364,7 @@ def _run_readiness():
 
 
 def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
-    """AUTO-PILOT · chains Tab1 → Tab2 → Tab3 with 30 s review pauses.
+    """AUTO-PILOT · chains Tab1 → Tab2 → Tab3 with 15 s review pauses.
 
     Honours the global _stop_event: if set during a review pause or between
     stages, the pipeline halts gracefully instead of ploughing on."""
@@ -375,8 +375,8 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t):
         log.append(text)
         return "\n".join(log), None, None, None, None, _chip(status, text)
 
-    # ── helper: 30 s interruptible countdown ─────────────────────────────
-    def pause_or_stop(label: str, seconds: int = 30):
+    # ── helper: 15 s interruptible countdown ─────────────────────────────
+    def pause_or_stop(label: str, seconds: int = 15):
         """Yields status updates each second; stops early if user hits STOP."""
         for remaining in range(seconds, 0, -1):
             if _stop_event.is_set():
@@ -507,13 +507,15 @@ def build_ui() -> gr.Blocks:
                                          in pipeline.DUBBING_LANGUAGES],
                                 value="auto", label="🎙 Original language",
                                 info="Language of the source audio — used by "
-                                     "the emotion/ASR scan")
+                                     "the emotion/ASR scan",
+                                interactive=True, allow_custom_value=False)
                             lang_target_in = gr.Dropdown(
                                 choices=[(lbl, code) for code, lbl
                                          in pipeline.DUBBING_LANGUAGES],
                                 value="en", label="🌍 Target / dub language",
                                 info="Language of your Translated SRT — the "
-                                     "cloned voices speak this")
+                                     "cloned voices speak this",
+                                interactive=True, allow_custom_value=False)
                         with gr.Accordion("🔑 Advanced — Hugging Face token "
                                           "(Pyannote diarization)", open=False):
                             hf_token_in = gr.Textbox(
@@ -589,7 +591,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
                         gr.Markdown("### ⚡ Auto-pilot (one-click)")
                         gr.Markdown("Runs the **entire pipeline end-to-end** — "
-                                    "analysis → matching → render — with 30 s "
+                                    "analysis → matching → render — with 15 s "
                                     "review pauses between stages.")
                         with gr.Row():
                             auto_btn = gr.Button(value="", icon=icon("rocket"),
