@@ -1,4 +1,3 @@
-# ═══════════════════════════════════════════════════════════════════════════
 #   AUTOMATIC DUBBING ENGINE — pipeline.py
 #   Core file-routing layer · sequential GPU execution · OOM defense
 #   Target runtime: Google Colab Free T4 (16 GB VRAM) — CPU-safe fallbacks
@@ -238,21 +237,38 @@ def _torchaudio_compat() -> None:
     # The parent must have __path__ so Python treats it as a package.
     try:
         import types
+        from collections import namedtuple
+
+        # AudioMetaData is a NamedTuple that pyannote imports from
+        # torchaudio.backend.common — fields per torchaudio's original API.
+        _AudioMetaData = namedtuple(
+            "AudioMetaData",
+            ["sample_rate", "num_frames", "num_channels",
+             "bits_per_sample", "encoding"])
+
+        def _make_dummy(name: str):
+            m = types.ModuleType(name)
+            m.get_audio_backend = lambda: "soundfile"
+            m.set_audio_backend = lambda *a, **k: None
+            m.list_audio_backends = lambda: ["soundfile"]
+            m.AudioMetaData = _AudioMetaData
+            m.load = lambda *a, **k: (None, None)
+            m.save = lambda *a, **k: None
+            m.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
+            return m
+
         if "torchaudio.backend" not in sys.modules:
             _pkg = types.ModuleType("torchaudio.backend")
             _pkg.__path__ = []                      # mark as package
             _pkg.get_audio_backend = lambda: "soundfile"
             _pkg.set_audio_backend = lambda *a, **k: None
             _pkg.list_audio_backends = lambda: ["soundfile"]
+            _pkg.AudioMetaData = _AudioMetaData
             sys.modules["torchaudio.backend"] = _pkg
         for _sub in ("common", "soundfile_backend", "no_backend", "utils"):
             _name = f"torchaudio.backend.{_sub}"
             if _name not in sys.modules:
-                _m = types.ModuleType(_name)
-                _m.get_audio_backend = lambda: "soundfile"
-                _m.set_audio_backend = lambda *a, **k: None
-                _m.list_audio_backends = lambda: ["soundfile"]
-                sys.modules[_name] = _m
+                sys.modules[_name] = _make_dummy(_name)
     except Exception:
         pass
 
