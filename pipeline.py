@@ -233,18 +233,28 @@ def _torchaudio_compat() -> None:
     if not hasattr(torchaudio, "get_audio_backend"):
         torchaudio.get_audio_backend = lambda: "soundfile"
 
-    # torchaudio ≥ 2.9 removed the `backend` submodule — register a dummy
-    # module in sys.modules so `import torchaudio.backend` doesn't crash.
-    if "torchaudio.backend" not in sys.modules:
-        try:
-            import types
-            _dummy = types.ModuleType("torchaudio.backend")
-            _dummy.get_audio_backend = lambda: "soundfile"
-            _dummy.set_audio_backend = lambda *a, **k: None
-            _dummy.list_audio_backends = lambda: ["soundfile"]
-            sys.modules["torchaudio.backend"] = _dummy
-        except Exception:
-            pass
+    # torchaudio ≥ 2.9 removed the `backend` submodule — register dummy
+    # modules in sys.modules so `import torchaudio.backend.*` doesn't crash.
+    # The parent must have __path__ so Python treats it as a package.
+    try:
+        import types
+        if "torchaudio.backend" not in sys.modules:
+            _pkg = types.ModuleType("torchaudio.backend")
+            _pkg.__path__ = []                      # mark as package
+            _pkg.get_audio_backend = lambda: "soundfile"
+            _pkg.set_audio_backend = lambda *a, **k: None
+            _pkg.list_audio_backends = lambda: ["soundfile"]
+            sys.modules["torchaudio.backend"] = _pkg
+        for _sub in ("common", "soundfile_backend", "no_backend", "utils"):
+            _name = f"torchaudio.backend.{_sub}"
+            if _name not in sys.modules:
+                _m = types.ModuleType(_name)
+                _m.get_audio_backend = lambda: "soundfile"
+                _m.set_audio_backend = lambda *a, **k: None
+                _m.list_audio_backends = lambda: ["soundfile"]
+                sys.modules[_name] = _m
+    except Exception:
+        pass
 
 
 def _numpy2_compat() -> None:
