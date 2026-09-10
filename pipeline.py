@@ -277,11 +277,12 @@ def _torch_load_compat() -> None:
     """
     PyTorch 2.6 changed the default of `torch.load(weights_only=...)` from
     False → True. Older model checkpoints (Pyannote, FunASR, Demucs) pickle
-    auxiliary objects (torch_version, numpy arrays, …) that the new strict
-    loader rejects with 'Weights only load failed'.
+    auxiliary objects (torch_version, numpy arrays, …) that the strict loader
+    rejects with 'Weights only load failed'.
 
-    Our model sources are trusted (official pyannote/funasr/demucs hubs), so
-    restore the legacy permissive default. Idempotent.
+    Pyannote also passes weights_only=True explicitly in some code paths, so
+    we FORCE the permissive mode unconditionally — our model sources are
+    trusted (official pyannote/funasr/demucs hubs). Idempotent.
     """
     try:
         import torch
@@ -294,12 +295,19 @@ def _torch_load_compat() -> None:
 
     @functools.wraps(orig)
     def _patched_load(*args, **kwargs):
-        if "weights_only" not in kwargs:
-            kwargs["weights_only"] = False
+        kwargs["weights_only"] = False          # FORCE permissive (trusted sources)
         return orig(*args, **kwargs)
 
     _patched_load._autodub_patched = True
     torch.load = _patched_load
+    # also allowlist the globals the strict loader complains about, in case
+    # any code path bypasses our patch (e.g. cached function references)
+    try:
+        import torch.serialization
+        torch.serialization.add_safe_globals(
+            [torch.torch_version.TorchVersion])
+    except Exception:
+        pass
 
 
 def _numpy2_compat() -> None:
