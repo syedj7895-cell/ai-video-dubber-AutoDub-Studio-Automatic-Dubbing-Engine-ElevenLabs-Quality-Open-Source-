@@ -213,57 +213,59 @@ def _hf_hub_compat() -> None:
 def _torchaudio_compat() -> None:
     """
     Bleeding-edge torchaudio (≥ 2.9 — Colab's default) removed the deprecated
-    `set_audio_backend` / `list_audio_backends` / `get_audio_backend` APIs
-    AND the `torchaudio.backend` submodule entirely. Some audio/ML libraries
-    (e.g. pyannote's dependency chain) still call these at import time.
-    Install harmless no-op shims + a dummy `torchaudio.backend` module so
-    those code paths keep working. Idempotent — safe to call before every
-    heavy import.
+    `set_audio_backend` / `list_audio_backends` / `get_audio_backend` APIs,
+    the `torchaudio.backend` submodule, `torchaudio.info()`, etc.
+    Some audio/ML libraries (e.g. pyannote's dependency chain) still call
+    these at import time. Install harmless no-op shims + a dummy
+    `torchaudio.backend` module so those code paths keep working. Idempotent
+    — safe to call before every heavy import.
     """
     import sys
     try:
         import torchaudio
     except ImportError:
         return
+    from collections import namedtuple
+    from types import ModuleType
+
+    # AudioMetaData NamedTuple — matches torchaudio's original API.
+    _AudioMetaData = namedtuple(
+        "AudioMetaData",
+        ["sample_rate", "num_frames", "num_channels",
+         "bits_per_sample", "encoding"])
+
     if not hasattr(torchaudio, "set_audio_backend"):
         torchaudio.set_audio_backend = lambda *a, **k: None
     if not hasattr(torchaudio, "list_audio_backends"):
         torchaudio.list_audio_backends = lambda: ["soundfile"]
     if not hasattr(torchaudio, "get_audio_backend"):
         torchaudio.get_audio_backend = lambda: "soundfile"
+    if not hasattr(torchaudio, "info"):
+        torchaudio.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
+    if not hasattr(torchaudio, "load"):
+        torchaudio.load = lambda *a, **k: (None, 16_000)
+    if not hasattr(torchaudio, "save"):
+        torchaudio.save = lambda *a, **k: None
 
     # torchaudio ≥ 2.9 removed the `backend` submodule — register dummy
     # modules in sys.modules so `import torchaudio.backend.*` doesn't crash.
     # The parent must have __path__ so Python treats it as a package.
+    def _make_dummy(name: str) -> ModuleType:
+        m = ModuleType(name)
+        m.get_audio_backend = lambda: "soundfile"
+        m.set_audio_backend = lambda *a, **k: None
+        m.list_audio_backends = lambda: ["soundfile"]
+        m.AudioMetaData = _AudioMetaData
+        m.load = lambda *a, **k: (None, None)
+        m.save = lambda *a, **k: None
+        m.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
+        return m
+
     try:
-        import types
-        from collections import namedtuple
-
-        # AudioMetaData is a NamedTuple that pyannote imports from
-        # torchaudio.backend.common — fields per torchaudio's original API.
-        _AudioMetaData = namedtuple(
-            "AudioMetaData",
-            ["sample_rate", "num_frames", "num_channels",
-             "bits_per_sample", "encoding"])
-
-        def _make_dummy(name: str):
-            m = types.ModuleType(name)
-            m.get_audio_backend = lambda: "soundfile"
-            m.set_audio_backend = lambda *a, **k: None
-            m.list_audio_backends = lambda: ["soundfile"]
-            m.AudioMetaData = _AudioMetaData
-            m.load = lambda *a, **k: (None, None)
-            m.save = lambda *a, **k: None
-            m.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
-            return m
-
         if "torchaudio.backend" not in sys.modules:
-            _pkg = types.ModuleType("torchaudio.backend")
+            _pkg = _make_dummy("torchaudio.backend")
             _pkg.__path__ = []                      # mark as package
-            _pkg.get_audio_backend = lambda: "soundfile"
-            _pkg.set_audio_backend = lambda *a, **k: None
-            _pkg.list_audio_backends = lambda: ["soundfile"]
-            _pkg.AudioMetaData = _AudioMetaData
+            torchaudio.backend = _pkg               # attribute access too
             sys.modules["torchaudio.backend"] = _pkg
         for _sub in ("common", "soundfile_backend", "no_backend", "utils"):
             _name = f"torchaudio.backend.{_sub}"
