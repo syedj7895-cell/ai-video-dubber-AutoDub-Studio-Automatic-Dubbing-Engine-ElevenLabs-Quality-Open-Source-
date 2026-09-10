@@ -273,6 +273,35 @@ def _torchaudio_compat() -> None:
         pass
 
 
+def _torch_load_compat() -> None:
+    """
+    PyTorch 2.6 changed the default of `torch.load(weights_only=...)` from
+    False → True. Older model checkpoints (Pyannote, FunASR, Demucs) pickle
+    auxiliary objects (torch_version, numpy arrays, …) that the new strict
+    loader rejects with 'Weights only load failed'.
+
+    Our model sources are trusted (official pyannote/funasr/demucs hubs), so
+    restore the legacy permissive default. Idempotent.
+    """
+    try:
+        import torch
+        import functools
+    except ImportError:
+        return
+    orig = torch.load
+    if getattr(orig, "_autodub_patched", False):
+        return
+
+    @functools.wraps(orig)
+    def _patched_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return orig(*args, **kwargs)
+
+    _patched_load._autodub_patched = True
+    torch.load = _patched_load
+
+
 def _numpy2_compat() -> None:
     """
     NumPy 2.0 removed legacy aliases (np.NaN, np.float_, …) that older ML
@@ -664,6 +693,7 @@ def step3_diarization(hf_token: Optional[str],
     _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9 BEFORE pyannote
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
     _hf_hub_compat()       # patch hf_hub_download to accept use_auth_token (Pyannote compat)
+    _torch_load_compat()   # restore legacy torch.load default for trusted checkpoints
     try:
         from pyannote.audio import Pipeline
     except ImportError as e:
@@ -814,6 +844,7 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
             "pip install funasr modelscope  ·  Or run on Google Colab (T4).") from e
     _torchaudio_compat()   # shim removed APIs before funasr's import chain
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
+    _torch_load_compat()   # restore legacy torch.load default for trusted checkpoints
     try:
         from funasr import AutoModel
     except ImportError as e:
@@ -1350,6 +1381,7 @@ def _ensure_prompt_transcripts(log: Log) -> Dict[str, str]:
     import torch
     _torchaudio_compat()
     _numpy2_compat()
+    _torch_load_compat()
     from funasr import AutoModel
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModel(model=SENSEVOICE_MODEL, vad_model="fsmn-vad",
