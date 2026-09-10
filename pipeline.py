@@ -214,11 +214,11 @@ def _hf_hub_compat() -> None:
 def _torchaudio_compat() -> None:
     """
     Bleeding-edge torchaudio (≥ 2.9 — Colab's default) removed the deprecated
-    `set_audio_backend` / `list_audio_backends` APIs that some audio/ML
-    libraries still call at import time (e.g. pyannote's dependency chain).
-    Install harmless no-op shims so those code paths keep working with the
-    modern auto-backend loader. Idempotent — safe to call before every
-    heavy import.
+    `set_audio_backend` / `list_audio_backends` / `get_audio_backend` APIs
+    that some audio/ML libraries still call at import time (e.g. pyannote's
+    dependency chain). Install harmless no-op shims so those code paths keep
+    working with the modern auto-backend loader. Idempotent — safe to call
+    before every heavy import.
     """
     try:
         import torchaudio
@@ -228,6 +228,20 @@ def _torchaudio_compat() -> None:
         torchaudio.set_audio_backend = lambda *a, **k: None
     if not hasattr(torchaudio, "list_audio_backends"):
         torchaudio.list_audio_backends = lambda: ["soundfile"]
+    if not hasattr(torchaudio, "get_audio_backend"):
+        torchaudio.get_audio_backend = lambda: "soundfile"
+    # also patch the backend submodule — some libs access it via
+    # torchaudio.backend.get_audio_backend() instead of the top-level module
+    try:
+        import torchaudio.backend as _tb
+        if not hasattr(_tb, "get_audio_backend"):
+            _tb.get_audio_backend = lambda: "soundfile"
+        if not hasattr(_tb, "set_audio_backend"):
+            _tb.set_audio_backend = lambda *a, **k: None
+        if not hasattr(_tb, "list_audio_backends"):
+            _tb.list_audio_backends = lambda: ["soundfile"]
+    except Exception:
+        pass
 
 
 def _numpy2_compat() -> None:
