@@ -240,12 +240,44 @@ def _torchaudio_compat() -> None:
         torchaudio.list_audio_backends = lambda: ["soundfile"]
     if not hasattr(torchaudio, "get_audio_backend"):
         torchaudio.get_audio_backend = lambda: "soundfile"
+    # ── functional soundfile-backed I/O for APIs torchaudio ≥ 2.9 removed ──
+    # CRITICAL: load() must honour frame_offset/num_frames — pyannote's
+    # chunked reader asks for exact 10 s windows (160 000 samples @16 kHz).
+    # A stub returning the full file (or info() reporting num_frames=0,
+    # which corrupts pyannote's window math) crashes the batch with a
+    # tensor-size mismatch. These implementations are fully functional.
+    def _sf_info(filepath, *a, **k):
+        import soundfile as _sf
+        i = _sf.info(str(filepath))
+        return _AudioMetaData(i.samplerate, i.frames, i.channels,
+                              16, i.subtype or "PCM_S")
+
+    def _sf_load(filepath, frame_offset: int = 0, num_frames: int = -1,
+                 normalize: bool = True, channels_first: bool = True,
+                 *a, **k):
+        import numpy as _np
+        import soundfile as _sf
+        import torch as _t
+        start = int(frame_offset or 0)
+        stop = start + int(num_frames) if num_frames and num_frames > 0 else None
+        data, sr = _sf.read(str(filepath), start=start, stop=stop,
+                            dtype="float32", always_2d=True)      # (N, C)
+        if channels_first:
+            data = data.T                                          # → (C, N)
+        return _t.from_numpy(_np.ascontiguousarray(data)), sr
+
+    def _sf_save(filepath, src, sample_rate: int, *a, **k):
+        import soundfile as _sf
+        t = src.detach().cpu().numpy() if hasattr(src, "detach") else src
+        _sf.write(str(filepath), t.T if getattr(t, "ndim", 1) == 2 else t,
+                  int(sample_rate))
+
     if not hasattr(torchaudio, "info"):
-        torchaudio.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
+        torchaudio.info = _sf_info
     if not hasattr(torchaudio, "load"):
-        torchaudio.load = lambda *a, **k: (None, 16_000)
+        torchaudio.load = _sf_load
     if not hasattr(torchaudio, "save"):
-        torchaudio.save = lambda *a, **k: None
+        torchaudio.save = _sf_save
 
     # torchaudio ≥ 2.9 removed the `backend` submodule — register dummy
     # modules in sys.modules so `import torchaudio.backend.*` doesn't crash.
@@ -256,9 +288,9 @@ def _torchaudio_compat() -> None:
         m.set_audio_backend = lambda *a, **k: None
         m.list_audio_backends = lambda: ["soundfile"]
         m.AudioMetaData = _AudioMetaData
-        m.load = lambda *a, **k: (None, None)
-        m.save = lambda *a, **k: None
-        m.info = lambda *a, **k: _AudioMetaData(16_000, 0, 1, 16, "PCM_S")
+        m.load = _sf_load
+        m.save = _sf_save
+        m.info = _sf_info
         return m
 
     try:
@@ -747,7 +779,17 @@ def step3_diarization(hf_token: Optional[str],
     pipe.to(torch.device(device))
     log("🎙 Diarizing the isolated vocal track …")
     t0 = time.time()
-    diar = pipe(str(VOCALS_WAV))
+    # torchaudio ≥ 2.9 regression guard: with file-path input, pyannote's
+    # chunked reader can receive the FULL waveform instead of the requested
+    # 10 s window (tensor-size crash). Feed an in-memory 16 kHz mono dict —
+    # pyannote then slices tensors directly, no file IO at all.
+    try:
+        _mono, _sr = _load_vocals_16k()
+        diar = pipe({"waveform": torch.from_numpy(_mono).unsqueeze(0),
+                     "sample_rate": _sr})
+    except Exception as _ioe:
+        log(f"   ⚠ in-memory feed failed ({_ioe}) — using file fallback")
+        diar = pipe(str(VOCALS_WAV))
     turns = [{"start": float(t.start), "end": float(t.end), "raw": label}
              for t, _, label in diar.itertracks(yield_label=True)]
     del pipe, diar
@@ -1311,11 +1353,31 @@ def step6_split_speaker_scripts(log: Log, force: bool = False) -> Dict[str, List
 #  STEP 7 · COSYVOICE 3.0 ZERO-SHOT TTS  (silence padding + overlap protection)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _cosyvoice_syspath() -> None:
+    """
+    CosyVoice ships as a SOURCE TREE (no setup.py — `pip install .` fails).
+    Register the usual clone locations + the Matcha-TTS submodule on
+    sys.path so `import cosyvoice` resolves. Idempotent.
+    """
+    import sys
+    for base in ("/content/CosyVoice",                    # Colab bootstrap
+                 str(Path.cwd() / "CosyVoice"),           # clone beside app
+                 str(Path.home() / "CosyVoice")):         # home clone
+        p = Path(base)
+        if (p / "cosyvoice").is_dir():
+            for entry in (p, p / "third_party" / "Matcha-TTS"):
+                s = str(entry)
+                if s not in sys.path:
+                    sys.path.insert(0, s)
+            return
+
+
 def _load_cosyvoice(log: Log):
     """
     Lazy CosyVoice 3.0 loader (zero-shot mode). The engine ships inside the
     FunAudioLLM repo, so operators get a one-line bootstrap when missing.
     """
+    _cosyvoice_syspath()
     try:
         import torch
     except ImportError as e:
@@ -1335,9 +1397,11 @@ def _load_cosyvoice(log: Log):
             except ImportError as e:
                 raise RuntimeError(
                     "CosyVoice engine not found. Bootstrap once with:\n"
-                    "  git clone https://github.com/FunAudioLLM/CosyVoice && "
-                    "cd CosyVoice && git submodule update --init --recursive && "
-                    "pip install -r requirements.txt && pip install -e .\n"
+                    "  git clone --recursive https://github.com/FunAudioLLM/"
+                    "CosyVoice  /content/CosyVoice\n"
+                    "  pip install -r /content/CosyVoice/requirements.txt\n"
+                    "(source tree — NO `pip install .`; the Matcha-TTS\n"
+                    " submodule is picked up via sys.path automatically)\n"
                     "…then re-run the render.") from e
 
     from modelscope import snapshot_download
@@ -1363,10 +1427,13 @@ def _load_cosyvoice(log: Log):
 
 def _load_prompt_speech(path: str, target_sr: int = 16_000):
     """Clone-prompt wav → torch tensor (1, n) @16 kHz (CosyVoice expects 16k)."""
+    import numpy as np
+    import soundfile as sf
     import torch
     import torchaudio
-    wav, sr = torchaudio.load(str(path))                 # (channels, n)
-    wav = wav.mean(dim=0, keepdim=True)
+    data, sr = sf.read(str(path), dtype="float32", always_2d=True)  # (n, ch)
+    wav = torch.from_numpy(np.ascontiguousarray(data.T)).mean(
+        dim=0, keepdim=True)                             # → (1, n)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
     return wav

@@ -5,7 +5,9 @@
 
 # ── UI (Phase 1 · glassmorphism Gradio experience) ──────────────────
 gradio>=4.44.0
-gradio-client>=2.0.0   # Colab ships 1.3.0 → crashes on /api/info (bool schema bug)
+# NOTE: do NOT pin gradio-client here — gradio pins its EXACT compatible
+# version itself. Colab_Runner.ipynb Cell 3 realigns Colab's stale
+# gradio-client 1.3.0 (bool-schema /api/info crash) to what gradio declares.
 
 # ── ML stack ────────────────────────────────────────────────────────
 # torch / torchaudio ship pre-installed on Colab. For local installs,
