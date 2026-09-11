@@ -748,6 +748,32 @@ def step3_diarization(hf_token: Optional[str],
     log(f"🧠 Loading Pyannote 3.1 · {PYANNOTE_MODEL} · device={device}")
 
     token = (hf_token or "").strip()
+    # pre-flight: verify token validity + BOTH gated repos BEFORE the
+    # 1 GB weight download. A denied gate would otherwise surface as an
+    # opaque blob-download error after minutes of waiting.
+    if token:
+        import urllib.request
+        for _repo in (PYANNOTE_MODEL, "pyannote/segmentation-3.0"):
+            _req = urllib.request.Request(
+                "https://huggingface.co/api/models/" + _repo,
+                headers={"Authorization": "Bearer " + token})
+            try:
+                with urllib.request.urlopen(_req, timeout=15):
+                    log("   [OK] HF gate open: " + _repo)
+            except Exception as _e:
+                _code = getattr(_e, "code", None)
+                if _code in (401, 403):
+                    raise RuntimeError(
+                        "HuggingFace gate DENIED for '" + _repo + "'. Fix: open "
+                        "huggingface.co/" + _repo + " and click 'Agree and "
+                        "access repository' with the SAME account that owns "
+                        "the token, then re-run. (Token itself is valid.)")
+                elif _code == 404:
+                    raise RuntimeError(
+                        "HuggingFace repo '" + _repo + "' not found - check "
+                        "the model id / your network.")
+                else:  # offline / proxy hiccup - do not hard-block
+                    log("   [!] HF gate probe skipped (" + str(_e) + ") - continuing")
     # huggingface_hub ≥ 0.25 dropped `use_auth_token` in favour of `token`;
     # the _hf_hub_compat() patch above also silences Pyannote's internal usage.
     pipe = None

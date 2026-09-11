@@ -14,20 +14,20 @@ gradio>=4.44.0
 # grab the CUDA wheel from https://pytorch.org then run this file.
 torch>=2.1.0
 torchaudio>=2.1.0
-demucs>=4.0.1                # Step 2 · Meta Demucs v4 vocal separation
-pyannote.audio~=3.1.0        # Step 3 · Pyannote 3.1 speaker diarization
-funasr>=1.1.4                # Step 4 · SenseVoice-Small emotion engine
-modelscope>=1.17.0           # model hub used by FunASR downloads
+demucs==4.0.1                # Step 2 · Meta Demucs v4 (pinned — known-good)
+pyannote.audio==3.1.1        # Step 3 · Pyannote 3.1 (exact — 4.x exists upstream)
+funasr>=1.1.4,<2             # Step 4 · SenseVoice-Small (bounded range)
+modelscope>=1.17,<2          # model hub used by FunASR downloads
 huggingface_hub>=0.25        # Gradio 6.x requires ≥0.25; Pyannote works via _hf_hub_compat() patch
 
 # ── Media & data glue ───────────────────────────────────────────────
 numpy
 pandas
-pysrt                        # Step 5 · SRT parsing & timestamp mapping
+pysrt==1.1.2                 # Step 5 · SRT parsing & timestamp mapping (pinned)
 pydub
 soundfile
 moviepy>=1.0.3               # Step 1 fallback extractor (if FFmpeg missing)
-ffmpeg-python
+ffmpeg-python==0.2.0
 tqdm
 librosa>=0.10.0              # Step 7 · non-pitch-shifting time-stretch (overlap protection)
 
