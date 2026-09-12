@@ -39,6 +39,18 @@ _GRADIO_MAJOR = int(str(gr.__version__).split(".")[0])
 _IS_G6 = _GRADIO_MAJOR >= 6
 _COPY_KW = {} if _IS_G6 else {"show_copy_button": True}
 
+# JS-only copy-to-clipboard (Gradio 6 removed show_copy_button; this works
+# on 4.x / 5.x / 6.x and falls back to execCommand on non-https origins).
+_COPY_JS = ("(text) => {"
+            "const fb=(t)=>{const ta=document.createElement('textarea');"
+            "ta.value=t||'';ta.style.position='fixed';ta.style.opacity='0';"
+            "document.body.appendChild(ta);ta.select();"
+            "try{document.execCommand('copy');}catch(e){}"
+            "document.body.removeChild(ta);};"
+            "if(navigator.clipboard&&window.isSecureContext){"
+            "navigator.clipboard.writeText(text||'').catch(()=>fb(text));}"
+            "else{fb(text);}}")
+
 BASE_DIR = Path(__file__).resolve().parent
 ICONS_DIR = BASE_DIR / "assets" / "icons"
 
@@ -556,6 +568,8 @@ def build_ui() -> gr.Blocks:
                                                 interactive=False,
                                                 **_COPY_KW,
                                                 elem_classes=["console"])
+                        gr.Button("Copy console", variant="secondary").click(
+                            fn=None, inputs=[import_log], js=_COPY_JS)
                 with gr.Row():
                     vocals_preview = gr.Audio(label="🎤 Isolated vocals",
                                               elem_classes=["glass", "pad"])
@@ -585,6 +599,8 @@ def build_ui() -> gr.Blocks:
                                                interactive=False,
                                                **_COPY_KW,
                                                elem_classes=["console"])
+                        gr.Button("Copy console", variant="secondary").click(
+                            fn=None, inputs=[match_log], js=_COPY_JS)
                 gr.Markdown("### 🧾 Consolidated dubbing script")
                 script_df = gr.DataFrame(
                     headers=["#", "Start", "End", "Speaker", "Emotion",
@@ -651,6 +667,8 @@ def build_ui() -> gr.Blocks:
                                                 interactive=False,
                                                 **_COPY_KW,
                                                 elem_classes=["console"])
+                        gr.Button("Copy console", variant="secondary").click(
+                            fn=None, inputs=[render_log], js=_COPY_JS)
                 final_audio = gr.Audio(label="🎧 Final master mix",
                                        elem_classes=["glass", "pad"])
                 final_video = gr.Video(label="🎬 Final dubbed video "

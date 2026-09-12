@@ -1455,23 +1455,24 @@ def _load_cosyvoice(log: Log):
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  ·  Or run on "
             "Google Colab (T4).") from e
-    try:
-        from cosyvoice.cli.cosyvoice import CosyVoice3 as _CV        # CosyVoice 3.0
-    except ImportError:
+    errs = []
+    _CV = None
+    for _cls in ("CosyVoice3", "CosyVoice2", "CosyVoice"):
         try:
-            from cosyvoice.cli.cosyvoice import CosyVoice2 as _CV    # 2.x fallback
-        except ImportError:
-            try:
-                from cosyvoice.cli.cosyvoice import CosyVoice as _CV
-            except ImportError as e:
-                raise RuntimeError(
-                    "CosyVoice engine not found. Bootstrap once with:\n"
-                    "  git clone --recursive https://github.com/FunAudioLLM/"
-                    "CosyVoice  /content/CosyVoice\n"
-                    "  pip install -r /content/CosyVoice/requirements.txt\n"
-                    "(source tree — NO `pip install .`; the Matcha-TTS\n"
-                    " submodule is picked up via sys.path automatically)\n"
-                    "…then re-run the render.") from e
+            _mod = __import__("cosyvoice.cli.cosyvoice", fromlist=[_cls])
+            _CV = getattr(_mod, _cls)
+            break
+        except Exception as e:      # ImportError OR deeper missing deps
+            errs.append(f"{_cls}: {e}")
+    if _CV is None:
+        raise RuntimeError(
+            "CosyVoice engine could not be imported. Deepest errors:\n  "
+            + "\n  ".join(errs[-2:])
+            + "\n\nBootstrap (Colab Cell 4 does this automatically):\n"
+            "  git clone --recursive https://github.com/FunAudioLLM/"
+            "CosyVoice /content/CosyVoice\n"
+            "  then re-run Cell 4 (filtered requirements install).\n"
+            "If Cell 4's install failed, its full pip output shows the cause.")
 
     from modelscope import snapshot_download
     model_dir = None
