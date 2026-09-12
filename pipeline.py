@@ -548,38 +548,81 @@ def step1_extract_audio(media_path: str, log: Log, force: bool = False) -> Path:
 #  STEP 2 · VOCAL / MUSIC SEPARATION  (Meta Demucs v4)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _demucs_cli_separate(log: Log) -> None:
+    """
+    Fallback separation via the demucs CLI - used when the installed demucs
+    wheel lacks the demucs.api submodule (PyPI demucs==4.0.1 ships WITHOUT
+    api.py; it only exists in the GitHub source). Produces vocals.wav +
+    no_vocals.wav via --two-stems=vocals, then renames them to the
+    pipeline's expected artifacts.
+    """
+    import sys as _sys
+    t0 = time.time()
+    exe = shutil.which("demucs")
+    cmd = ([exe] if exe else [_sys.executable, "-m", "demucs.separate"])
+    cmd += ["--two-stems=vocals", "-n", "htdemucs", "--shifts", "0",
+            "-o", str(OUTPUTS_DIR), str(AUDIO_WAV)]
+    log("[i] running: " + " ".join(cmd[:8]) + " ...")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError("demucs CLI failed: "
+                           + (proc.stderr or proc.stdout or "")[-400:])
+    out_dir = OUTPUTS_DIR / "htdemucs" / AUDIO_WAV.stem
+    vocals = out_dir / "vocals.wav"
+    no_vocals = out_dir / "no_vocals.wav"
+    if not vocals.exists() or not no_vocals.exists():
+        raise RuntimeError(f"demucs CLI finished but stems not found in {out_dir}")
+    shutil.move(str(vocals), str(VOCALS_WAV))
+    shutil.move(str(no_vocals), str(MUSIC_WAV))
+    shutil.rmtree(out_dir, ignore_errors=True)
+    log(f"   CLI separation done in {time.time() - t0:.1f}s")
+
+
 def step2_separate_vocals(log: Log, force: bool = False) -> Tuple[Path, Path]:
     """
     Load Demucs v4 (htdemucs), split the master audio into a clean vocal
     stem and a background instrumental stem, write both to disk as .wav,
     then IMMEDIATELY tear the model down with clear_gpu_cache().
+    Falls back to the demucs CLI when demucs.api is unavailable (the PyPI
+    4.0.1 wheel does not ship the api submodule - known upstream gap).
     """
     if VOCALS_WAV.exists() and MUSIC_WAV.exists() and not force:
-        log("↩ Step 2 cached (vocals.wav + music.wav) — skipping.")
+        log("<- Step 2 cached (vocals.wav + music.wav) - skipping.")
         return VOCALS_WAV, MUSIC_WAV
 
     try:
         import torch
         import soundfile as sf
-        from demucs.api import Separator
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
-            f"Step 2 needs the ML stack — module '{missing}' is not installed here. "
+            f"Step 2 needs the ML stack - module '{missing}' is not installed here. "
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  then  "
-            "pip install demucs  ·  Or run on Google Colab (T4) where the "
+            "pip install demucs  -  Or run on Google Colab (T4) where the "
             "stack ships preinstalled.") from e
 
+    try:
+        from demucs.api import Separator
+    except ImportError:
+        Separator = None
+    if Separator is None:
+        log("[i] demucs.api missing (PyPI wheel) - engaging demucs CLI fallback ...")
+        _demucs_cli_separate(log)
+        dur = _wav_duration(VOCALS_WAV)
+        log("   " + clear_gpu_cache())
+        log(f"[OK] Step 2 -> vocals.wav + music.wav  ({dur:.1f}s, CLI path)")
+        return VOCALS_WAV, MUSIC_WAV
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"🧠 Loading Demucs v4 · model=htdemucs · device={device}")
+    log(f"[GPU] Loading Demucs v4 - model=htdemucs - device={device}")
     log("   " + log_memory())
 
     t0 = time.time()
-    # shifts=0 → single pass (2× faster, T4-friendly); split=True keeps VRAM flat
+    # shifts=0 -> single pass (2x faster, T4-friendly); split=True keeps VRAM flat
     sep = Separator(model="htdemucs", device=device, shifts=0,
                     overlap=0.25, split=True, progress=False)
-    log("🎚 Separating stems (chunked streaming — OOM-safe) …")
+    log("Separating stems (chunked streaming - OOM-safe) ...")
     _wav, sources = sep.separate_audio_file(str(AUDIO_WAV))
     sr = sep.samplerate  # 44 100 Hz
 
@@ -589,10 +632,10 @@ def step2_separate_vocals(log: Log, force: bool = False) -> Tuple[Path, Path]:
     sf.write(str(MUSIC_WAV), music.numpy().T, sr)
 
     dur = _wav_duration(VOCALS_WAV)
-    # 🔥 full model teardown before anything else loads
+    # full model teardown before anything else loads
     del sources, vocals, music, sep
     log("   " + clear_gpu_cache())
-    log(f"✅ Step 2 → vocals.wav + music.wav  ({dur:.1f}s in {time.time() - t0:.1f}s)")
+    log(f"[OK] Step 2 -> vocals.wav + music.wav  ({dur:.1f}s in {time.time() - t0:.1f}s)")
     return VOCALS_WAV, MUSIC_WAV
 
 

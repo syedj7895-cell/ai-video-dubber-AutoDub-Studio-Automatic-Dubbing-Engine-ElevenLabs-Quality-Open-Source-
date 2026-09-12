@@ -366,61 +366,69 @@ def _run_readiness():
 
 
 def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
-    """AUTO-PILOT · chains Tab1 → Tab2 → Tab3 with 15 s review pauses.
+    """AUTO-PILOT - chains Tab1 -> Tab2 -> Tab3 with 15 s review pauses.
 
-    Honours the global _stop_event: if set during a review pause or between
-    stages, the pipeline halts gracefully instead of ploughing on."""
+    Console handling: pipeline yields are CUMULATIVE transcripts, so each
+    stage's output REPLACES its own console section (zero duplication);
+    auto-pilot status lines are appended once each."""
     global _stop_event
     _stop_event.clear()
-    log = []
-    def emit(text, status):
-        log.append(text)
-        return "\n".join(log), None, None, None, None, _chip(status, text)
+    con = {"text": ""}
 
-    # ── helper: 15 s interruptible countdown ─────────────────────────────
+    def emit_msg(text, status):
+        con["text"] = (con["text"] + "\n" + text).strip("\n")
+        return con["text"], None, None, None, None, _chip(status, text)
+
+    def emit_stage(line, status, start, label):
+        con["text"] = con["text"][:start] + line
+        return con["text"], None, None, None, None, _chip(status, label)
+
     def pause_or_stop(label: str, seconds: int = 15):
         """Yields status updates each second; stops early if user hits STOP."""
         for remaining in range(seconds, 0, -1):
             if _stop_event.is_set():
                 return
-            yield emit(f"⏸ {label} · {remaining} s to review — "
-                       "click STOP to halt", "ok")
+            yield emit_msg(f"[pause] {label} - {remaining} s to review - "
+                           "click STOP to halt", "ok")
             time.sleep(1)
 
-    yield emit("⏳ Auto-pilot engaged · Tab 1 — extract & split …", "run")
+    yield emit_msg("[auto] Auto-pilot engaged - Tab 1: extract & split ...", "run")
+    s_start = len(con["text"])
     for line in pipeline.run_import_and_analysis(_fp(media), force=False,
                                                  source_lang=lang_o or "auto",
                                                  target_lang=lang_t or "en",
                                                  diagnostic=bool(diagnostic)):
-        yield emit(line, "run")
+        yield emit_stage(line, "run", s_start, "Tab 1 - steps 1-2 running")
     if _stop_event.is_set():
-        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
         return
     yield from pause_or_stop("Tab 1 review")
     if _stop_event.is_set():
-        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
         return
 
-    yield emit("⏳ Auto-pilot · Tab 2 — diarization, emotions & script …", "run")
+    yield emit_msg("[auto] Auto-pilot - Tab 2: diarization, emotions & script ...", "run")
+    s_start = len(con["text"])
     for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
                                              force=False,
                                              diagnostic=bool(diagnostic)):
-        yield emit(line, "run")
+        yield emit_stage(line, "run", s_start, "Tab 2 - steps 3-5 running")
     if _stop_event.is_set():
-        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
         return
     yield from pause_or_stop("Tab 2 review")
     if _stop_event.is_set():
-        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
         return
 
-    yield emit("⏳ Auto-pilot · Tab 3 — rendering the dub …", "run")
+    yield emit_msg("[auto] Auto-pilot - Tab 3: rendering the dub ...", "run")
+    s_start = len(con["text"])
     for line in pipeline.run_rendering(force=False, diagnostic=bool(diagnostic)):
-        yield emit(line, "run")
+        yield emit_stage(line, "run", s_start, "Tab 3 - steps 6-8 rendering")
     if _stop_event.is_set():
-        yield emit("🛑 Auto-pilot stopped by user.", "err")
+        yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
         return
-    yield emit("🏁 Auto-pilot complete — download the master below.", "ok")
+    yield emit_msg("[done] Auto-pilot complete - download the master below.", "ok")
 
 
 def _stop_auto():
