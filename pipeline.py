@@ -1457,13 +1457,26 @@ def _load_cosyvoice(log: Log):
             "Google Colab (T4).") from e
     errs = []
     _CV = None
-    for _cls in ("CosyVoice3", "CosyVoice2", "CosyVoice"):
-        try:
-            _mod = __import__("cosyvoice.cli.cosyvoice", fromlist=[_cls])
-            _CV = getattr(_mod, _cls)
+    for _attempt in (0, 1):             # pass 1, then auto-heal, then retry
+        errs = []
+        for _cls in ("CosyVoice3", "CosyVoice2", "CosyVoice"):
+            try:
+                _mod = __import__("cosyvoice.cli.cosyvoice", fromlist=[_cls])
+                _CV = getattr(_mod, _cls)
+                break
+            except Exception as e:      # ImportError OR deeper missing deps
+                errs.append(f"{_cls}: {e}")
+        if _CV is not None or _attempt:
             break
-        except Exception as e:      # ImportError OR deeper missing deps
-            errs.append(f"{_cls}: {e}")
+        import sys as _sys
+        _missing = sorted({mm.group(1) for e in errs
+                           for mm in [re.search(r"No module named '([^']+)'", str(e))]
+                           if mm})
+        if _missing:
+            log("[i] auto-healing missing CosyVoice deps: "
+                + ", ".join(_missing) + " ...")
+            subprocess.run([_sys.executable, "-m", "pip", "install", "-q",
+                            *_missing], capture_output=True, text=True)
     if _CV is None:
         raise RuntimeError(
             "CosyVoice engine could not be imported. Deepest errors:\n  "
