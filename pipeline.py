@@ -1455,9 +1455,16 @@ def _load_cosyvoice(log: Log):
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  ·  Or run on "
             "Google Colab (T4).") from e
-    errs = []
-    _CV = None
-    for _attempt in (0, 1):             # pass 1, then auto-heal, then retry
+    # Multi-pass self-heal: import -> detect missing modules -> pip install
+    # the RIGHT pip packages (module names often differ from package names)
+    # -> retry. Up to 6 passes; stalls (no progress) exit early.
+    _MOD2PKG = {"whisper": "openai-whisper", "cv2": "opencv-python",
+                "sklearn": "scikit-learn", "yaml": "pyyaml",
+                "matcha": "matcha-tts", "hyperpyyaml": "HyperPyYAML",
+                "pil": "pillow", "audioop": "audioop-lts", "wget": "wget"}
+    import sys as _sys
+    errs, _CV, _prev = [], None, None
+    for _attempt in range(6):
         errs = []
         for _cls in ("CosyVoice3", "CosyVoice2", "CosyVoice"):
             try:
@@ -1466,17 +1473,19 @@ def _load_cosyvoice(log: Log):
                 break
             except Exception as e:      # ImportError OR deeper missing deps
                 errs.append(f"{_cls}: {e}")
-        if _CV is not None or _attempt:
+        if _CV is not None or _attempt == 5:
             break
-        import sys as _sys
         _missing = sorted({mm.group(1) for e in errs
                            for mm in [re.search(r"No module named '([^']+)'", str(e))]
                            if mm})
-        if _missing:
-            log("[i] auto-healing missing CosyVoice deps: "
-                + ", ".join(_missing) + " ...")
-            subprocess.run([_sys.executable, "-m", "pip", "install", "-q",
-                            *_missing], capture_output=True, text=True)
+        if not _missing or _missing == _prev:
+            break                        # nothing healable, or stalled
+        _prev = _missing
+        _pkgs = [_MOD2PKG.get(mn.lower(), mn) for mn in _missing]
+        log("[i] auto-healing missing CosyVoice deps (pass "
+            + str(_attempt + 1) + "/6): " + ", ".join(_missing) + " ...")
+        subprocess.run([_sys.executable, "-m", "pip", "install", "-q", *_pkgs],
+                       capture_output=True, text=True)
     if _CV is None:
         raise RuntimeError(
             "CosyVoice engine could not be imported. Deepest errors:\n  "
