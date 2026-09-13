@@ -1497,24 +1497,36 @@ def _load_cosyvoice(log: Log):
             "If Cell 4's install failed, its full pip output shows the cause.")
 
     from modelscope import snapshot_download
-    model_dir = None
-    for repo in ("iic/CosyVoice3-0.5B", "iic/CosyVoice2-0.5B"):
+    # PAIRED engine+checkpoint selection: each CosyVoice class expects
+    # its OWN checkpoint layout (CosyVoice3 wants cosyvoice3.yaml,
+    # CosyVoice2 wants cosyvoice.yaml) - mixing them crashes with
+    # 'yaml not found'. Try pairs in order; first success wins.
+    _PAIRS = (("CosyVoice3", "iic/CosyVoice3-0.5B"),
+              ("CosyVoice2", "iic/CosyVoice2-0.5B"),
+              ("CosyVoice", "iic/CosyVoice-300M"))
+    _errs = []
+    for _cls_name, _repo in _PAIRS:
         try:
-            model_dir = snapshot_download(repo)
-            break
-        except Exception:
+            _mod = __import__("cosyvoice.cli.cosyvoice", fromlist=[_cls_name])
+            _CVc = getattr(_mod, _cls_name)
+        except Exception as e:
+            _errs.append(f"{_cls_name}: import failed ({e})")
             continue
-    if model_dir is None:
-        raise RuntimeError("CosyVoice checkpoint download failed "
-                           "(check network / ModelScope access).")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"🧠 Loading CosyVoice · {Path(model_dir).name} · device={device}")
-    log("   " + log_memory())
-    try:
-        return _CV(model_dir, load_trt=False, fp16=torch.cuda.is_available())
-    except TypeError:                       # older constructor without trt/jit
-        return _CV(model_dir)
+        try:
+            model_dir = snapshot_download(_repo)
+        except Exception as e:
+            _errs.append(f"{_repo}: download failed ({str(e)[:120]})")
+            continue
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        log(f"[GPU] Loading CosyVoice - {_repo} - device={device}")
+        log("   " + log_memory())
+        try:
+            return _CVc(model_dir, load_trt=False, fp16=torch.cuda.is_available())
+        except TypeError:                   # older constructor w/o trt/jit
+            return _CVc(model_dir)
+    raise RuntimeError(
+        "CosyVoice could not load any engine/checkpoint pair. Errors:\n  "
+        + "\n  ".join(_errs))
 
 
 def _load_prompt_speech(path: str, target_sr: int = 16_000):
