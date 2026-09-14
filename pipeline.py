@@ -1496,6 +1496,25 @@ def _load_cosyvoice(log: Log):
             "  then re-run Cell 4 (filtered requirements install).\n"
             "If Cell 4's install failed, its full pip output shows the cause.")
 
+    # Deep deps: imported lazily during model load (not at class import)
+    # - pre-heal them too so Step 7 never dies on 'No module named X'.
+    if _CV is not None:
+        import sys as _sys
+        for _attempt in range(4):
+            _deep = []
+            for _d in ("conformer", "matcha", "hyperpyyaml",
+                       "onnxruntime", "whisper"):
+                try:
+                    __import__(_d)
+                except ModuleNotFoundError:
+                    _deep.append(_d)
+            if not _deep:
+                break
+            _pkgs = [_MOD2PKG.get(d.lower(), d) for d in _deep]
+            log("[i] auto-healing deep CosyVoice deps: "
+                + ", ".join(_deep) + " ...")
+            subprocess.run([_sys.executable, "-m", "pip", "install", "-q",
+                            *_pkgs], capture_output=True, text=True)
     from modelscope import snapshot_download
     # PAIRED engine+checkpoint selection: each CosyVoice class expects
     # its OWN checkpoint layout (CosyVoice3 wants cosyvoice3.yaml,
