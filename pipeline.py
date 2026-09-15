@@ -279,6 +279,23 @@ def _torchaudio_compat() -> None:
         torchaudio.load = _sf_load
     if not hasattr(torchaudio, "save"):
         torchaudio.save = _sf_save
+    # torchcodec-backed native load (torchaudio >= 2.9) crashes when a
+    # library passes an already-decoded TENSOR (e.g. CosyVoice's load_wav
+    # on prompt speech). Pass tensors through as 16 kHz floats instead.
+    if not getattr(torchaudio.load, "_autodub_patched", False):
+        _native_load = torchaudio.load
+
+        def _tensor_load(filepath, *a, **k):
+            import torch as _t
+            if isinstance(filepath, _t.Tensor):
+                t = filepath
+                if t.dim() > 1:
+                    t = t.mean(dim=0, keepdim=True)
+                return t.float(), 16000
+            return _native_load(filepath, *a, **k)
+
+        _tensor_load._autodub_patched = True
+        torchaudio.load = _tensor_load
 
     # torchaudio ≥ 2.9 removed the `backend` submodule — register dummy
     # modules in sys.modules so `import torchaudio.backend.*` doesn't crash.
@@ -1859,7 +1876,9 @@ def step7_synthesize(log: Log, force: bool = False,
             continue
 
         try:
-            prompt_speech = _load_prompt_speech(str(BASE_DIR / prompt_rel))
+            # pass the WAV PATH - CosyVoice loads/resamples it internally;
+            # (a raw tensor crashes torchcodec's AudioDecoder on torchaudio 2.11)
+            prompt_speech = str(BASE_DIR / prompt_rel)
             clip, _ = _cosyvoice_speak(model, row["text"],
                                        f"Speak {row['instruct']}.",
                                        prompt_speech, transcripts.get(spk, ""))
