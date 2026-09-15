@@ -196,3 +196,21 @@ default browser straight into the hosted UI — no console windows, no clutter.
 - SenseVoice tags `neutral` ≈ "calm" in the human-readable emotion log.
 - Demucs writes 4 stems internally but only `vocals.wav` + `music.wav` are kept.
 - On long videos, expect Step 2 (Demucs) to be the slowest GPU stage.
+
+## Cloud persistence & storage
+
+| Item | Size | Where |
+|---|---|---|
+| Model caches (one-time) | ~5 GB | cloud (if persistence ON) / VM (OFF) |
+| Per 5-min audio job | ~0.3 GB | **local VM only - never uploaded** |
+| Uploaded media | media size | local VM only |
+
+**Three modes** (choose in Cell 0 - default is **OFF**):
+
+- **None (default)** - everything runs on the ephemeral Colab VM. Full functionality; after a disconnect models re-download (~15 min) and pipeline steps re-run.
+- **Google Drive (drive)** - model caches live in MyDrive/AutoDub_Studio/model_cache; reconnects restore instantly. Colab's own permission popup handles auth.
+- **HuggingFace Hub (hf)** - model caches sync to a **private** dataset repo YourName/autodub-model-cache using your HF token (paste in Cell 0). Pulled automatically at session start, pushed after setup.
+
+**Auto-cleanup policy:** cloud storage holds **only model caches** - job artifacts
+(audio/outputs) are never uploaded and stay on the VM. The **Clear cloud storage**
+button (Tab 1 > Advanced) wipes cached models (~5 GB re-downloads next session).
