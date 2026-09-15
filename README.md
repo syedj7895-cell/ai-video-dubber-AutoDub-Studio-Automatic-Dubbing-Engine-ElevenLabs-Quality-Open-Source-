@@ -211,6 +211,9 @@ default browser straight into the hosted UI — no console windows, no clutter.
 - **Google Drive (drive)** - model caches live in MyDrive/AutoDub_Studio/model_cache; reconnects restore instantly. Colab's own permission popup handles auth.
 - **HuggingFace Hub (hf)** - model caches sync to a **private** dataset repo YourName/autodub-model-cache using your HF token (paste in Cell 0). Pulled automatically at session start, pushed after setup.
 
+
+**Manual sync:** the optional **Cell 5b · 🔄 Sync model cache → HF Hub** pushes late-arriving models to your private repo anytime — resumable, models-only, safe to re-run.
+
 **Auto-cleanup policy:** cloud storage holds **only model caches** - job artifacts
 (audio/outputs) are never uploaded and stay on the VM. The **Clear cloud storage**
 button (Tab 1 > Advanced) wipes cached models (~5 GB re-downloads next session).
