@@ -352,14 +352,15 @@ def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
         yield f"❌ Unexpected error: {e}", None, None, _chip("err", "Unexpected error")
 
 
-def _run_matching(token, srt_o, srt_t, diagnostic):
+def _run_matching(token, srt_o, srt_t, num_speakers, diagnostic):
     """TAB 2 · steps 3–5 → (console, dataframe, emotion log, clones, status)."""
     yield "⏳ Booting speaker matching …", None, None, None, _chip("run", "Steps 3–5 in progress")
     last = ""
     try:
-        for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
-                                                 force=False,
-                                                 diagnostic=bool(diagnostic)):
+        for line in pipeline.run_script_matching(
+                _fp(token), _fp(srt_o), _fp(srt_t), force=False,
+                num_speakers=int(num_speakers) if num_speakers else 0,
+                diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, None, _chip("run", "Steps 3–5 in progress")
         state = pipeline.PipelineState.load()
@@ -377,7 +378,7 @@ def _run_readiness():
     return _checklist(pipeline.render_readiness())
 
 
-def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
+def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, diagnostic):
     """AUTO-PILOT - chains Tab1 -> Tab2 -> Tab3 with 15 s review pauses.
 
     Console handling: pipeline yields are CUMULATIVE transcripts, so each
@@ -421,9 +422,10 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
 
     yield emit_msg("[auto] Auto-pilot - Tab 2: diarization, emotions & script ...", "run")
     s_start = len(con["text"])
-    for line in pipeline.run_script_matching(_fp(token), _fp(srt_o), _fp(srt_t),
-                                             force=False,
-                                             diagnostic=bool(diagnostic)):
+    for line in pipeline.run_script_matching(
+            _fp(token), _fp(srt_o), _fp(srt_t), force=False,
+            num_speakers=int(num_speakers) if num_speakers else 0,
+            diagnostic=bool(diagnostic)):
         yield emit_stage(line, "run", s_start, "Tab 2 - steps 3-5 running")
     if _stop_event.is_set():
         yield emit_msg("[stop] Auto-pilot stopped by user.", "err")
@@ -466,6 +468,55 @@ def _run_rendering(diagnostic):
             yield last, None, None, _chip("err", "Halted — read the console")
     except Exception as e:  # pragma: no cover
         yield f"❌ Unexpected error: {e}", None, None, _chip("err", "Unexpected error")
+
+
+
+def _spk_overview_rows():
+    return [[pipeline.display_name(r["speaker"]), r["gender"] or "?",
+             r["lines"], r["first"], r["last"], f"{r['total_s']}s"]
+            for r in pipeline.speaker_overview()]
+
+
+def _spk_ids():
+    return [r["speaker"] for r in pipeline.speaker_overview()]
+
+
+def _save_profile(speaker, name, gender):
+    if not speaker:
+        return (_spk_overview_rows(),
+                _chip("err", "No speaker selected"))
+    pipeline.save_speaker_profile(speaker, name or "", gender or "")
+    prof = pipeline.load_speaker_profiles().get(speaker, {})
+    return (_spk_overview_rows(),
+            _chip("ok", f"Saved: {speaker} is now '{prof.get('name', speaker)}' "
+                        f"({prof.get('gender', '?')})"))
+
+
+def _fix_line(row_no, speaker):
+    if not row_no or not speaker:
+        return (_script_rows(), _chip("err", "Pick a row # and a speaker"))
+    ok = pipeline.set_row_speaker(int(row_no), speaker)
+    return (_script_rows(),
+            _chip("ok" if ok else "err",
+                  f"Row {row_no} -> {speaker}" if ok else
+                  f"Row {row_no} not found"))
+
+
+def _clear_cloud():
+    msg = pipeline.clear_cloud_storage(include_models=True)
+    return _chip("ok", msg)
+
+
+
+def _refresh_speakers():
+    ids = _spk_ids()
+    row_nos = [r[0] for r in _script_rows()]
+    v = ids[0] if ids else None
+    r0 = row_nos[0] if row_nos else None
+    return (gr.DataFrame(value=_spk_overview_rows()),
+            gr.Dropdown(choices=ids, value=v),
+            gr.Dropdown(choices=row_nos, value=r0),
+            gr.Dropdown(choices=ids, value=v))
 
 
 def _script_rows():
@@ -540,6 +591,13 @@ def build_ui() -> gr.Blocks:
                                 info="Language of your Translated SRT — the "
                                      "cloned voices speak this",
                                 interactive=True, allow_custom_value=False)
+                        spk_hint_in = gr.Dropdown(
+                            choices=["Auto", "1", "2", "3", "4", "5",
+                                     "6", "7", "8", "9", "10"],
+                            value="Auto", label="👥 Expected speakers",
+                            info="Hint only - helps merge stray voice clusters; "
+                                 "not a strict limit",
+                            interactive=True, allow_custom_value=False)
                         with gr.Accordion("🔑 Advanced — Hugging Face token "
                                           "(Pyannote diarization)", open=False):
                             hf_token_in = gr.Textbox(
@@ -548,6 +606,10 @@ def build_ui() -> gr.Blocks:
                                 placeholder="hf_xxxxxxxxxxxx  (or set HUGGING_FACE_HUB_TOKEN)",
                                 info="Accept the terms at huggingface.co/pyannote/"
                                      "speaker-diarization-3.1 first.")
+                            clear_cloud_btn = gr.Button("🧹 Clear cloud storage",
+                                                        variant="secondary",
+                                                        elem_classes=["icon-btn"])
+                            clear_cloud_msg = gr.HTML("")
                             diag_in = gr.Checkbox(
                                 value=False,
                                 label="🩺 Diagnostic Mode — collect ALL errors "
@@ -601,6 +663,39 @@ def build_ui() -> gr.Blocks:
                                                elem_classes=["console"])
                         gr.Button("Copy console", variant="secondary").click(
                             fn=None, inputs=[match_log], js=_COPY_JS)
+                gr.Markdown("### 🧬 Speaker identification")
+                gr.Markdown("Click a speaker below to give it a custom name "
+                            "and pick its gender - saves instantly and applies "
+                            "everywhere.")
+                spk_table = gr.DataFrame(
+                    headers=["Speaker", "Gender", "Lines", "First", "Last",
+                             "Total"],
+                    interactive=False, elem_classes=["glass"])
+                with gr.Row():
+                    spk_pick = gr.Dropdown(label="Speaker",
+                                           interactive=True,
+                                           allow_custom_value=False)
+                    spk_name = gr.Textbox(label="Custom name",
+                                          placeholder="e.g. Narrator",
+                                          interactive=True)
+                    spk_gender = gr.Dropdown(choices=["", "male", "female"],
+                                             value="", label="Gender",
+                                             interactive=True,
+                                             allow_custom_value=False)
+                    spk_save_btn = gr.Button("Save", variant="primary")
+                spk_save_msg = gr.HTML("")
+                gr.Markdown("### ⚙️ Fix a line's speaker")
+                gr.Markdown("Diarization got a line wrong? Pick its row # and "
+                            "the correct speaker.")
+                with gr.Row():
+                    fix_row = gr.Dropdown(label="Row #", interactive=True,
+                                          allow_custom_value=False)
+                    fix_spk = gr.Dropdown(label="Correct speaker",
+                                          interactive=True,
+                                          allow_custom_value=False)
+                    fix_btn = gr.Button("Apply", variant="primary")
+                fix_msg = gr.HTML("")
+                gr.Markdown("### 📄 Consolidated dubbing script")
                 gr.Markdown("### 🧾 Consolidated dubbing script")
                 script_df = gr.DataFrame(
                     headers=["#", "Start", "End", "Speaker", "Emotion",
@@ -684,13 +779,17 @@ def build_ui() -> gr.Blocks:
         )
         match_btn.click(
             fn=_run_matching,
-            inputs=[hf_token_in, srt_orig_in, srt_trans_in, diag_in],
+            inputs=[hf_token_in, srt_orig_in, srt_trans_in, diag_in, spk_hint_in],
             outputs=[match_log, script_df, emotion_log_tb, clone_files, match_status],
+        ).then(
+            fn=_refresh_speakers,
+            inputs=None,
+            outputs=[spk_table, spk_pick, fix_row, fix_spk],
         )
         auto_btn.click(
             fn=_run_full_auto,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in, diag_in],
+                    lang_orig_in, lang_target_in, diag_in, spk_hint_in],
             outputs=[render_log, final_audio, final_video, render_status,
                      match_status, analysis_status],
         )
@@ -705,6 +804,19 @@ def build_ui() -> gr.Blocks:
             outputs=[ready_html],
         )
 
+        # speaker-ID editor + per-line fixer + cloud clear
+        spk_save_btn.click(
+            fn=_save_profile,
+            inputs=[spk_pick, spk_name, spk_gender],
+            outputs=[spk_table, spk_save_msg],
+        )
+        fix_btn.click(
+            fn=_fix_line,
+            inputs=[fix_row, fix_spk],
+            outputs=[script_df, fix_msg],
+        )
+        clear_cloud_btn.click(fn=_clear_cloud, inputs=None,
+                              outputs=[clear_cloud_msg])
     return demo
 
 

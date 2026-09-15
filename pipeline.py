@@ -58,6 +58,7 @@ TTS_REPORT_JSON = OUTPUTS_DIR / "tts_report.json"             # Step 7 artifact
 FINAL_MIX_WAV = OUTPUTS_DIR / "final_mix.wav"                 # Step 8 artifact
 FINAL_VIDEO_MP4 = OUTPUTS_DIR / "final_dubbed.mp4"            # Step 8 artifact
 PROMPT_TRANSCRIPTS_JSON = OUTPUTS_DIR / "clone_prompt_transcripts.json"
+SPEAKER_PROFILES_JSON = OUTPUTS_DIR / "speaker_profiles.json"   # names/gender
 STATE_JSON = OUTPUTS_DIR / "state.json"                   # pipeline state
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg",
@@ -493,6 +494,129 @@ def load_srt(path) -> List[dict]:
     return cues
 
 
+
+# ---------------------------------------------------------------------------
+#  Speaker profiles + cloud-storage helpers (Tab 2 editing / persistence)
+# ---------------------------------------------------------------------------
+
+def _persist_config() -> dict:
+    """Cloud-persistence config written by Colab Cell 0 (mode/hf_token)."""
+    p = Path("/content/autodub_persist.json")
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"mode": "none"}
+
+
+def load_speaker_profiles() -> Dict[str, dict]:
+    """speaker -> {name, gender} custom edits (Tab 2 identification table)."""
+    if SPEAKER_PROFILES_JSON.exists():
+        try:
+            return json.loads(SPEAKER_PROFILES_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_speaker_profile(speaker: str, name: str = "", gender: str = "") -> dict:
+    profiles = load_speaker_profiles()
+    prof = profiles.setdefault(speaker, {})
+    if name:
+        prof["name"] = name.strip()
+    if gender:
+        prof["gender"] = gender.strip().lower()
+    SPEAKER_PROFILES_JSON.write_text(json.dumps(profiles, indent=2,
+                                                ensure_ascii=False),
+                                     encoding="utf-8")
+    return profiles
+
+
+def display_name(speaker: str) -> str:
+    prof = load_speaker_profiles().get(speaker, {})
+    return prof.get("name") or speaker
+
+
+def speaker_overview() -> List[dict]:
+    """Per-speaker stats for the Tab 2 identification table."""
+    if not DIARIZATION_JSON.exists():
+        return []
+    diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
+    profiles = load_speaker_profiles()
+    rows = []
+    for spk in sorted(diar.get("speakers", {})):
+        cues = [c for c in diar.get("cues", []) if c.get("speaker") == spk]
+        prof = profiles.get(spk, {})
+        rows.append({
+            "speaker": spk,
+            "name": prof.get("name", ""),
+            "gender": prof.get("gender", ""),
+            "lines": len(cues),
+            "first": fmt_ts(min((c["start"] for c in cues), default=0.0)),
+            "last": fmt_ts(max((c["end"] for c in cues), default=0.0)),
+            "total_s": round(sum(c["end"] - c["start"] for c in cues), 1),
+        })
+    return rows
+
+
+def set_row_speaker(index: int, speaker: str) -> bool:
+    """Per-line speaker fixer: rewrite the speaker of one consolidated row."""
+    if not FINAL_SCRIPT_JSON.exists():
+        return False
+    rows = json.loads(FINAL_SCRIPT_JSON.read_text(encoding="utf-8"))
+    hit = False
+    for r in rows:
+        if r.get("index") == index:
+            r["speaker"] = speaker
+            hit = True
+    if hit:
+        FINAL_SCRIPT_JSON.write_text(json.dumps(rows, indent=2,
+                                                ensure_ascii=False),
+                                     encoding="utf-8")
+    return hit
+
+
+def clear_cloud_storage(include_models: bool = True) -> str:
+    """Wipe cached models from the configured cloud backend (Drive / HF).
+    Job artifacts are never stored in the cloud (auto-cleanup), so this
+    only frees model-cache space."""
+    import shutil as _sh
+    cfg = _persist_config()
+    mode = cfg.get("mode", "none")
+    if mode == "drive":
+        base = Path("/content/drive/MyDrive/AutoDub_Studio")
+        if not base.exists():
+            return "Drive not mounted - nothing to clear."
+        freed = []
+        if include_models:
+            mc = base / "model_cache"
+            if mc.exists():
+                _sh.rmtree(mc, ignore_errors=True)
+                freed.append("Drive model_cache")
+        return "Cleared: " + (", ".join(freed) if freed else "nothing found")
+    if mode == "hf":
+        repo, token = cfg.get("hf_repo", ""), cfg.get("hf_token", "")
+        if not (repo and token):
+            return "HF backend not configured - nothing to clear."
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=token)
+            files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+            if include_models:
+                for f in files:
+                    try:
+                        api.delete_file(repo_id=repo, repo_type="dataset",
+                                        path_in_repo=f)
+                    except Exception:
+                        pass
+                return f"Cleared: HF dataset {repo} ({len(files)} file(s))"
+            return "HF dataset kept (include_models=False)."
+        except Exception as e:
+            return f"HF cleanup failed: {str(e)[:160]}"
+    return "Persistence is OFF - no cloud storage in use."
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  STEP 1 · AUDIO EXTRACTION  (MoviePy / raw FFmpeg bindings)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -755,7 +879,8 @@ def _mine_clone_prompts(log: Log,
 def step3_diarization(hf_token: Optional[str],
                       original_srt_path: Optional[str],
                       log: Log,
-                      force: bool = False) -> dict:
+                      force: bool = False,
+                      expected_speakers: int = 0) -> dict:
     """
     Pyannote 3.1 diarization of the clean vocal track, cross-referenced with
     the user's ORIGINAL SRT timeline (max-overlap speaker vote per cue), then
@@ -894,6 +1019,26 @@ def step3_diarization(hf_token: Optional[str],
     # canonical identity tags — most total speech becomes Speaker1
     ranked = sorted(raw_totals.items(), key=lambda kv: -kv[1])
     canon = {raw: f"Speaker{i + 1}" for i, (raw, _) in enumerate(ranked)}
+    # optional user hint: keep the N largest voice clusters and fold the
+    # rest into their nearest big cluster (temporal-overlap affinity)
+    n_exp = int(expected_speakers or 0)
+    if 0 < n_exp < len(ranked):
+        keep = [raw for raw, _ in ranked[:n_exp]]
+        keep_ivs = {r: _merge_intervals([(t["start"], t["end"])
+                                         for t in turns if t["raw"] == r])
+                    for r in keep}
+        for raw, _tot in ranked[n_exp:]:
+            ivs = _merge_intervals([(t["start"], t["end"])
+                                    for t in turns if t["raw"] == raw])
+            best, best_ov = keep[0], 0.0
+            for r in keep:
+                ov = sum(_overlap(a, b, c, d) for a, b in ivs
+                         for c, d in keep_ivs[r])
+                if ov > best_ov:
+                    best, best_ov = r, ov
+            canon[raw] = canon[best]
+            log(f"   hint: folded '{raw}' into '{canon[best]}' "
+                f"(nearest of {n_exp} expected speakers)")
     for row in cue_rows:
         row["speaker"] = canon.get(row["raw"], "Speaker1")
 
@@ -1239,6 +1384,7 @@ def run_script_matching(hf_token: Optional[str],
                         original_srt_path: Optional[str],
                         translated_srt_path: Optional[str],
                         force: bool = False,
+                        num_speakers: int = 0,
                         diagnostic: bool = False) -> Generator[str, None, None]:
     """TAB 2 · Steps 3–5: diarization → emotion scan → script assembly.
 
@@ -1263,7 +1409,7 @@ def run_script_matching(hf_token: Optional[str],
         yield log("─" * 62)
         diar: Optional[dict] = None
         try:
-            diar = step3_diarization(hf_token, original_srt_path, log, force=force)
+            diar = step3_diarization(hf_token, original_srt_path, log, force=force, expected_speakers=num_speakers)
             state.mark("step3", speakers=str(len(diar.get("speakers", {}))))
             state.save()
             yield log("   " + log_memory())
