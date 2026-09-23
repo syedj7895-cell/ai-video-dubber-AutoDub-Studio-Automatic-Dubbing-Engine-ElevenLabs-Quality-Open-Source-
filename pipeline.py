@@ -634,6 +634,127 @@ def clear_cloud_storage(include_models: bool = True) -> str:
     return "Persistence is OFF - no cloud storage in use."
 
 
+def _cache_roots():
+    import os
+    home = os.path.expanduser("~")
+    ms = Path(os.environ.get("MODELSCOPE_CACHE", home + "/.cache/modelscope"))
+    hf = Path(os.environ.get("HF_HOME", home + "/.cache/huggingface"))
+    return ms, hf
+
+
+def _copy_tree(src, dst) -> int:
+    import shutil as _sh
+    n = 0
+    src = Path(src)
+    if not src.exists():
+        return 0
+    for f in src.rglob("*"):
+        if f.is_file() and f.suffix != ".lock" and "tmp" not in f.name:
+            out = Path(dst) / f.relative_to(src)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if not out.exists():
+                _sh.copy2(str(f), str(out))
+                n += 1
+    return n
+
+
+def restore_model_cache(hf_token: str = "") -> str:
+    """Reuse a prior model cache (HF Hub if token, else Google Drive).
+    Never raises - returns a human-readable status string."""
+    ms, hf = _cache_roots()
+    ms.mkdir(parents=True, exist_ok=True)
+    hf.mkdir(parents=True, exist_ok=True)
+    stage = Path("/content/autodub_restore")
+    tok = (hf_token or "").strip() or _persist_config().get("hf_token", "")
+    if tok:
+        try:
+            from huggingface_hub import HfApi, snapshot_download
+            api = HfApi(token=tok)
+            repo = (_persist_config().get("hf_repo")
+                    or f"{api.whoami().get('name', 'user')}/autodub-model-cache")
+            snapshot_download(repo, repo_type="dataset", local_dir=str(stage))
+            a = _copy_tree(stage / "modelscope", ms)
+            b = _copy_tree(stage / "hf", hf)
+            return f"Restored from HF Hub: {a + b} file(s)"
+        except Exception as e:
+            return f"HF Hub has no usable cache ({str(e)[:120]})"
+    try:
+        drv = Path("/content/drive/MyDrive/AutoDub_Studio/model_cache")
+        if not Path("/content/drive/MyDrive").exists():
+            from google.colab import drive as _d
+            _d.mount("/content/drive")
+        if drv.exists():
+            a = _copy_tree(drv / "modelscope", ms)
+            b = _copy_tree(drv / "hf", hf)
+            return f"Restored from Drive: {a + b} file(s)"
+        return "No prior cache found - models will download normally."
+    except Exception as e:
+        return f"No prior cache (Drive unavailable: {str(e)[:100]})"
+
+
+def upload_model_cache(progress_cb=None, backend: str = "hf",
+                       hf_token: str = "", hf_repo: str = "") -> str:
+    """Upload cached models for future sessions. models-only (auto-cleanup).
+    progress_cb(pct, message) is called at each step when supplied."""
+    import shutil as _sh
+    ms, hf = _cache_roots()
+
+    def _p(pct, msg):
+        if progress_cb:
+            try:
+                progress_cb(pct, msg)
+            except Exception:
+                pass
+
+    if backend == "drive":
+        try:
+            drv = Path("/content/drive/MyDrive/AutoDub_Studio/model_cache")
+            if not Path("/content/drive/MyDrive").exists():
+                from google.colab import drive as _d
+                _d.mount("/content/drive")
+            _p(5, "copying models -> Drive ...")
+            a = _copy_tree(ms, drv / "modelscope")
+            b = _copy_tree(hf, drv / "hf")
+            _p(100, f"Drive upload done ({a + b} file(s))")
+            return f"Saved to Drive: {a + b} file(s)"
+        except Exception as e:
+            _p(100, "Drive upload failed")
+            return f"Drive upload failed: {str(e)[:150]}"
+
+    # HF Hub (default) - resumable
+    tok = (hf_token or "").strip() or _persist_config().get("hf_token", "")
+    if not tok:
+        _p(100, "HF upload needs a token")
+        return "HF upload needs a token (paste it in the persistence panel)."
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=tok)
+        repo = (hf_repo or _persist_config().get("hf_repo")
+                or f"{api.whoami().get('name', 'user')}/autodub-model-cache")
+        _p(3, "creating private repo ...")
+        api.create_repo(repo, repo_type="dataset", private=True, exist_ok=True)
+        stage = Path("/root/.cache/autodub_stage")
+        _sh.rmtree(stage, ignore_errors=True)
+        _p(10, "staging models ...")
+        a = _copy_tree(ms, stage / "modelscope")
+        b = _copy_tree(hf, stage / "hf")
+        total = max(1, a + b)
+        _p(35, f"uploading {a + b} file(s) to HF (resumable) ...")
+        api.upload_folder(folder_path=str(stage), repo_id=repo,
+                          repo_type="dataset",
+                          commit_message="AutoDub model cache sync")
+        _p(100, f"HF upload done -> {repo}")
+        cfg = _persist_config()
+        cfg.update({"mode": "hf", "hf_token": tok, "hf_repo": repo,
+                    "auto_cleanup": True})
+        Path("/content/autodub_persist.json").write_text(
+            json.dumps(cfg), encoding="utf-8")
+        return f"Uploaded to HF Hub: {repo} ({a + b} file(s))"
+    except Exception as e:
+        _p(100, "HF upload failed")
+        return f"HF upload failed: {str(e)[:180]}"
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  STEP 1 · AUDIO EXTRACTION  (MoviePy / raw FFmpeg bindings)
 # ═════════════════════════════════════════════════════════════════════════════

@@ -502,6 +502,39 @@ def _fix_line(row_no, speaker):
                   f"Row {row_no} not found"))
 
 
+
+def _persist_bar(pct, msg):
+    pct = max(0, min(100, int(pct)))
+    filled = int(pct / 5)
+    bar = "█" * filled + "░" * (20 - filled)
+    return (f'<div class="glass" style="padding:10px 14px;">'
+            f'<code>[{bar}] {pct}%</code> · {msg}</div>')
+
+
+def _start_upload(persist_on, backend, token):
+    """Streaming upload: yields progress updates; never blocks the UI queue."""
+    if not persist_on:
+        yield _chip("err", "Persistence is OFF - enable it first"), \
+              gr.update(), _chip("idle", "")
+        return
+    steps = []
+    def _cb(pct, msg):
+        steps.append((pct, msg))
+    res = pipeline.upload_model_cache(progress_cb=_cb, backend=backend,
+                                      hf_token=token or "")
+    for pct, msg in steps:
+        yield _persist_bar(pct, msg), gr.update(), \
+              _chip("run", msg)
+    yield _persist_bar(100, res), gr.update(), \
+          _chip("ok" if "failed" not in res.lower() else "err", res)
+
+
+def _toggle_persist(on):
+    return _chip("ok" if on else "idle",
+                 "Persistence ON - choose backend & click Start upload"
+                 if on else "Persistence OFF")
+
+
 def _clear_cloud():
     msg = pipeline.clear_cloud_storage(include_models=True)
     return _chip("ok", msg)
@@ -610,6 +643,25 @@ def build_ui() -> gr.Blocks:
                                                         variant="secondary",
                                                         elem_classes=["icon-btn"])
                             clear_cloud_msg = gr.HTML("")
+                            gr.Markdown("---")
+                            gr.Markdown("#### ☁️ Model persistence "
+                                        "(optional)")
+                            persist_on = gr.Checkbox(
+                                value=False,
+                                label="Enable model persistence "
+                                      "(reuse models across sessions)")
+                            persist_backend = gr.Radio(
+                                choices=[("Hugging Face Hub", "hf"),
+                                         ("Google Drive", "drive")],
+                                value="hf", label="Backend", interactive=True)
+                            persist_token = gr.Textbox(
+                                type="password", label="HF token (for HF Hub)",
+                                placeholder="hf_xxxxxxxxxxxx",
+                                info="Required for HF Hub upload/restore.")
+                            upload_btn = gr.Button("⬆️ Start upload (background)",
+                                                   variant="primary")
+                            upload_progress = gr.HTML("")
+                            upload_msg = gr.HTML("")
                             diag_in = gr.Checkbox(
                                 value=False,
                                 label="🩺 Diagnostic Mode — collect ALL errors "
@@ -815,6 +867,13 @@ def build_ui() -> gr.Blocks:
             inputs=[fix_row, fix_spk],
             outputs=[script_df, fix_msg],
         )
+        upload_btn.click(
+            fn=_start_upload,
+            inputs=[persist_on, persist_backend, persist_token],
+            outputs=[upload_progress, upload_msg, analysis_status],
+        )
+        persist_on.change(fn=_toggle_persist, inputs=[persist_on],
+                          outputs=[analysis_status])
         clear_cloud_btn.click(fn=_clear_cloud, inputs=None,
                               outputs=[clear_cloud_msg])
     return demo

@@ -212,8 +212,27 @@ default browser straight into the hosted UI — no console windows, no clutter.
 - **HuggingFace Hub (hf)** - model caches sync to a **private** dataset repo YourName/autodub-model-cache using your HF token (paste in Cell 0). Pulled automatically at session start, pushed after setup.
 
 
-**Manual sync:** the optional **Cell 5b · 🔄 Sync model cache → HF Hub** pushes late-arriving models to your private repo anytime — resumable, models-only, safe to re-run.
 
+
+### Model persistence (UI-driven)
+
+- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
+- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
+- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM. Use **Clear cloud storage** to free the cache.
+
+
+### Model persistence (UI-driven)
+
+- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
+- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
+- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM. Use **Clear cloud storage** to free the cache.
+
+
+### Model persistence (UI-driven)
+
+- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
+- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
+- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM.
 **Auto-cleanup policy:** cloud storage holds **only model caches** - job artifacts
 (audio/outputs) are never uploaded and stay on the VM. The **Clear cloud storage**
 button (Tab 1 > Advanced) wipes cached models (~5 GB re-downloads next session).
