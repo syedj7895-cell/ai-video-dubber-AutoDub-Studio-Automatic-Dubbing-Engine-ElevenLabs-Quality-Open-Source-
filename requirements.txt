@@ -26,6 +26,7 @@ pandas
 pysrt==1.1.2                 # Step 5 · SRT parsing & timestamp mapping (pinned)
 pydub
 soundfile
+indic-transliteration   # Step 5.5 Roman -> Devanagari
 moviepy>=1.0.3               # Step 1 fallback extractor (if FFmpeg missing)
 ffmpeg-python==0.2.0
 tqdm

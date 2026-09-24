@@ -1324,7 +1324,8 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
                     res = model.generate(input=str(BASE_DIR / rel), cache={},
                                          language="auto", use_itn=False)
                     raw = res[0].get("text", "") if res else ""
-                    ptexts[spk] = tag_re.sub("", raw).strip()
+                    ptexts[spk] = re.sub(r"<\|[^|>]*\|>", " ", raw).strip()
+                    ptexts[spk] = re.sub(r"\s+", " ", ptexts[spk]).strip()
                     log(f"   {spk}: '{ptexts[spk][:48]}'")
                 except Exception as e:
                     ptexts[spk] = ""
@@ -1348,6 +1349,39 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
 # ═════════════════════════════════════════════════════════════════════════════
 #  STEP 5 · SRT MAPPING & CONSOLIDATED SCRIPT ASSEMBLY  (pysrt)
 # ═════════════════════════════════════════════════════════════════════════════
+
+INDIC_LANGS = {"hi": "devanagari", "sa": "devanagari", "mr": "devanagari",
+               "ne": "devanagari", "bn": "bengali", "gu": "gujarati",
+               "pa": "gurmukhi", "ta": "tamil", "te": "telugu",
+               "kn": "kannada", "ml": "malayalam"}
+
+
+def transliterate_to_native(text: str, target_lang: str) -> str:
+    """Roman (Latin) Indic text -> native script (Devanagari for hi) so
+    the TTS front-end can pronounce it. No-op for non-Indic targets or
+    native-script text. Fail-soft (returns the original on any error)."""
+    scheme = INDIC_LANGS.get((target_lang or "").lower())
+    if not scheme or not text:
+        return text
+    if any(ord(ch) > 0x0900 for ch in text):
+        return text
+    if not any(("a" <= ch.lower() <= "z") for ch in text):
+        return text
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+        return transliterate(text, sanscript.ITRANS, scheme)
+    except Exception:
+        return text
+
+
+def _translit_on() -> bool:
+    """User toggle (Tab 1) — default ON."""
+    try:
+        return PipelineState.load().artifacts.get("translit", "1") == "1"
+    except Exception:
+        return True
+
 
 def step5_assemble_script(translated_srt_path: str,
                           log: Log,
@@ -1405,7 +1439,9 @@ def step5_assemble_script(translated_srt_path: str,
             "target_language": target_language,
             "clone_prompt": prompts[0] if prompts else "",
             "original_text": oc.get("text", ""),
-            "translated_text": tc["text"],
+            "translated_text": (
+                transliterate_to_native(tc["text"], target_language)
+                if _translit_on() else tc["text"]),
         })
 
     FINAL_SCRIPT_JSON.write_text(json.dumps(rows, indent=2, ensure_ascii=False),
@@ -1441,6 +1477,7 @@ def run_import_and_analysis(media_path: str,
                             force: bool = False,
                             source_lang: str = "auto",
                             target_lang: str = "en",
+                            translit: bool = True,
                             diagnostic: bool = False) -> Generator[str, None, None]:
     """TAB 1 · Steps 1–2: extract audio → Demucs vocal/music split.
 
@@ -1470,6 +1507,7 @@ def run_import_and_analysis(media_path: str,
         # dubbing language choices (consumed by Steps 4 & 7)
         state.artifacts["source_lang"] = str(source_lang or "auto")
         state.artifacts["target_lang"] = str(target_lang or "en")
+        state.artifacts["translit"] = "1" if translit else "0"
         yield log(f"🌐 Languages · original: {state.artifacts['source_lang']}"
                   f" → dub: {state.artifacts['target_lang']}")
 
@@ -1819,6 +1857,8 @@ def _load_cosyvoice(log: Log):
             model_dir = snapshot_download(_repo)
         except Exception as e:
             _errs.append(f"{_repo}: download failed ({str(e)[:120]})")
+            log(f"[i] CosyVoice checkpoint {_repo} unavailable: "
+                + str(e)[:120])
             continue
         device = "cuda" if torch.cuda.is_available() else "cpu"
         log(f"[GPU] Loading CosyVoice - {_repo} - device={device}")
@@ -1853,7 +1893,9 @@ def _ensure_prompt_transcripts(log: Log) -> Dict[str, str]:
     when only the cached path was taken.
     """
     if PROMPT_TRANSCRIPTS_JSON.exists():
-        return json.loads(PROMPT_TRANSCRIPTS_JSON.read_text(encoding="utf-8"))
+        raw = json.loads(PROMPT_TRANSCRIPTS_JSON.read_text(encoding="utf-8"))
+        return {k: re.sub(r"<\|[^|>]*\|>", " ", str(v)).strip()
+                for k, v in raw.items()}
     diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
     todo = {spk: (info.get("clone_prompts") or [""])[0]
             for spk, info in diar.get("speakers", {}).items()
@@ -1904,12 +1946,16 @@ def _cosyvoice_speak(model, text: str, instruct: str, prompt_speech,
     sr = int(getattr(model, "sample_rate", 24_000))
 
     attempts = []
-    if instruct and hasattr(model, "inference_instruct2"):
-        attempts.append(lambda: model.inference_instruct2(
-            text, instruct, prompt_speech, stream=False))
+    # clone (zero-shot) FIRST for faithful speaker voice + emotion;
+    # instruct2 is a delimited fallback; cross-lingual last.
     if prompt_text:
         attempts.append(lambda: model.inference_zero_shot(
             text, prompt_text, prompt_speech, stream=False))
+    if instruct and hasattr(model, "inference_instruct2"):
+        _ins = instruct if "<|endofprompt|>" in instruct else (
+            instruct.rstrip(". ") + "<|endofprompt|>")
+        attempts.append(lambda: model.inference_instruct2(
+            text, _ins, prompt_speech, stream=False))
     if hasattr(model, "inference_cross_lingual"):
         attempts.append(lambda: model.inference_cross_lingual(
             text, prompt_speech, stream=False))

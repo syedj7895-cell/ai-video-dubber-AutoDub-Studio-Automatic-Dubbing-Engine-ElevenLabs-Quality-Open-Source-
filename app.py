@@ -325,7 +325,8 @@ def _fp(f):
 #  UI ⇄ pipeline callback generators (streaming console)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
+def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, translit,
+                 diagnostic):
     """TAB 1 · steps 1–2 → (console, vocals preview, music preview, status)."""
     media_path = _fp(media)
     if not media_path:
@@ -339,6 +340,7 @@ def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, diagnostic):
                 media_path, force=False,
                 source_lang=lang_o or "auto",
                 target_lang=lang_t or "en",
+                translit=bool(translit),
                 diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, _chip("run", "Steps 1–2 in progress")
@@ -378,7 +380,7 @@ def _run_readiness():
     return _checklist(pipeline.render_readiness())
 
 
-def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, diagnostic):
+def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, translit, diagnostic):
     """AUTO-PILOT - chains Tab1 -> Tab2 -> Tab3 with 15 s review pauses.
 
     Console handling: pipeline yields are CUMULATIVE transcripts, so each
@@ -410,6 +412,7 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, dia
     for line in pipeline.run_import_and_analysis(_fp(media), force=False,
                                                  source_lang=lang_o or "auto",
                                                  target_lang=lang_t or "en",
+                                                 translit=bool(translit),
                                                  diagnostic=bool(diagnostic)):
         yield emit_stage(line, "run", s_start, "Tab 1 - steps 1-2 running")
     if _stop_event.is_set():
@@ -631,6 +634,10 @@ def build_ui() -> gr.Blocks:
                             info="Hint only - helps merge stray voice clusters; "
                                  "not a strict limit",
                             interactive=True, allow_custom_value=False)
+                        translit_in = gr.Checkbox(
+                            value=True,
+                            label="🔤 Transliterate Roman text to native script (e.g. Hindi)",
+                            info="Auto-converts Latin-script translated lines (Roman Hindi) into Devanagari so TTS can pronounce them.")
                         with gr.Accordion("🔑 Advanced — Hugging Face token "
                                           "(Pyannote diarization)", open=False):
                             hf_token_in = gr.Textbox(
@@ -826,7 +833,7 @@ def build_ui() -> gr.Blocks:
         analyze_btn.click(
             fn=_run_analysis,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in, diag_in],
+                    lang_orig_in, lang_target_in, translit_in, diag_in],
             outputs=[import_log, vocals_preview, music_preview, analysis_status],
         )
         match_btn.click(
@@ -841,7 +848,8 @@ def build_ui() -> gr.Blocks:
         auto_btn.click(
             fn=_run_full_auto,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in, diag_in, spk_hint_in],
+                    lang_orig_in, lang_target_in, diag_in, spk_hint_in,
+                    translit_in],
             outputs=[render_log, final_audio, final_video, render_status,
                      match_status, analysis_status],
         )
