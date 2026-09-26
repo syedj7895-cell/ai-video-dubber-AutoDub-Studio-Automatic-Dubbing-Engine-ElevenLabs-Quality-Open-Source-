@@ -721,7 +721,10 @@ class _CosyVoiceBase(TTSBackend):
             pipeline._load_cosyvoice(log)
             self._loaded = True
         except Exception as e:
-            raise RuntimeError(f"{self._label} initialization error: {e}") from e
+            # Fail soft: stay unloaded but do not raise, so synthesize() can
+            # still render through the reliable neural fallback voice.
+            log(f"{self._label} could not be initialised: {e}")
+            self._loaded = False
 
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
