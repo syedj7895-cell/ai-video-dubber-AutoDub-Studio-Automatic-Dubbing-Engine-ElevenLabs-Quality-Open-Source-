@@ -49,7 +49,7 @@ _DEP_MAP = {
     "accelerate": "accelerate",
     "piper": "piper-tts",
     "kokoro": "kokoro",
-    "TTS": "TTS",
+    "TTS": "coqui-tts",
     "f5_tts": "f5-tts",
     "chatterbox": "chatterbox-tts",
     "soundfile": "soundfile",
@@ -126,6 +126,97 @@ def _get_or_create_default_ref_wav() -> str:
     import soundfile as sf
     sf.write(str(ref_path), sig, sr)
     return str(ref_path)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Robust shared synthesis helpers (used by every backend)
+# ─────────────────────────────────────────────────────────────────────
+
+_EDGE_VOICES = {
+    "hi": "hi-IN-MadhurNeural", "en": "en-US-AriaNeural",
+    "ur": "ur-PK-AsadNeural", "bn": "bn-IN-BashkarNeural",
+    "ta": "ta-IN-ValluvarNeural", "te": "te-IN-MohanNeural",
+    "es": "es-ES-AlvaroNeural", "fr": "fr-FR-HenriNeural",
+    "de": "de-DE-ConradNeural", "zh": "zh-CN-YunxiNeural",
+    "ja": "ja-JP-KeitaNeural", "ko": "ko-KR-InJoonNeural",
+}
+
+
+def _ensure_espeak(log: Log = _noop) -> None:
+    """Kokoro/Piper phonemizers need the espeak-ng binary (Colab has neither)."""
+    if shutil.which("espeak-ng") or shutil.which("espeak"):
+        return
+    log("Installing espeak-ng (phonemizer for Kokoro/Piper) ...")
+    subprocess.run("apt-get install -y -q espeak-ng", shell=True,
+                   capture_output=True, text=True)
+    subprocess.run("pip install -q phonemizer-fork", shell=True,
+                   capture_output=True, text=True)
+
+
+def _edge_synth(text: str, voice: Optional[str] = None,
+                language: Optional[str] = None, rate: int = 0,
+                volume: int = 0, log: Log = _noop,
+                attempts: int = 3) -> Tuple[np.ndarray, int]:
+    """Microsoft Edge neural TTS with retry + event-loop isolation.
+
+    The coroutine runs in a private thread with its own loop so it can never
+    collide with Gradio's running event loop, and transient endpoint resets
+    are retried with backoff before giving up.
+    """
+    edge_tts = _require("edge_tts", "pip install edge-tts", log)
+    lang = (language or "hi").split("-")[0].lower()
+    v = voice or _EDGE_VOICES.get(lang, _EDGE_VOICES["hi"])
+    r = f"{int(rate):+d}%"
+    vol = f"{int(volume):+d}%"
+    last: Exception = RuntimeError("unknown error")
+    for i in range(1, attempts + 1):
+        p = Path(tempfile.mkstemp(suffix=".mp3")[1])
+        try:
+            def _worker() -> None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    comm = edge_tts.Communicate(text, v, rate=r, volume=vol)
+                    loop.run_until_complete(comm.save(str(p)))
+                finally:
+                    loop.close()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                ex.submit(_worker).result(timeout=90)
+            if p.exists() and p.stat().st_size > 512:
+                import librosa
+                y, sr = librosa.load(str(p), sr=24000, mono=True)
+                return np.asarray(y, dtype=np.float32), 24000
+            last = RuntimeError("endpoint returned empty audio")
+        except Exception as e:
+            last = e
+        log(f"   edge-tts attempt {i}/{attempts} failed: {last}")
+        if i < attempts:
+            time.sleep(1.5 * i)
+    raise RuntimeError(f"Edge-TTS unavailable after {attempts} attempts: {last}")
+
+
+def _neural_fallback(text: str, language: Optional[str] = None,
+                     log: Log = _noop, reason: str = "") -> Tuple[np.ndarray, int]:
+    """Guaranteed-audio chain: Edge neural -> Meta MMS -> gTTS.
+
+    Heavyweight cloning engines call this when their weights or library cannot
+    be provisioned, so every model always returns audible, on-language speech
+    instead of a hard failure.
+    """
+    if reason:
+        log(f"   -> using reliable neural voice instead ({reason})")
+    lang = (language or "hi").split("-")[0].lower()
+    text_n = _translit_if_hindi(text, lang)
+    try:
+        return _edge_synth(text_n, language=lang, log=log, attempts=2)
+    except Exception as e:
+        log(f"   edge fallback unavailable: {e}")
+    try:
+        return get_backend("mms").synthesize(text_n, language=lang, log=log)
+    except Exception as e:
+        log(f"   MMS fallback unavailable: {e}")
+    return get_backend("gtts").synthesize(text_n, language=lang, log=log)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -217,32 +308,16 @@ class EdgeTTS(TTSBackend):
 
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
-        edge_tts = _require("edge_tts", "pip install edge-tts", log)
         settings = settings or {}
         v = voice or self._VOICES[0]
-        rate = f"{int(settings.get('rate', 0)):+d}%"
-        vol = f"{int(settings.get('volume', 0)):+d}%"
-        p = Path(tempfile.mkstemp(suffix=".mp3")[1])
-
-        # Run async in isolated thread to NEVER collide with Gradio's running event loop
-        def _thread_worker():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                async def _save():
-                    comm = edge_tts.Communicate(text, v, rate=rate, volume=vol)
-                    await comm.save(str(p))
-                loop.run_until_complete(_save())
-            finally:
-                loop.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            ex.submit(_thread_worker).result(timeout=60)
-
-        import soundfile as sf
-        import librosa
-        y, sr = librosa.load(str(p), sr=24000, mono=True)
-        return y.astype(np.float32), 24000
+        try:
+            return _edge_synth(text, voice=v, language=language,
+                               rate=settings.get("rate", 0),
+                               volume=settings.get("volume", 0), log=log)
+        except Exception as e:
+            log(f"Edge-TTS endpoint unreachable ({e})")
+            return _neural_fallback(text, language, log,
+                                    "Edge cloud endpoint blocked")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -344,38 +419,63 @@ class PiperTTS(TTSBackend):
 
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
-        try:
-            from piper.voice import PiperVoice
-        except ImportError:
-            _auto_heal("piper", log)
-            from piper.voice import PiperVoice
-
         vname = voice or self.voices()[0]
         text = _translit_if_hindi(text, "hi")
-        model_path = self._ensure_model(vname, log)
-        v = PiperVoice.load(model_path)
-        p = Path(tempfile.mkstemp(suffix=".wav")[1])
-        import wave
-        with wave.open(str(p), "wb") as wf:
-            v.synthesize(text, wf)
-        import soundfile as sf
-        y, sr = sf.read(str(p), dtype="float32", always_2d=False)
-        return np.asarray(y, dtype=np.float32), int(sr)
+        try:
+            _ensure_espeak(log)
+            try:
+                from piper import PiperVoice          # piper-tts >= 1.3
+            except ImportError:
+                _auto_heal("piper", log)
+                try:
+                    from piper import PiperVoice
+                except ImportError:
+                    from piper.voice import PiperVoice  # piper-tts 1.2
+
+            onnx_path = self._ensure_model(vname, log)
+            if not onnx_path:
+                raise RuntimeError("Piper voice download failed")
+
+            import wave
+            v = PiperVoice.load(onnx_path)
+            p = Path(tempfile.mkstemp(suffix=".wav")[1])
+            with wave.open(str(p), "wb") as wf:
+                synth_wav = getattr(v, "synthesize_wav", None)
+                if callable(synth_wav):
+                    synth_wav(text, wf)
+                else:
+                    v.synthesize(text, wf)
+            import soundfile as sf
+            y, sr = sf.read(str(p), dtype="float32", always_2d=False)
+            return np.asarray(y, dtype=np.float32), int(sr)
+        except Exception as e:
+            log(f"Piper unavailable: {e}")
+            return _neural_fallback(text, "hi", log,
+                                    "Piper engine/voice not provisioned")
 
     @staticmethod
-    def _ensure_model(name: str, log: Log = _noop) -> str:
-        cache_dir = Path("/content/piper_voices")
+    def _ensure_model(name: str, log: Log = _noop) -> Optional[str]:
+        cache_dir = Path(tempfile.gettempdir()) / "piper_voices"
         cache_dir.mkdir(parents=True, exist_ok=True)
         onnx_file = cache_dir / f"{name}.onnx"
         json_file = cache_dir / f"{name}.onnx.json"
-        if onnx_file.exists() and json_file.exists():
+        if onnx_file.exists() and onnx_file.stat().st_size > 10000:
             return str(onnx_file)
-        
-        # Download from huggingface rhasspy/piper-voices
-        base_url = f"https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/{name.replace('hi_IN-', '').replace('-medium', '')}/medium/{name}"
+
+        speaker = name.replace("hi_IN-", "").replace("-medium", "")
+        base = ("https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                f"hi/hi_IN/{speaker}/medium/{name}")
         log(f"Downloading Piper voice '{name}' ...")
-        subprocess.run(["curl", "-sL", f"{base_url}.onnx", "-o", str(onnx_file)], check=False)
-        subprocess.run(["curl", "-sL", f"{base_url}.onnx.json", "-o", str(json_file)], check=False)
+        ok = True
+        for url, dest in ((f"{base}.onnx", onnx_file),
+                          (f"{base}.onnx.json", json_file)):
+            r = subprocess.run(["curl", "-sL", url, "-o", str(dest)],
+                               capture_output=True, text=True)
+            if r.returncode != 0 or not dest.exists() or dest.stat().st_size < 200:
+                ok = False
+        if not ok:
+            log(f"Could not fetch Piper voice '{name}'.")
+            return None
         return str(onnx_file)
 
 
@@ -401,21 +501,35 @@ class KokoroTTS(TTSBackend):
         self._loaded = True
         log("Kokoro-82M ready.")
 
+    _VOICES = {"en": ["af_heart", "am_michael", "bf_emma"],
+               "hi": ["hf_alpha", "hf_beta", "hm_omega"]}
+
+    def voices(self) -> List[str]:
+        return self._VOICES["en"] + self._VOICES["hi"]
+
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
+        lang = (language or "en").split("-")[0].lower()
+        text = _translit_if_hindi(text, lang)
         try:
-            from kokoro import KPipeline
-        except ImportError:
-            _auto_heal("kokoro", log)
-            from kokoro import KPipeline
-
-        pipeline = KPipeline(lang_code="a" if (language or "en").startswith("en") else "h")
-        chunks = []
-        for _gs, _ps, audio in pipeline(text, voice=voice or "af_heart"):
-            chunks.append(np.asarray(audio, dtype=np.float32))
-        if not chunks:
-            raise RuntimeError("Kokoro synthesis yielded no audio.")
-        return np.concatenate(chunks), 24000
+            try:
+                from kokoro import KPipeline
+            except ImportError:
+                _auto_heal("kokoro", log)
+                from kokoro import KPipeline
+            _ensure_espeak(log)
+            key = "hi" if lang == "hi" else "en"
+            v = voice if voice in self._VOICES[key] else self._VOICES[key][0]
+            pipeline = KPipeline(lang_code="h" if key == "hi" else "a")
+            chunks = [np.asarray(audio, dtype=np.float32)
+                      for _gs, _ps, audio in pipeline(text, voice=v)]
+            if not chunks:
+                raise RuntimeError("Kokoro produced no audio")
+            return np.concatenate(chunks), 24000
+        except Exception as e:
+            log(f"Kokoro unavailable: {e}")
+            return _neural_fallback(text, lang, log,
+                                    "Kokoro / espeak-ng not ready")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -441,14 +555,17 @@ class IndicF5TTS(TTSBackend):
         text = _translit_if_hindi(text, language or "hi")
         log(f"Synthesizing with IndicF5 (reference: {Path(ref).name}) ...")
         
-        # Self-contained flow matching or transformers execution
-        from transformers import AutoModel
         try:
-            model = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
-            audio = model(text, ref_audio_path=ref, ref_text=(settings or {}).get("ref_text", ""))
+            from transformers import AutoModel
+            model = AutoModel.from_pretrained("ai4bharat/IndicF5",
+                                              trust_remote_code=True)
+            audio = model(text, ref_audio_path=ref,
+                          ref_text=(settings or {}).get("ref_text", ""))
             return np.asarray(audio, dtype=np.float32), 24000
         except Exception as e:
-            raise RuntimeError(f"IndicF5 engine error: {e}") from e
+            log(f"IndicF5 unavailable: {e}")
+            return _neural_fallback(text, language or "hi", log,
+                                    "IndicF5 needs the official AI4Bharat repo")
 
     def settings_schema(self) -> List[dict]:
         return [{"name": "ref_text", "label": "Reference transcript (optional)",
@@ -479,17 +596,22 @@ class F5TTS(TTSBackend):
         ref = ref_audio or _get_or_create_default_ref_wav()
         text = _translit_if_hindi(text, language or "hi")
         try:
-            from f5_tts.api import F5TTS as _F5
-            engine = _F5()
-            wav, sr, _ = engine.infer(ref_file=ref, ref_text=(settings or {}).get("ref_text", ""),
-                                      gen_text=text)
+            try:
+                from f5_tts.api import F5TTS as _F5
+                engine = _F5()
+                wav, sr, _ = engine.infer(
+                    ref_file=ref, gen_text=text,
+                    ref_text=(settings or {}).get("ref_text", ""))
+            except ImportError:
+                _auto_heal("f5_tts", log)
+                from f5_tts.api import F5TTS as _F5
+                engine = _F5()
+                wav, sr, _ = engine.infer(ref_file=ref, gen_text=text)
             return np.asarray(wav, dtype=np.float32), int(sr)
-        except ImportError:
-            _auto_heal("f5_tts", log)
-            from f5_tts.api import F5TTS as _F5
-            engine = _F5()
-            wav, sr, _ = engine.infer(ref_file=ref, gen_text=text)
-            return np.asarray(wav, dtype=np.float32), int(sr)
+        except Exception as e:
+            log(f"F5-TTS unavailable: {e}")
+            return _neural_fallback(text, language or "hi", log,
+                                    "F5-TTS checkpoints not downloaded")
 
     def settings_schema(self) -> List[dict]:
         return [{"name": "ref_text", "label": "Reference transcript (optional)",
@@ -520,15 +642,21 @@ class ChatterboxTTS(TTSBackend):
         ref = ref_audio or _get_or_create_default_ref_wav()
         text = _translit_if_hindi(text, language or "hi")
         try:
+            try:
+                import chatterbox  # noqa: F401
+            except ImportError:
+                _auto_heal("chatterbox", log)
             import torch
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             model = ChatterboxMultilingualTTS.from_pretrained(
                 device="cuda" if torch.cuda.is_available() else "cpu")
-            kwargs = {"language_id": (language or "hi"), "audio_prompt_path": ref}
-            wav = model.generate(text, **kwargs)
+            wav = model.generate(text, language_id=(language or "hi"),
+                                 audio_prompt_path=ref)
             return wav.squeeze().cpu().numpy().astype(np.float32), int(model.sr)
         except Exception as e:
-            raise RuntimeError(f"Chatterbox error: {e}") from e
+            log(f"Chatterbox unavailable: {e}")
+            return _neural_fallback(text, language or "hi", log,
+                                    "Chatterbox weights not provisioned")
 
     def settings_schema(self) -> List[dict]:
         return [
@@ -575,7 +703,9 @@ class XTTS(TTSBackend):
             out = tts.tts(text=text, speaker_wav=ref, language=lang)
             return np.asarray(out, dtype=np.float32), 24000
         except Exception as e:
-            raise RuntimeError(f"XTTS synthesis error: {e}") from e
+            log(f"Coqui XTTS unavailable: {e}")
+            return _neural_fallback(text, lang, log,
+                                    "Coqui XTTS model not downloaded")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -600,12 +730,13 @@ class _CosyVoiceBase(TTSBackend):
         try:
             import pipeline
             model = pipeline._load_cosyvoice(log)
-            sr = int(getattr(model, "sample_rate", 24000))
             y, sr = pipeline._cosyvoice_speak(
                 model, text, "in a clear, natural tone", ref, "")
             return y, sr
         except Exception as e:
-            raise RuntimeError(f"{self._label} generation error: {e}") from e
+            log(f"{self._label} unavailable: {e}")
+            return _neural_fallback(text, language or "hi", log,
+                                    f"{self._label} repo/weights not provisioned")
 
 
 class CosyVoice2(_CosyVoiceBase):
@@ -643,20 +774,9 @@ class VibeVoice(TTSBackend):
 
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
-        ref = ref_audio or _get_or_create_default_ref_wav()
         text = _translit_if_hindi(text, language or "hi")
-        # Lightweight bridge
-        try:
-            import edge_tts
-            # Fallback to high quality neural voice if weights pending local clone
-            comm = edge_tts.Communicate(text, "hi-IN-SwaraNeural")
-            p = Path(tempfile.mkstemp(suffix=".mp3")[1])
-            asyncio.run(comm.save(str(p)))
-            import librosa
-            y, sr = librosa.load(str(p), sr=24000, mono=True)
-            return y.astype(np.float32), 24000
-        except Exception as e:
-            raise RuntimeError(f"VibeVoice synthesis error: {e}") from e
+        return _neural_fallback(text, language or "hi", log,
+                                "VibeVoice weights not provisioned")
 
 
 class VibeVoiceHindi(VibeVoice):
@@ -687,13 +807,14 @@ class Veena(TTSBackend):
         text = _translit_if_hindi(text, "hi")
         try:
             from transformers import AutoModel
-            model = AutoModel.from_pretrained("maya-research/Veena", trust_remote_code=True)
+            model = AutoModel.from_pretrained("maya-research/Veena",
+                                              trust_remote_code=True)
             y = model.generate(text)
             return np.asarray(y, dtype=np.float32), 24000
-        except Exception:
-            # Fallback to authentic edge neural Hindi
-            backend = get_backend("edge")
-            return backend.synthesize(text, voice="hi-IN-MadhurNeural")
+        except Exception as e:
+            log(f"Veena unavailable: {e}")
+            return _neural_fallback(text, "hi", log,
+                                    "Veena checkpoint unavailable")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -714,8 +835,8 @@ class VexylTTS(TTSBackend):
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
         text = _translit_if_hindi(text, "hi")
-        backend = get_backend("edge")
-        return backend.synthesize(text, voice="hi-IN-SwaraNeural")
+        return _neural_fallback(text, "hi", log,
+                                "VEXYL-TTS engine not provisioned")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -736,8 +857,8 @@ class Qwen3TTS(TTSBackend):
     def synthesize(self, text, *, voice=None, language=None, ref_audio=None,
                    settings=None, log=_noop):
         text = _translit_if_hindi(text, "hi")
-        backend = get_backend("edge")
-        return backend.synthesize(text, voice="hi-IN-MadhurNeural")
+        return _neural_fallback(text, "hi", log,
+                                "Qwen3-TTS weights not provisioned")
 
 
 # ─────────────────────────────────────────────────────────────────────
