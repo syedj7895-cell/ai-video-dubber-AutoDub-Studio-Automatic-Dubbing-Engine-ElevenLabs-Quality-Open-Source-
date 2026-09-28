@@ -30,6 +30,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -129,6 +130,10 @@ class Log:
 
     def render(self) -> str:
         return "\n".join(self.lines)
+
+
+def _noop(_msg: str = "") -> None:
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1721,7 +1726,8 @@ def step6_split_speaker_scripts(log: Log, force: bool = False) -> Dict[str, List
             "end": float(r.get("end", 0.0)),
             "emotion": r.get("emotion", "neutral"),
             "instruct": r.get("instruct", "in a calm, neutral tone"),
-            "language": r.get("language", "en"),
+            "language": r.get("language", "en"),          # SOURCE language
+            "target_language": r.get("target_language", ""),  # DUB language
             "text": clean,                       # ← the ONLY field TTS receives
         })
 
@@ -1763,10 +1769,13 @@ def _cosyvoice_syspath() -> None:
             return
 
 
-def _load_cosyvoice(log: Log):
+def _load_cosyvoice(log: Log, prefer: str = ""):
     """
-    Lazy CosyVoice 3.0 loader (zero-shot mode). The engine ships inside the
+    Lazy CosyVoice loader (zero-shot mode). The engine ships inside the
     FunAudioLLM repo, so operators get a one-line bootstrap when missing.
+
+    `prefer` pins a specific checkpoint — e.g. "iic/CosyVoice2-0.5B" for the
+    default CosyVoice 2.0 engine. Empty keeps the historical 3 → 2 → 1 order.
     """
     _cosyvoice_syspath()
     try:
@@ -1845,6 +1854,9 @@ def _load_cosyvoice(log: Log):
     _PAIRS = (("CosyVoice3", "iic/CosyVoice3-0.5B"),
               ("CosyVoice2", "iic/CosyVoice2-0.5B"),
               ("CosyVoice", "iic/CosyVoice-300M"))
+    if prefer:               # the engine selector pins one checkpoint first
+        _PAIRS = (tuple(p for p in _PAIRS if p[1] == prefer)
+                  + tuple(p for p in _PAIRS if p[1] != prefer))
     _errs = []
     for _cls_name, _repo in _PAIRS:
         try:
@@ -1974,10 +1986,611 @@ def _cosyvoice_speak(model, text: str, instruct: str, prompt_speech,
     raise RuntimeError(f"CosyVoice synthesis failed: {str(last_err)[:200]}")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  🎛 TTS ENGINE REGISTRY — selectable engines + lightweight fallback
+#     · CosyVoice 2.0  (DEFAULT)  → falls back to Edge-TTS
+#     · CosyVoice 3.0             → falls back to Edge-TTS
+#     · Chatterbox (Resemble AI)  → falls back to Edge-TTS
+#     · Fish Audio S2-Pro         → falls back to Edge-TTS
+#     · Edge-TTS                  → TERMINAL: no fallback, errors surfaced
+#  Edge-TTS is the ONLY lightweight tier (9 Hindi neural voices, both genders).
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TTS_ENGINE = "cosyvoice2"
+
+TTS_ENGINES: Dict[str, dict] = {
+    "cosyvoice2": {
+        "label": "CosyVoice 2.0  (default · offline)",
+        "kind": "cosyvoice", "repo": "iic/CosyVoice2-0.5B",
+        "clone": True, "fallback": "edge", "vram": "~2 GB", "sr": 24_000,
+    },
+    "cosyvoice3": {
+        "label": "CosyVoice 3.0  (offline)",
+        "kind": "cosyvoice", "repo": "iic/CosyVoice3-0.5B",
+        "clone": True, "fallback": "edge", "vram": "~2 GB", "sr": 24_000,
+    },
+    "chatterbox": {
+        "label": "Chatterbox  (Resemble AI · offline)",
+        "kind": "chatterbox", "repo": "ResembleAI/Chatterbox-Multilingual-hi",
+        "clone": True, "fallback": "edge", "vram": "~2 GB", "sr": 24_000,
+    },
+    "fishs2": {
+        "label": "Fish Audio S2-Pro  (heavy · offline)",
+        "kind": "fish", "repo": "fishaudio/s2-pro",
+        "clone": True, "fallback": "edge", "vram": "4-12 GB", "sr": 44_100,
+    },
+    "edge": {
+        "label": "Edge-TTS  (lightweight · cloud)",
+        "kind": "edge", "repo": "",
+        "clone": False, "fallback": "", "vram": "0 (cloud)", "sr": 24_000,
+    },
+}
+
+_TTS_ENGINE = DEFAULT_TTS_ENGINE
+
+
+def engine_choices() -> List[Tuple[str, str]]:
+    """[(label, engine_id)] — ready for a Gradio dropdown/radio."""
+    return [(spec["label"], eid) for eid, spec in TTS_ENGINES.items()]
+
+
+def get_tts_engine() -> str:
+    return _TTS_ENGINE if _TTS_ENGINE in TTS_ENGINES else DEFAULT_TTS_ENGINE
+
+
+def set_tts_engine(engine_id: str) -> str:
+    """Select the render engine; persisted so Steps 7 & 8 always agree."""
+    global _TTS_ENGINE
+    if engine_id in TTS_ENGINES:
+        _TTS_ENGINE = engine_id
+    st = PipelineState.load()
+    st.artifacts["tts_engine"] = _TTS_ENGINE
+    st.save()
+    return _TTS_ENGINE
+
+
+def engine_fallback(engine_id: str, spec: Optional[dict] = None) -> str:
+    """Edge-TTS is the sole lightweight tier — and the terminal node.
+
+    Prefers the live spec (which `resolve_engine` always populates) so a
+    dynamically built engine still routes correctly, then falls back to the
+    static registry for plain id lookups.
+    """
+    if isinstance(spec, dict) and "fallback" in spec:
+        return str(spec.get("fallback") or "")
+    return TTS_ENGINES.get(engine_id, {}).get("fallback", "")
+
+
+def _emotion_word(instruct: str) -> str:
+    """Normalise a SenseVoice / table emotion label to a bare lowercase word."""
+    word = re.sub(r"[^A-Za-z]+", "", str(instruct or "")).lower()
+    return word or "neutral"
+
+
+def format_line(text: str, instruct: str, engine_id: str) -> str:
+    """Inline emotion tag for engines that read one from the text itself.
+
+    CosyVoice takes emotion as a separate `instruct` argument (see
+    `format_instruct`); Edge-TTS has no emotion control; Chatterbox maps it to
+    its `exaggeration` scalar. Only the Fish-style engines want the tag
+    embedded in the line, using `[free-form bracket]` syntax.
+    """
+    if TTS_ENGINES.get(engine_id, {}).get("kind") == "fish":
+        return f"[{_emotion_word(instruct)}] {text}".strip()
+    return text
+
+
+def format_instruct(instruct: str, engine_id: str) -> str:
+    """The separate `instruct` string passed to CosyVoice-style engines."""
+    if TTS_ENGINES.get(engine_id, {}).get("kind") == "cosyvoice":
+        return f"Speak {_emotion_word(instruct)}."
+    return ""
+
+
+# SenseVoice 7-emotion → Chatterbox `exaggeration` (0-2). Chatterbox has no tag
+# system; higher exaggeration = more dramatic AND faster speech, which our
+# 1.15x time-stretch overlap guard then clamps back into the time slot.
+_CHATTER_EXAG = {"happy": 0.70, "sad": 0.35, "angry": 0.80, "surprised": 0.75,
+                 "neutral": 0.40, "fearful": 0.70, "disgusted": 0.65}
+
+
+def _emotion_to_exaggeration(instruct: str) -> float:
+    return float(_CHATTER_EXAG.get(_emotion_word(instruct), 0.50))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Edge-TTS · the lightweight tier AND the single fallback for every engine
+#  Distinct, gender-matched Indic voice per speaker (tiered by fidelity).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── VERIFIED against the live endpoint (edge_tts.list_voices()) ──────────────
+# Microsoft ships exactly TWO true Hindi neural voices, so a cast larger than
+# 2 cannot be covered by hi-IN alone. Marathi and Nepali are written in
+# Devanagari and read Hindi text natively → phonetically faithful stand-ins.
+# Every TIER 3 locale uses a DIFFERENT script, so it will mispronounce
+# Devanagari and is therefore only reached once Tiers 1-2 are exhausted.
+_EDGE_TIER1 = ("hi-IN",)                        # true Hindi
+_EDGE_TIER2 = ("mr-IN", "ne-NP")                # Devanagari-script Indic
+_EDGE_TIER3 = ("gu-IN", "bn-IN", "bn-BD", "ta-IN", "ta-LK", "ta-MY", "ta-SG",
+               "te-IN", "kn-IN", "ml-IN", "ur-IN", "ur-PK")
+_EDGE_TIERS = (_EDGE_TIER1, _EDGE_TIER2, _EDGE_TIER3)
+
+# How many leading voices per gender read Devanagari natively (Tiers 1 + 2).
+_NATIVE_SCRIPT_VOICES = len(_EDGE_TIER1) + len(_EDGE_TIER2)
+
+# Offline mirror of the same tiers — used only when the live list is
+# unreachable. Order is significant: allocation takes from the FRONT, so the
+# Devanagari-faithful voices are always cast before the foreign-script ones.
+_EDGE_FALLBACK_POOL = {
+    "Female": ["hi-IN-SwaraNeural",
+               "mr-IN-AarohiNeural", "ne-NP-HemkalaNeural",
+               "gu-IN-DhwaniNeural", "bn-IN-TanishaaNeural",
+               "bn-BD-NabanitaNeural", "ta-IN-PallaviNeural",
+               "ta-LK-SaranyaNeural", "ta-MY-KaniNeural",
+               "ta-SG-VenbaNeural", "te-IN-ShrutiNeural",
+               "kn-IN-SapnaNeural", "ml-IN-SobhanaNeural",
+               "ur-IN-GulNeural", "ur-PK-UzmaNeural"],
+    "Male": ["hi-IN-MadhurNeural",
+             "mr-IN-ManoharNeural", "ne-NP-SagarNeural",
+             "gu-IN-NiranjanNeural", "bn-IN-BashkarNeural",
+             "bn-BD-PradeepNeural", "ta-IN-ValluvarNeural",
+             "ta-LK-KumarNeural", "ta-MY-SuryaNeural",
+             "ta-SG-AnbuNeural", "te-IN-MohanNeural",
+             "kn-IN-GaganNeural", "ml-IN-MidhunNeural",
+             "ur-IN-SalmanNeural", "ur-PK-AsadNeural"],
+}
+
+
+def _is_native_script(voice: str) -> bool:
+    """True when a voice reads Devanagari natively (hi-IN / mr-IN / ne-NP)."""
+    v = str(voice or "").lower()
+    return any(v.startswith(loc.lower())
+               for tier in _EDGE_TIERS[:2] for loc in tier)
+
+
+def _edge_voice_list(log: Log = _noop) -> Dict[str, List[str]]:
+    """Live Indic voices from Edge, grouped by gender and TIER-ordered.
+
+    Genders and names come from the service rather than being hardcoded, so the
+    pool stays correct when Microsoft adds or re-genders a voice. The returned
+    lists are ordered by locale tier (hi-IN → mr/ne → the rest), and allocation
+    takes from the front, so the Devanagari-faithful voices are cast first.
+    """
+    try:
+        import asyncio as _aio
+        import concurrent.futures as _cf
+
+        import edge_tts
+
+        def _worker():
+            loop = _aio.new_event_loop()
+            _aio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(edge_tts.list_voices())
+            finally:
+                loop.close()
+
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            voices = ex.submit(_worker).result(timeout=60)
+
+        by_locale: Dict[str, List[Tuple[str, str]]] = {}
+        for v in voices:
+            by_locale.setdefault(str(v.get("Locale", "")), []).append(
+                (str(v.get("ShortName", "")), str(v.get("Gender", "Female"))))
+
+        pool: Dict[str, List[str]] = {}
+        for tier in _EDGE_TIERS:                 # tier order == preference
+            for loc in tier:
+                for name, gender in by_locale.get(loc, []):
+                    if name:
+                        pool.setdefault(gender, []).append(name)
+        pool = {g: list(dict.fromkeys(n)) for g, n in pool.items() if n}
+        if pool:
+            total = sum(len(x) for x in pool.values())
+            detail = ", ".join(f"{g}:{len(v)}" for g, v in sorted(pool.items()))
+            log(f"   Edge-TTS · {total} Indic voice(s) online ({detail}) · "
+                f"{_NATIVE_SCRIPT_VOICES} Devanagari-faithful per gender")
+            return pool
+    except Exception as e:
+        log(f"   ⚠ Edge voice list unavailable ({str(e)[:80]}) — using the "
+            f"built-in Indic pool")
+    return {g: list(v) for g, v in _EDGE_FALLBACK_POOL.items()}
+
+
+def allocate_speaker_voices(speakers_info: Dict[str, dict],
+                            log: Log = _noop) -> Dict[str, str]:
+    """Give every diarized speaker a DISTINCT, gender-matched Indic voice.
+
+    Deterministic: speakers are cast in name order, each taking the next unused
+    voice of its gender — so re-renders reproduce the identical casting.
+    The first `_NATIVE_SCRIPT_VOICES` voices per gender are hi-IN / mr-IN /
+    ne-NP and read Devanagari natively; anything beyond that is a foreign-script
+    voice, so using it is flagged because it WILL mispronounce Hindi text.
+    """
+    pool = _edge_voice_list(log)
+    free = {g: list(v) for g, v in pool.items()}
+    # Round-robin order for the exhausted case — tier-ordered, so the
+    # Devanagari-faithful voices are recycled first.
+    every = [v for g in sorted(pool) for v in pool[g]]
+    cast: Dict[str, str] = {}
+
+    for i, spk in enumerate(sorted(speakers_info)):
+        raw = str((speakers_info.get(spk) or {}).get("gender", "")).lower()
+        gender = ("Female" if raw.startswith("f")
+                  else "Male" if raw.startswith("m") else "")
+        pick = ""
+        for g in ([gender] if gender else []) + sorted(free):
+            if free.get(g):
+                pick = free[g].pop(0)
+                break
+        if not pick:
+            pick = every[i % len(every)] if every else "hi-IN-SwaraNeural"
+            log(f"   ⚠ {spk}: voice pool exhausted — reusing {pick} "
+                f"(this speaker now SHARES a voice)")
+        cast[spk] = pick
+
+    for spk in sorted(cast):
+        warn = "" if _is_native_script(cast[spk]) else \
+            "   ⚠ foreign script — may mispronounce Devanagari"
+        log(f"   🎙 {spk} → {cast[spk]}{warn}")
+    return cast
+
+
+def _load_edge(log: Log):
+    """Edge-TTS needs no weights — only the package. Uses zero GPU memory."""
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError:
+        log("[i] installing edge-tts ...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                        "edge-tts"], capture_output=True, text=True)
+        try:
+            import edge_tts  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "Edge-TTS is not installed → pip install edge-tts") from e
+    try:
+        import librosa  # noqa: F401   (decodes the returned MP3)
+    except ImportError as e:
+        raise RuntimeError(
+            "librosa is required to decode Edge-TTS audio → "
+            "pip install librosa") from e
+    log("✅ Edge-TTS ready — cloud neural Hindi voices, 0 GB VRAM.")
+    return {"kind": "edge"}
+
+
+def _edge_speak(model, text: str, voice: str = "", rate: int = 0,
+                volume: int = 0, log: Log = _noop):
+    """One Hindi line through the assigned Edge voice → (float32 mono, 24000).
+
+    Runs the coroutine in a private thread with its own event loop so it can
+    never collide with Gradio's running loop, and retries transient resets.
+    """
+    import asyncio as _aio
+    import concurrent.futures as _cf
+    import tempfile
+
+    import librosa
+    import numpy as np
+
+    try:
+        import edge_tts
+    except ImportError as e:
+        raise RuntimeError("Edge-TTS not installed → pip install edge-tts") from e
+
+    v = voice or "hi-IN-SwaraNeural"
+    r = f"{int(rate):+d}%"
+    vol = f"{int(volume):+d}%"
+    last: Exception = RuntimeError("unknown error")
+
+    for attempt in range(1, 4):
+        p = Path(tempfile.mkstemp(suffix=".mp3")[1])
+        try:
+            def _worker() -> None:
+                loop = _aio.new_event_loop()
+                _aio.set_event_loop(loop)
+                try:
+                    comm = edge_tts.Communicate(text, v, rate=r, volume=vol)
+                    loop.run_until_complete(comm.save(str(p)))
+                finally:
+                    loop.close()
+
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                ex.submit(_worker).result(timeout=90)
+            if p.exists() and p.stat().st_size > 512:
+                y, _sr = librosa.load(str(p), sr=24_000, mono=True)
+                return np.asarray(y, dtype=np.float32), 24_000
+            last = RuntimeError("endpoint returned empty audio")
+        except Exception as e:
+            last = e
+        log(f"   edge attempt {attempt}/3 failed: {str(last)[:110]}")
+        if attempt < 3:
+            time.sleep(1.5 * attempt)
+    raise RuntimeError(f"Edge-TTS failed after 3 attempts: {str(last)[:180]}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Chatterbox (Resemble AI) · clone-capable, ~2 GB, dedicated Hindi finetune
+#  NOTE: every generated file carries a Resemble PerTh neural watermark.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_chatterbox(log: Log):
+    """Load Chatterbox Multilingual (Hindi finetune preferred)."""
+    try:
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # noqa: F401
+    except ImportError:
+        log("[i] installing chatterbox-tts ...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                        "chatterbox-tts"], capture_output=True, text=True)
+        try:
+            from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # noqa
+        except ImportError as e:
+            raise RuntimeError(
+                "Chatterbox is not installed → pip install chatterbox-tts"
+            ) from e
+
+    import torch
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    repo = TTS_ENGINES["chatterbox"]["repo"]
+    log(f"[GPU] Loading Chatterbox · device={device}")
+    log("   " + log_memory())
+
+    last: Exception = RuntimeError("unknown error")
+    # Prefer the dedicated Hindi finetune; fall back to the generic multilingual
+    # model if that repo id is not accepted by this build's signature.
+    for cand in (repo, ""):
+        try:
+            if cand:
+                model = ChatterboxMultilingualTTS.from_pretrained(
+                    repo_id=cand, device=device)
+            else:
+                model = ChatterboxMultilingualTTS.from_pretrained(
+                    device=device)
+            log("✅ Chatterbox ready — PerTh watermark is embedded in all "
+                "generated audio.")
+            return model
+        except Exception as e:
+            last = e
+            log(f"   ⚠ Chatterbox '{cand or 'default'}' load failed "
+                f"({str(e)[:90]})")
+    raise RuntimeError(f"Chatterbox could not load: {str(last)[:200]}")
+
+
+def _chatterbox_speak(model, text: str, ref_audio: str = "", language: str = "hi",
+                      exaggeration: float = 0.5, cfg_weight: float = 0.0,
+                      log: Log = _noop):
+    """One cloned line → (float32 mono, model.sr).
+
+    `cfg_weight=0` is deliberate: our clone prompts are recorded in the SOURCE
+    language but we synthesise Hindi, and Resemble advise 0 to avoid the output
+    inheriting the reference clip's accent.
+    """
+    import numpy as np
+
+    kwargs: dict = {"exaggeration": float(exaggeration),
+                    "cfg_weight": float(cfg_weight)}
+    try:
+        out = model.generate(text, language_id=language,
+                             audio_prompt_path=(ref_audio or None), **kwargs)
+    except TypeError:
+        kwargs.pop("cfg_weight", None)          # older build without cfg
+        out = model.generate(text, language_id=language,
+                             audio_prompt_path=(ref_audio or None), **kwargs)
+
+    y = out.detach().cpu().numpy() if hasattr(out, "detach") else np.asarray(out)
+    return np.asarray(y, dtype=np.float32).squeeze(), int(
+        getattr(model, "sr", 24_000))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Fish Audio S2-Pro · heaviest engine (self-hosted, quantized)
+#  bf16 needs ~21 GB → use NF4 (~12 GB) or the s2.cpp GGUF pair (~4-8 GB).
+#  Validate first with:  python fish_s2_probe.py --all
+#  Licence: Fish Audio Research License — non-commercial; ships attribution.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FISH_ATTRIBUTION = ("This model is licensed under the Fish Audio Research "
+                    "License, Copyright © 39 AI, INC. All Rights Reserved.")
+
+
+def _load_fishs2(log: Log):
+    """Load self-hosted S2-Pro.
+
+    Two supported shapes:
+      1. an `s2.cpp` / official REST server already listening (S2_CPP_URL)
+      2. the fish-speech python package with local (quantized) weights
+    """
+    url = (os.environ.get("S2_CPP_URL") or "").strip()
+    if url:
+        log(f"✅ Fish S2-Pro via local /v1/tts server → {url}")
+        log(f"   {FISH_ATTRIBUTION}")
+        return {"kind": "fish", "mode": "server", "url": url.rstrip("/")}
+
+    try:
+        import fish_speech  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "Fish Speech is not installed. Self-hosting S2-Pro needs either:\n"
+            "  · an s2.cpp server  → export S2_CPP_URL=http://127.0.0.1:8080\n"
+            "  · or  git clone https://github.com/fishaudio/fish-speech "
+            "&& pip install -e .\n"
+            "Run `python fish_s2_probe.py --all` first to validate this GPU."
+        ) from e
+
+    log(f"[GPU] Fish S2-Pro weights={TTS_ENGINES['fishs2']['repo']}")
+    log("   " + log_memory())
+    log(f"   {FISH_ATTRIBUTION}")
+    return {"kind": "fish", "mode": "local"}
+
+
+def _fishs2_speak(model, text: str, ref_audio: str = "", log: Log = _noop,
+                  **kw):
+    """One S2-Pro line through a local /v1/tts server → (float32, 44.1 kHz).
+
+    The server returns WAV, so the real sample rate is read from the file
+    rather than assumed. The emotion tag must already be inline in `text`.
+    """
+    import tempfile
+
+    import soundfile as sf
+    try:
+        import requests
+    except ImportError as e:
+        raise RuntimeError("pip install requests") from e
+
+    url = str(model.get("url", "")).rstrip("/")
+    if not url:
+        raise RuntimeError(
+            "Fish S2-Pro in-process synthesis is not wired for this build.\n"
+            "Use an s2.cpp server instead:\n"
+            "  1. build https://github.com/mach92432/s2.cpp\n"
+            "  2. start it with the q4_k_m GGUF pair (~4 GB VRAM)\n"
+            "  3. export S2_CPP_URL=http://127.0.0.1:8080\n"
+            "Run `python fish_s2_probe.py --all` first to validate this GPU "
+            "(S2-Pro needs 24 GB at bf16).")
+
+    payload: dict = {"text": text, "format": "wav", "sample_rate": 44100}
+    if ref_audio:
+        payload["reference_audio"] = str(ref_audio)
+
+    r = requests.post(f"{url}/v1/tts", json=payload, timeout=900)
+    r.raise_for_status()
+
+    tmp = Path(tempfile.mkstemp(suffix=".wav")[1])
+    tmp.write_bytes(r.content)
+    y, sr = sf.read(str(tmp), dtype="float32", always_2d=True)
+    return y.mean(axis=1).astype("float32"), int(sr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  engine resolution — binds an id to its (loader, speaker) pair
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_engine(engine_id: str = "") -> dict:
+    """Return the spec + callables for `engine_id` (defaults to the selection)."""
+    eid = engine_id if engine_id in TTS_ENGINES else get_tts_engine()
+    spec: dict = dict(TTS_ENGINES[eid])
+    spec["id"] = eid
+    kind = spec["kind"]
+
+    if kind == "edge":
+        spec["load"] = _load_edge
+        spec["speak"] = _edge_speak
+        spec["instruct"] = False
+    elif kind == "chatterbox":
+        spec["load"] = _load_chatterbox
+        spec["speak"] = _chatterbox_speak
+        spec["instruct"] = False
+    elif kind == "fish":
+        spec["load"] = _load_fishs2
+        spec["speak"] = _fishs2_speak
+        spec["instruct"] = False
+    else:                                   # cosyvoice family
+        spec["load"] = (lambda log, _r=spec["repo"]: _load_cosyvoice(log, prefer=_r))
+        spec["speak"] = _cosyvoice_speak
+        spec["instruct"] = True
+    return spec
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  engine dispatch + failover  (Edge-TTS is the terminal node)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EngineRuntime:
+    """Holds the active engine + its model, and performs the failover to Edge.
+
+    Failover happens at two points:
+      · load time  — the usual failure (OOM, weights missing, not installed)
+      · 3 consecutive row failures — the engine loaded but cannot produce audio
+    Edge-TTS has no fallback of its own, so when IT fails the error is raised
+    for the console rather than silently substituting a different voice.
+    """
+
+    def __init__(self, engine: dict, log: Log, dub_lang: str = "hi") -> None:
+        self.log = log
+        self.spec = engine
+        self.model = None
+        self.failed = 0
+        self.fell_back_from = ""
+        # The language we dub INTO (not the source language detected per line).
+        # Multi-lingual engines such as Chatterbox must be told this explicitly.
+        self.dub_lang = str(dub_lang or "hi").lower()
+
+    @property
+    def id(self) -> str:
+        return self.spec["id"]
+
+    @property
+    def kind(self) -> str:
+        return self.spec["kind"]
+
+    def _switch(self, fb_id: str, why: str) -> None:
+        self.log(f"⚠ {why}")
+        self.log(f"   ↳ falling back to the lightweight engine: {fb_id}")
+        self.fell_back_from = self.id
+        self.spec = resolve_engine(fb_id)
+        self.failed = 0
+        self.model = self.spec["load"](self.log)
+
+    def load(self) -> None:
+        try:
+            self.model = self.spec["load"](self.log)
+        except Exception as e:
+            fb_id = engine_fallback(self.id, self.spec)
+            if not fb_id:
+                raise                                   # terminal engine
+            self._switch(fb_id, f"{self.id} could not load ({str(e)[:160]})")
+
+    def speak(self, spk, row, prompt_speech, transcript, voice_cast):
+        """Synthesize one row → (clip, sr). Raises only on a terminal engine."""
+        try:
+            clip, sr = self._dispatch(spk, row, prompt_speech, transcript,
+                                      voice_cast)
+            self.failed = 0
+            return clip, sr
+        except Exception as e:
+            self.failed += 1
+            fb_id = engine_fallback(self.id, self.spec)
+            if self.failed >= 3 and fb_id and fb_id != self.id:
+                self._switch(fb_id, f"{self.id} failed {self.failed}x in a row "
+                                    f"({str(e)[:90]})")
+                return self._dispatch(spk, row, prompt_speech, transcript,
+                                      voice_cast)
+            raise
+
+    def _dispatch(self, spk, row, prompt_speech, transcript, voice_cast):
+        text = str(row["text"])
+        instruct = str(row.get("instruct", "") or "")
+        sid = self.id
+        if self.kind == "cosyvoice":
+            return self.spec["speak"](self.model,
+                                      format_line(text, instruct, sid),
+                                      format_instruct(instruct, sid),
+                                      prompt_speech, transcript)
+        if self.kind == "chatterbox":
+            return self.spec["speak"](
+                self.model, text, ref_audio=prompt_speech,
+                language=(row.get("target_language") or self.dub_lang),
+                exaggeration=_emotion_to_exaggeration(instruct))
+        if self.kind == "edge":
+            return self.spec["speak"](self.model, text,
+                                      voice=voice_cast.get(spk, ""))
+        # fish-style: emotion travels inline in the text
+        return self.spec["speak"](self.model,
+                                  format_line(text, instruct, sid),
+                                  ref_audio=prompt_speech)
+
+
 def step7_synthesize(log: Log, force: bool = False,
                      max_speedup: float = 1.15) -> dict:
     """
-    CosyVoice 3.0 zero-shot synthesis onto per-speaker silent master timelines:
+    Engine-agnostic synthesis onto per-speaker silent master timelines:
       · one master numpy ZERO-SIGNAL array per speaker, exactly matching the
         duration of the original media (the master audio clock)
       · every row is cloned with the speaker's clean voice profile + emotion
@@ -1989,10 +2602,20 @@ def step7_synthesize(log: Log, force: bool = False,
     import numpy as np
     import soundfile as sf
 
+    engine = resolve_engine()                 # selected in Tab 1
+    eid = engine["id"]
+
     track_files = sorted(OUTPUTS_DIR.glob("track_speaker*.wav"))
     if TTS_REPORT_JSON.exists() and track_files and not force:
-        log("↩ Step 7 cached — skipping synthesis (force to redo).")
-        return json.loads(TTS_REPORT_JSON.read_text(encoding="utf-8"))
+        cached = json.loads(TTS_REPORT_JSON.read_text(encoding="utf-8"))
+        # Re-render when the engine changed — otherwise switching engines would
+        # silently reuse the previous engine's tracks.
+        if cached.get("engine", "") == eid:
+            log(f"↩ Step 7 cached [{eid}] — skipping (force to redo).")
+            return cached
+        log(f"♻ Engine changed → {eid} "
+            f"(was {cached.get('engine', 'unknown')}) — re-rendering Step 7.")
+        force = True
 
     if not FINAL_SCRIPT_JSON.exists():
         raise RuntimeError("Run Tab 2 first — final_script.json missing.")
@@ -2008,8 +2631,31 @@ def step7_synthesize(log: Log, force: bool = False,
         raise RuntimeError("No speakable rows survived sanitisation.")
 
     duration = _wav_duration(AUDIO_WAV)          # master clock
-    model = _load_cosyvoice(log)
-    sr = int(getattr(model, "sample_rate", 24_000))
+
+    speakers_info = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8")) \
+        .get("speakers", {})
+    transcripts = _ensure_prompt_transcripts(log)
+
+    # ── engine bring-up (degrades to the lightweight tier on failure) ─────
+    dub_lang = (PipelineState.load().artifacts.get("target_lang") or "hi")
+    rt = EngineRuntime(engine, log, dub_lang=dub_lang)
+    rt.load()
+    eid = rt.id
+    if rt.kind == "cosyvoice":
+        sr = int(getattr(rt.model, "sample_rate", 24_000))
+    elif rt.kind == "chatterbox":
+        sr = int(getattr(rt.model, "sr", 24_000))
+    else:
+        sr = int(rt.spec.get("sr", 24_000))
+    if rt.fell_back_from:
+        log(f"   active engine: {eid}  (fell back from {rt.fell_back_from})")
+        engine = rt.spec
+
+    # Edge-TTS has FIXED voices → cast a distinct, gender-matched Hindi voice
+    # per speaker so a fallback never collapses everyone onto one voice.
+    voice_cast: Dict[str, str] = {}
+    if rt.kind == "edge":
+        voice_cast = allocate_speaker_voices(speakers_info, log)
 
     # ── the auto-padding system: silent zero-signal master per speaker ────
     n_total = int(round(duration * sr))
@@ -2021,11 +2667,9 @@ def step7_synthesize(log: Log, force: bool = False,
     timeline = sorted(({"spk": spk, **l} for spk, lines in scripts.items()
                        for l in lines),
                       key=lambda d: (d["start"], d.get("index") or 0))
-    speakers_info = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8")) \
-        .get("speakers", {})
-    transcripts = _ensure_prompt_transcripts(log)
 
-    report = {"sample_rate": sr, "duration_s": round(duration, 3), "rows": []}
+    report = {"engine": eid, "sample_rate": sr,
+              "duration_s": round(duration, 3), "rows": []}
     t0 = time.time()
     for i, row in enumerate(timeline, 1):
         spk = row["spk"]
@@ -2043,12 +2687,15 @@ def step7_synthesize(log: Log, force: bool = False,
             continue
 
         try:
-            # pass the WAV PATH - CosyVoice loads/resamples it internally;
-            # (a raw tensor crashes torchcodec's AudioDecoder on torchaudio 2.11)
+            # pass the WAV PATH — engines load/resample it internally (a raw
+            # tensor crashes torchcodec's AudioDecoder on torchaudio 2.11)
             prompt_speech = str(BASE_DIR / prompt_rel)
-            clip, _ = _cosyvoice_speak(model, row["text"],
-                                       f"Speak {row['instruct']}.",
-                                       prompt_speech, transcripts.get(spk, ""))
+            clip, clip_sr = rt.speak(spk, row, prompt_speech,
+                                     transcripts.get(spk, ""), voice_cast)
+            # normalise every engine's output into the master sample rate
+            if clip_sr and int(clip_sr) != sr:
+                clip = _resample_1d(clip, int(clip_sr), sr)
+            clip = np.asarray(clip, dtype=np.float32).reshape(-1)
         except Exception as e:
             log(f"   ⚠ row {row.get('index')} synthesis failed: {str(e)[:120]}")
             continue
@@ -2086,7 +2733,8 @@ def step7_synthesize(log: Log, force: bool = False,
             log(f"   {i}/{len(timeline)} · row {row.get('index')} [{spk}] "
                 f"{gen_s:.2f}s → slot {avail:.2f}s{note}")
 
-    del model
+    rt.model = None
+    del rt
     log("   " + clear_gpu_cache())
 
     for spk, master in masters.items():
@@ -2096,7 +2744,7 @@ def step7_synthesize(log: Log, force: bool = False,
     TTS_REPORT_JSON.write_text(json.dumps(report, indent=2, ensure_ascii=False),
                                encoding="utf-8")
     stretched = sum(1 for r in report["rows"] if r["speed"] > 1.0)
-    log(f"✅ Step 7 → {len(masters)} padded track(s) · "
+    log(f"✅ Step 7 [{eid}] → {len(masters)} padded track(s) · "
         f"{len(report['rows'])} row(s) rendered in {report['elapsed_s']}s · "
         f"{stretched} overlap-protection stretch(es)")
     return report

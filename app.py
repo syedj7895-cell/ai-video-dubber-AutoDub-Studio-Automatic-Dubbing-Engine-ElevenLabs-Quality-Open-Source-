@@ -538,6 +538,15 @@ def _toggle_persist(on):
                  if on else "Persistence OFF")
 
 
+def _switch_tts_engine(engine_id: str):
+    """Persist the selected TTS engine and return a descriptive status chip."""
+    actual = pipeline.set_tts_engine(engine_id)
+    label = pipeline.TTS_ENGINES.get(actual, {}).get("label", actual)
+    fb = pipeline.engine_fallback(actual)
+    fb_note = f" · falls back to {fb}" if fb else " · terminal tier"
+    return _chip("ok", f"TTS Engine: {label}{fb_note}")
+
+
 def _clear_cloud():
     msg = pipeline.clear_cloud_storage(include_models=True)
     return _chip("ok", msg)
@@ -604,6 +613,26 @@ def build_ui() -> gr.Blocks:
             with gr.Tab("📂 File Import & Analysis"):
                 with gr.Row():
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
+                        gr.Markdown("### 🎙 TTS Engine — pick the voice synthesizer")
+                        tts_engine_in = gr.Radio(
+                            choices=pipeline.engine_choices(),
+                            value=pipeline.get_tts_engine(),
+                            label="Engine",
+                            info="CosyVoice 2.0 is the default. Every engine casts "
+                                 "a DISTINCT Hindi voice per speaker; all non-Edge "
+                                 "engines fall back to Edge-TTS automatically.",
+                            interactive=True)
+                        tts_engine_note = gr.HTML(
+                            _chip("ok", "Active: " + pipeline.TTS_ENGINES[
+                                pipeline.get_tts_engine()]["label"]))
+                        gr.Markdown(
+                            "⚠️ **Licence & watermark notice** — Chatterbox "
+                            "embeds a Resemble PerTh neural watermark in every "
+                            "clip it generates. Fish Audio S2-Pro output is "
+                            "governed by the Fish Audio Research License "
+                            "(non-commercial use). Edge-TTS audio is "
+                            "synthesised remotely by Microsoft.")
+                        gr.Markdown("---")
                         gr.Markdown("### 📥 Source material")
                         media_in = gr.File(label="🎬 Audio / Video master",
                                            file_types=["video", "audio"])
@@ -882,6 +911,8 @@ def build_ui() -> gr.Blocks:
         )
         persist_on.change(fn=_toggle_persist, inputs=[persist_on],
                           outputs=[analysis_status])
+        tts_engine_in.change(fn=_switch_tts_engine, inputs=[tts_engine_in],
+                             outputs=[tts_engine_note])
         clear_cloud_btn.click(fn=_clear_cloud, inputs=None,
                               outputs=[clear_cloud_msg])
     return demo

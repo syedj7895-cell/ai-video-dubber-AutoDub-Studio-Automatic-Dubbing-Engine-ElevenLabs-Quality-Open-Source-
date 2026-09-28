@@ -18,7 +18,7 @@ zero-shot emotional TTS.
 | 4 | Emotion detection (7 emotions) | **SenseVoice-Small** (FunASR) | ✅ Phase 3 |
 | 5 | SRT mapping & merging | **pysrt** | ✅ Phase 3 |
 | 6 | Speaker text splitting (TTS-safe) | custom algorithmic engine | ✅ Phase 4 |
-| 7 | Multilingual emotional TTS | **CosyVoice 3.0** zero-shot | ✅ Phase 4 |
+| 7 | Multilingual emotional TTS | **CosyVoice 2.0 / 3.0 · Chatterbox · Fish S2-Pro · Edge-TTS** (5-way selector) | ✅ Phase 4 |
 | 8 | Master mixdown + ducking + remux | **numpy / FFmpeg** | ✅ Phase 5 |
 
 ---
@@ -89,12 +89,13 @@ Pyannote 3.1 is gated. With the account that owns your token:
 - **Step 6 · Splitting engine** — clones the consolidated array into per-speaker
   channels (`Project_SpeakerN.txt`) with every speaker label & timecode stripped,
   so the TTS voice can never read metadata aloud
-- **Step 7 · CosyVoice 3.0 zero-shot** — builds a **silent zero-signal master
-  array per speaker**, exactly matching the original media duration; each line
-  is cloned with the speaker's voice profile + emotion tags (English · Hindi ·
-  Spanish). **Overpressure fix:** if a clip would bleed into the next line, it
-  is time-stretched with `librosa.effects.time_stretch` (non-pitch-shifting,
-  up to **1.15×**) so it snaps inside its slot without moving the clock
+- **Step 7 · Pluggable TTS** (engine selected in Tab 1) — builds a **silent
+  zero-signal master array per speaker**, exactly matching the original media
+  duration; each line is cloned with the speaker's voice profile + emotion tags
+  (English · Hindi · Spanish). **Overpressure fix:** if a clip would bleed into
+  the next line, it is time-stretched with `librosa.effects.time_stretch`
+  (non-pitch-shifting, up to **1.15×**) so it snaps inside its slot without
+  moving the clock
 - **Step 8 · Mixdown & ducking** — layers every speaker master over the Demucs
   instrumental with a **lookahead −6 dB ducking curve** (smooth linear
   attack/release), exports `final_mix.wav`, and — when the source was video —
@@ -107,6 +108,58 @@ Pyannote 3.1 is gated. With the account that owns your token:
 Everything streams live into a glass **pipeline console**; vocals/music previews
 appear right under Tab 1, and the consolidated script table + emotion log +
 clone prompts appear in Tab 2.
+
+---
+
+## 🎙 Pluggable TTS engines (5-way selector · Tab 1)
+
+Pick the synthesizer at the very top of **Tab 1**. Every engine shares the same
+per-speaker clone prompts and the same silent-master timeline, so swapping an
+engine only changes *who* speaks — never *when*.
+
+| Engine | Params | VRAM | Zero-shot clone | Fallback |
+|---|---|---|---|---|
+| **CosyVoice 2.0** *(default)* | 0.5 B | ~2 GB | ✅ | Edge-TTS |
+| **CosyVoice 3.0** | 0.5 B | ~2 GB | ✅ | Edge-TTS |
+| **Chatterbox** (Resemble AI) | 0.5 B | ~2 GB | ✅ | Edge-TTS |
+| **Fish Audio S2-Pro** | — | 4–12 GB | ✅ | Edge-TTS |
+| **Edge-TTS** *(lightweight)* | cloud | 0 | ❌ | — terminal — |
+
+**Automatic fallback.** Every non-Edge engine degrades to **Edge-TTS** when it
+fails to load (missing package, OOM, absent weights) *or* after **3 consecutive
+line failures** mid-render. Edge-TTS is the **terminal node** — if Edge itself
+fails, the error is surfaced instead of silently substituting a different voice.
+Changing the engine in Tab 1 invalidates the Step 7 cache and re-renders
+automatically.
+
+**Distinct voice per speaker.** Edge-TTS cannot clone, so voices are cast per
+speaker instead — deterministically, in name order, matched to the diarized
+gender. Microsoft ships only **two** true Hindi neural voices, so the pool is
+tiered by phonetic fidelity (`hi-IN` → `mr-IN`/`ne-NP`, which are written in
+Devanagari and read Hindi natively → other Indic locales, flagged in the console
+because they *will* mispronounce Devanagari). That gives **15 female + 15 male**
+verified voices, of which 3 per gender are Devanagari-faithful.
+
+**Cross-lingual guard.** Clone prompts are recorded in the *source* language but
+we dub *into Hindi*, so Chatterbox is driven with `cfg_weight=0.0` to stop the
+reference clip's accent bleeding into the Hindi output.
+
+**Emotion mapping.** SenseVoice's 7 emotions drive each engine natively:
+CosyVoice takes a separate `instruct` string, Chatterbox maps to its
+`exaggeration` scalar (0–2), Fish embeds `[tag]` inline, and Edge has no
+emotion control.
+
+> ⚠️ **Licence & watermark notice** — Chatterbox stamps a Resemble **PerTh**
+> neural watermark into every clip it generates. Fish Audio S2-Pro output falls
+> under the **Fish Audio Research License (non-commercial)**. Edge-TTS audio is
+> synthesised remotely by Microsoft.
+
+Validate the heaviest engine before committing to it:
+
+```bash
+python fish_s2_probe.py --all
+```
+
 
 ---
 
