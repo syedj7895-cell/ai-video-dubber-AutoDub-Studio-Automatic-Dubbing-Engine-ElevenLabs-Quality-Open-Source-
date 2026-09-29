@@ -269,23 +269,39 @@ default browser straight into the hosted UI — no console windows, no clutter.
 
 ### Model persistence (UI-driven)
 
-- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
-- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
-- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM. Use **Clear cloud storage** to free the cache.
+- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste
+  an HF token at the top to restore models from your private HF dataset repo,
+  otherwise it tries Google Drive, otherwise it downloads normally.
+- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick
+  **Hugging Face Hub** or **Google Drive**, paste your HF token, and click
+  **Start upload**. Uploads run with a live progress bar while you keep dubbing.
+- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave
+  the VM.
 
-
-### Model persistence (UI-driven)
-
-- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
-- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
-- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM. Use **Clear cloud storage** to free the cache.
-
-
-### Model persistence (UI-driven)
-
-- A **fast Cache Check / Restore cell** runs just before the CosyVoice cell: paste an HF token at the top to restore models from your private HF dataset repo, otherwise it tries Google Drive, otherwise it downloads normally.
-- A **Model persistence panel** lives in **Tab 1 > Advanced**: enable it, pick **Hugging Face Hub** or **Google Drive**, paste your HF token, and click **Start upload**. Uploads run with a live progress bar while you keep dubbing.
-- Cloud storage holds **models only** (auto-cleanup) - job artifacts never leave the VM.
 **Auto-cleanup policy:** cloud storage holds **only model caches** - job artifacts
 (audio/outputs) are never uploaded and stay on the VM. The **Clear cloud storage**
 button (Tab 1 > Advanced) wipes cached models (~5 GB re-downloads next session).
+
+### Using the same token twice
+
+The cache repo is created **private**, so **restore must authenticate too**.
+
+- Use **one WRITE token everywhere** - a `write` token can read *and* write.
+  A `read` token is enough to *download* but will break **Start upload**.
+- Fine-grained tokens: grant **Read + Write** on that dataset repo (or "all
+  repos"), otherwise the upload 401s.
+- Paste the **same** token in Cell 4B and in the Tab 1 panel, or simply leave
+  Cell 4B blank once persistence is enabled: the repo id is remembered in
+  `/content/autodub_persist.json`.
+
+> ⚠️ **If restore reports "empty storage" while your dashboard shows GBs, that
+> is an auth failure, not an empty repo.** An unauthenticated download of a
+> private repo returns **401**, which is easily mistaken for "nothing stored".
+> The restore cell now says which it is:
+>
+> | Message | Meaning | Fix |
+> |---|---|---|
+> | `TOKEN REJECTED` | the token itself is invalid | regenerate at huggingface.co/settings/tokens |
+> | `token has NO ACCESS (401)` | valid token, wrong repo or no grant | check the repo id / token scopes |
+> | `accessible but EMPTY (0 files)` | genuine empty repo | upload from Tab 1 first |
+> | `no such private dataset` | repo id mismatch | set `HF_REPO_RESTORE` in Cell 4B |

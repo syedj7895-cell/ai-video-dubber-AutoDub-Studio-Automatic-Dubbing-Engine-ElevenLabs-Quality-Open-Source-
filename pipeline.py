@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -663,26 +664,103 @@ def _copy_tree(src, dst) -> int:
     return n
 
 
-def restore_model_cache(hf_token: str = "") -> str:
+def _hf_auth(tok: str) -> None:
+    """Make `tok` the ambient HF credential for THIS process.
+
+    `snapshot_download` / `from_pretrained` default to `token=None`, meaning
+    "use the ambient credential" - the HF_TOKEN env var or the file left by
+    `huggingface-cli login`. A fresh Colab VM has NEITHER, so any call that
+    forgets to pass token= goes out unauthenticated; on a PRIVATE repo that
+    returns 401, which downstream code then misreads as "empty cache".
+    """
+    if not tok:
+        return
+    os.environ["HF_TOKEN"] = tok
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
+    try:
+        from huggingface_hub import login
+        try:
+            login(token=tok, add_to_git_credential=False)
+        except TypeError:                # older hub lacking that kwarg
+            login(tok)
+    except Exception:
+        pass
+
+
+def restore_model_cache(hf_token: str = "", hf_repo: str = "") -> str:
     """Reuse a prior model cache (HF Hub if token, else Google Drive).
-    Never raises - returns a human-readable status string."""
+
+    Never raises - returns a status string that distinguishes an ACCESS
+    failure from a genuinely EMPTY repo, because those need different fixes.
+    """
     ms, hf = _cache_roots()
     ms.mkdir(parents=True, exist_ok=True)
     hf.mkdir(parents=True, exist_ok=True)
     stage = Path("/content/autodub_restore")
-    tok = (hf_token or "").strip() or _persist_config().get("hf_token", "")
+    cfg = _persist_config()
+    tok = (hf_token or "").strip() or str(cfg.get("hf_token", "")).strip()
+
     if tok:
+        _hf_auth(tok)
         try:
             from huggingface_hub import HfApi, snapshot_download
-            api = HfApi(token=tok)
-            repo = (_persist_config().get("hf_repo")
-                    or f"{api.whoami().get('name', 'user')}/autodub-model-cache")
-            snapshot_download(repo, repo_type="dataset", local_dir=str(stage))
+        except Exception as e:
+            return f"huggingface_hub unavailable ({str(e)[:100]})"
+
+        api = HfApi(token=tok)
+        try:
+            user = api.whoami().get("name", "user")
+        except Exception as e:
+            return (f"HF token rejected ({str(e)[:110]}) - regenerate it at "
+                    f"huggingface.co/settings/tokens")
+
+        candidates: List[str] = []
+        for cand in (hf_repo, cfg.get("hf_repo"),
+                     f"{user}/autodub-model-cache"):
+            cand = (cand or "").strip()
+            if cand and cand not in candidates:
+                candidates.append(cand)
+
+        problems: List[str] = []
+        for repo in candidates:
+            try:
+                files = api.list_repo_files(repo_id=repo, repo_type="dataset",
+                                            token=tok)
+            except Exception as e:
+                msg = str(e)
+                if "401" in msg or "403" in msg or "Unauthorized" in msg:
+                    problems.append(f"{repo}: token has NO ACCESS (401)")
+                elif "404" in msg or "not found" in msg.lower():
+                    problems.append(f"{repo}: no such private dataset")
+                else:
+                    problems.append(f"{repo}: {msg[:90]}")
+                continue
+
+            if not files:
+                problems.append(f"{repo}: accessible but EMPTY (0 files)")
+                continue
+
+            try:
+                if stage.exists():
+                    import shutil as _sh
+                    _sh.rmtree(stage, ignore_errors=True)
+                snapshot_download(repo, repo_type="dataset", token=tok,
+                                  local_dir=str(stage))
+            except Exception as e:
+                problems.append(f"{repo}: download failed ({str(e)[:90]})")
+                continue
+
             a = _copy_tree(stage / "modelscope", ms)
             b = _copy_tree(stage / "hf", hf)
-            return f"Restored from HF Hub: {a + b} file(s)"
-        except Exception as e:
-            return f"HF Hub has no usable cache ({str(e)[:120]})"
+            if not (a + b):             # layout fallback: flat stage root
+                a = _copy_tree(stage, ms)
+            return (f"Restored from HF Hub: {repo} ({a + b} file(s), "
+                    f"{len(files)} in repo)")
+
+        detail = " | ".join(problems[:3]) if problems else "no candidate repo"
+        return (f"HF Hub has no usable cache - {detail}. "
+                f"Models will download normally instead.")
+
     try:
         drv = Path("/content/drive/MyDrive/AutoDub_Studio/model_cache")
         if not Path("/content/drive/MyDrive").exists():
@@ -731,6 +809,7 @@ def upload_model_cache(progress_cb=None, backend: str = "hf",
     if not tok:
         _p(100, "HF upload needs a token")
         return "HF upload needs a token (paste it in the persistence panel)."
+    _hf_auth(tok)                     # authenticate the whole session
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=tok)
