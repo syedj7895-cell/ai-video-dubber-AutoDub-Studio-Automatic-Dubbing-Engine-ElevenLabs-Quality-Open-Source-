@@ -183,6 +183,22 @@ that range the mix is just a worse copy of one voice. A partner of the *other*
 gender is refused, so a blend can never de-gender a speaker. Set it with
 `set_kokoro_blend(partner, weight)`.
 
+**Phase D · auto-blend above capacity.** Kokoro ships only **4** Hindi voices, so
+a balanced cast of four maps one-to-one and everyone is already distinct. Past
+that a voice is *recycled* and two speakers become audibly identical — the same
+failure the Edge pool has, just smaller. Step 7 therefore gives every **shared**
+speaker a weighted mix of the two same-gender voices at a canonical weight no
+other speaker uses (0.70 → 0.30 → 0.50 …, the extremes first, so consecutive
+speakers sit as far apart as the clamp allows). The canonical weight is computed
+on the gender's *first* pool voice and then translated onto whatever voice the
+allocator actually assigned — otherwise two recycled speakers could request the
+same ladder value and end up with the identical tensor.
+
+Precedence is explicit: a Tab 2 **blend partner** you set by hand is an
+instruction, so it wins and auto-blend switches off — with a console warning if
+voices are still being shared, because one identical blend cannot separate two
+speakers. Clear the partner to hand control back to Phase D.
+
 **Edge prosody.** Edge cannot clone, so `pitch` (Hz), `rate` and `volume`
 (percent) are its only expressive controls — persisted via
 `set_engine_prosody()` and applied to every line. Pitch support is probed at

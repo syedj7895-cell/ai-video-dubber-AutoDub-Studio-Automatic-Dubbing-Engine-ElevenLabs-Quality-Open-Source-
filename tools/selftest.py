@@ -542,6 +542,95 @@ _kcast = pipeline.allocate_speaker_voices(
 check("kokoro casting is gender-matched",
       _kcast["A"].startswith("hm_") and _kcast["B"].startswith("hf_"))
 
+# ── Phase D · auto-blend above capacity ─────────────────────────────────────
+# A helper: the effective share of the gender's FIRST pool voice in the final
+# tensor `base*w + partner*(1-w)`. Two speakers are distinguishable only if
+# these differ — that is the whole point of the policy.
+def _alpha0(base, partner, w, pool):
+    return (w if base == pool[0] else 0.0) + \
+           ((1.0 - w) if partner == pool[0] else 0.0)
+
+
+_F_POOL = ["hf_alpha", "hf_beta"]
+_M_POOL = ["hm_omega", "hm_psi"]
+
+# Reset any blend a previous check persisted — Phase D must start neutral.
+pipeline.set_kokoro_blend("", None)
+
+_si4 = {"F1": {"f0_hz": 220.0}, "F2": {"f0_hz": 200.0},
+        "M1": {"f0_hz": 110.0}, "M2": {"f0_hz": 100.0}}
+_cast4 = {"F1": "hf_alpha", "F2": "hf_beta",
+          "M1": "hm_omega", "M2": "hm_psi"}
+
+check("Kokoro Hindi capacity is 4 voices", pipeline.KOKORO_HINDI_CAPACITY == 4)
+check("a cast within capacity needs no auto-blend",
+      pipeline.auto_kokoro_blends(_cast4, _si4) == {})
+
+_si5 = dict(_si4, F3={"f0_hz": 180.0})
+_cast5 = dict(_cast4, F3="hf_alpha")           # F3 must SHARE F1's voice
+_bl5 = pipeline.auto_kokoro_blends(_cast5, _si5)
+check("only the recycled speaker is blended",
+      set(_bl5) == {"F3"} and "F1" not in _bl5 and "F2" not in _bl5)
+check("blend partner is the OTHER voice of the same gender",
+      _bl5.get("F3", {}).get("partner") == "hf_beta")
+check("auto-blend weight stays inside the 0.30–0.70 clamp",
+      _bl5 and pipeline._KOKORO_BLEND_MIN <= _bl5["F3"]["weight"]
+      <= pipeline._KOKORO_BLEND_MAX)
+
+# 5 female speakers → 3 of them must share; every resulting mix must differ.
+_si6 = {"F1": {"f0_hz": 230.0}, "F2": {"f0_hz": 215.0}, "F3": {"f0_hz": 200.0},
+        "F4": {"f0_hz": 185.0}, "F5": {"f0_hz": 170.0}}
+_cast6 = {"F1": "hf_alpha", "F2": "hf_beta", "F3": "hf_alpha",
+          "F4": "hf_beta", "F5": "hf_alpha"}
+_bl6 = pipeline.auto_kokoro_blends(_cast6, _si6)
+_alphas = []
+for spk, voice in _cast6.items():
+    b = _bl6.get(spk)
+    _alphas.append(_alpha0(voice, b["partner"], b["weight"], _F_POOL)
+                   if b else (1.0 if voice == _F_POOL[0] else 0.0))
+check("5 speakers → 3 auto-blends issued", len(_bl6) == 3)
+check("every speaker resolves to a DISTINCT mix", len(set(_alphas)) == 5)
+check("auto-blend never crosses genders",
+      all(pipeline._kokoro_voice_gender(v["partner"]) == "female"
+          for v in _bl6.values()))
+
+# Precedence: an explicit Tab 2 partner is an instruction, so it wins.
+pipeline.set_kokoro_blend("hf_beta", 0.5)
+try:
+    _manual = pipeline.auto_kokoro_blends(_cast5, _si5)
+    check("manual Tab 2 blend partner beats Phase D auto-blend", _manual == {})
+finally:
+    pipeline.set_kokoro_blend("", None)
+
+# Full-resolution check: the blend the dispatcher forwards for a shared speaker
+# actually changes the tensor mixture (the mechanism Kokoro documents).
+_seen_k = {}
+_orig_kospeak, _orig_kload = pipeline._kokoro_speak, pipeline._load_kokoro
+
+
+def _probe_kospeak(model, text, voice="", speed=1.0, blend=None, log=None, **kw):
+    _seen_k["blend"] = blend or {}
+    return [0.0] * 24000, 24000
+
+
+try:
+    pipeline._kokoro_speak, pipeline._load_kokoro = _probe_kospeak, (lambda log=None: "k")
+    # resolve_engine() binds spec["speak"] from the module globals, so it must
+    # be called AFTER the patch above for the probe to receive the call.
+    _rt = pipeline.EngineRuntime(pipeline.resolve_engine("kokoro"),
+                                 pipeline.Log())
+    _rt.model = "k"
+    _rt._dispatch("F3", {"index": 1, "text": "नमस्ते"}, "", "",
+                  _cast6, _bl6)
+    check("dispatcher forwards the per-speaker auto-blend",
+          _seen_k.get("blend", {}).get("partner") == "hf_beta")
+    _seen_k.clear()
+    _rt._dispatch("F1", {"index": 1, "text": "नमस्ते"}, "", "", _cast6, _bl6)
+    check("an unblended speaker forwards NO auto-blend",
+          not _seen_k.get("blend", {}).get("partner"))
+finally:
+    pipeline._kokoro_speak, pipeline._load_kokoro = _orig_kospeak, _orig_kload
+
 # ── voice preview (Tab 2 audition) ─────────────────────────────────────────
 # Refusal paths must not touch the network or load weights.
 _p, _m = pipeline.preview_voice(engine_id="chatterbox")

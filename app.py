@@ -858,6 +858,12 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(elem_classes=["glass", "pad"]):
                         gr.Markdown("**Kokoro speed & blending** · same-gender "
                                     "partners only, weight clamped 0.30–0.70")
+                        gr.Markdown("_Above 4 speakers Kokoro must reuse a Hindi "
+                                    "voice, so each shared speaker is "
+                                    "auto-blended with a **distinct** same-gender "
+                                    "mix (Phase D). Setting a partner below "
+                                    "disables that and applies your blend to "
+                                    "everyone._")
                         voz_speed = gr.Slider(minimum=0.5, maximum=1.5,
                                               value=float(_kokoro_speed),
                                               step=0.05, label="Speed ×")

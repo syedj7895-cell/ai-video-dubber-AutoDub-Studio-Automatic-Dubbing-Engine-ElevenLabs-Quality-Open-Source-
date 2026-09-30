@@ -2966,6 +2966,109 @@ def _kokoro_cast(speakers_info: Dict[str, dict], log: Log = _noop) -> Dict[str, 
                                    native=lambda _v: True)
 
 
+# ── Phase D · auto-blend above capacity ──────────────────────────────────────
+# Kokoro ships FOUR Hindi voices, so a balanced cast of ≤4 maps one-to-one and
+# every speaker is already distinct. Past that a voice is RECYCLED and two
+# speakers become audibly identical — the same failure the Edge pool has, just
+# smaller. Rather than pretend a fifth voice exists, each recycled speaker
+# keeps its base voice but mixes in the other voice of the same gender at a
+# canonical weight no other speaker of that gender uses.
+
+# Canonical weight = share of the gender's FIRST pool voice. Jumping to the
+# extremes first (0.70 → 0.30 → 0.50) maximises the distance between
+# consecutive speakers within the 0.30–0.70 clamp, where a 0.95/0.05 mix would
+# just be a worse copy of one voice.
+_BLEND_LADDER = (0.70, 0.30, 0.50, 0.60, 0.40, 0.65, 0.35, 0.55, 0.45,
+                 0.62, 0.38, 0.54, 0.46)
+
+KOKORO_HINDI_CAPACITY = sum(len(v) for v in _KOKORO_HINDI_VOICES.values())
+
+
+def auto_kokoro_blends(cast: Dict[str, str],
+                       speakers_info: Optional[Dict[str, dict]] = None,
+                       log: Log = _noop) -> Dict[str, dict]:
+    """Per-speaker blends that keep an over-capacity Kokoro cast distinguishable.
+
+    Returns `{speaker: {"partner": <voice>, "weight": <0.30–0.70>}}` for the
+    speakers whose voice had to be SHARED, or `{}` when no blending is needed.
+    A speaker left OUT of the map renders on its pure voice.
+
+    `weight` is chosen as a canonical share of the gender's first pool voice and
+    then translated onto whatever voice the allocator actually assigned
+    (`base * w + partner * (1-w)`). Translating matters: without it, a recycled
+    speaker on `pool[1]` and a recycled speaker on `pool[0]` could both request
+    the same ladder value and end up with the identical tensor.
+
+    **Precedence** — a manually configured Tab 2 blend partner is an explicit
+    instruction and wins; auto-blending is then off. If voices are still being
+    shared in manual mode we say so, because one identical blend cannot separate
+    two speakers.
+    """
+    cast = {k: v for k, v in (cast or {}).items() if v}
+    if len(cast) < 2:
+        return {}
+
+    shared = sorted(v for v, n in Counter(cast.values()).items() if n > 1)
+    manual = str((get_kokoro_blend() or {}).get("partner") or "").strip()
+    if manual:
+        log(f"   ⚖ manual Kokoro blend partner '{manual}' applies to every "
+            f"speaker — auto-blend off.")
+        if shared:
+            log(f"   ⚠ {len(shared)} voice(s) are still shared; one identical "
+                f"blend cannot separate those speakers. Clear the Tab 2 blend "
+                f"partner to let Phase D spread them.")
+        return {}
+
+    if not shared:
+        return {}
+
+    blends: Dict[str, dict] = {}
+    # Bucket by the gender of the ASSIGNED voice (always consistent with `cast`),
+    # then rank highest F0 first — the allocator's own deterministic order.
+    buckets: Dict[str, List[str]] = defaultdict(list)
+    for spk, voice in cast.items():
+        buckets[_kokoro_voice_gender(voice) or "?"].append(spk)
+
+    for gender, spks in buckets.items():
+        pool = _kokoro_voice_pool().get(str(gender).capitalize(), [])
+        if len(pool) < 2:                       # nothing to mix this voice with
+            continue
+        spks.sort(key=lambda s: -float(
+            ((speakers_info or {}).get(s) or {}).get("f0_hz") or 0.0))
+        seen: set = set()
+        step = 0
+        for spk in spks:
+            base = cast[spk]
+            if base not in seen:
+                seen.add(base)                  # first speaker on this voice → pure
+                continue
+            alpha = _BLEND_LADDER[step % len(_BLEND_LADDER)]
+            step += 1
+            if base == pool[0]:
+                partner, weight = pool[1], alpha
+            elif base == pool[1]:
+                partner, weight = pool[0], 1.0 - alpha
+            else:                               # voice outside the known pool
+                continue
+            blends[spk] = {"partner": partner,
+                           "weight": round(max(_KOKORO_BLEND_MIN,
+                                               min(_KOKORO_BLEND_MAX,
+                                                   float(weight))), 3)}
+
+    if blends:
+        log(f"   🔀 Phase D auto-blend · {len(cast)} speakers > "
+            f"{KOKORO_HINDI_CAPACITY} Kokoro Hindi voices — "
+            f"{len(blends)} speaker(s) get a distinct same-gender mix.")
+        for spk in sorted(blends):
+            b = blends[spk]
+            log(f"      {spk}: {cast[spk]} ⊕ {b['partner']} @ "
+                f"{b['weight']:.2f}  [gender kept · now distinct]")
+    elif shared:
+        log(f"   ⚠ voices are shared but no blend could be built — the "
+            f"speaker(s) on {', '.join(shared)} will sound alike.")
+    return blends
+
+
 def _espeak_status() -> Tuple[bool, str]:
     """Is the espeak-ng BINARY on PATH? Informational, not a hard gate."""
     if shutil.which("espeak-ng") or shutil.which("espeak"):
@@ -3633,17 +3736,21 @@ class EngineRuntime:
                     self.label, causes, detail=traceback.format_exc())) from e
             self._switch(fb_id, f"{self.id} could not load ({str(e)[:160]})")
 
-    def speak(self, spk, row, prompt_speech, transcript, voice_cast):
+    def speak(self, spk, row, prompt_speech, transcript, voice_cast,
+              blends: Optional[Dict[str, dict]] = None):
         """Synthesize one row → (clip, sr).
 
         Fallback engines switch tier after 3 consecutive failures. TERMINAL
         engines have nowhere to go, so 3 consecutive failures abort the render
         with a full report — never a silent voice substitution, and never a
         silently-empty master track.
+
+        `blends` is a per-speaker override (Phase D auto-blend). It wins over
+        the engine-wide blend from Tab 2 for the speakers it names.
         """
         try:
             clip, sr = self._dispatch(spk, row, prompt_speech, transcript,
-                                      voice_cast)
+                                      voice_cast, blends)
             self.failed = 0
             return clip, sr
         except Exception as e:
@@ -3668,10 +3775,11 @@ class EngineRuntime:
                 self._switch(fb_id, f"{self.id} failed {self.failed}x in a row "
                                     f"({str(e)[:90]})")
                 return self._dispatch(spk, row, prompt_speech, transcript,
-                                      voice_cast)
+                                      voice_cast, blends)
             raise
 
-    def _dispatch(self, spk, row, prompt_speech, transcript, voice_cast):
+    def _dispatch(self, spk, row, prompt_speech, transcript, voice_cast,
+                  blends: Optional[Dict[str, dict]] = None):
         text = str(row["text"])
         instruct = str(row.get("instruct", "") or "")
         sid = self.id
@@ -3686,10 +3794,13 @@ class EngineRuntime:
                 language=(row.get("target_language") or self.dub_lang),
                 exaggeration=_emotion_to_exaggeration(instruct))
         if self.kind == "kokoro":
+            # Per-speaker auto-blend (Phase D) wins over the engine-wide
+            # Tab 2 blend for the speakers it names; everyone else keeps the
+            # global setting (or none at all).
             return self.spec["speak"](
                 self.model, text, voice=voice_cast.get(spk, ""),
                 speed=float(self.spec.get("speed", 1.0)),
-                blend=self.spec.get("blend") or {})
+                blend=(blends or {}).get(spk) or self.spec.get("blend") or {})
         if self.kind == "edge":
             return self.spec["speak"](self.model, text,
                                       voice=voice_cast.get(spk, ""),
@@ -3767,10 +3878,14 @@ def step7_synthesize(log: Log, force: bool = False,
     # Non-cloning engines have FIXED voices → cast a distinct, gender-matched
     # voice per speaker so one speaker never silently absorbs another's.
     voice_cast: Dict[str, str] = {}
+    blends: Dict[str, dict] = {}
     if rt.kind == "edge":
         voice_cast = allocate_speaker_voices(speakers_info, log)
     elif rt.kind == "kokoro":
         voice_cast = _kokoro_cast(speakers_info, log)
+        # Phase D — past Kokoro's 4 Hindi voices a cast has to share, so give
+        # every recycled speaker a distinct same-gender mix.
+        blends = auto_kokoro_blends(voice_cast, speakers_info, log)
 
     # ── the auto-padding system: silent zero-signal master per speaker ────
     n_total = int(round(duration * sr))
@@ -3811,7 +3926,8 @@ def step7_synthesize(log: Log, force: bool = False,
 
         try:
             clip, clip_sr = rt.speak(spk, row, prompt_speech,
-                                     transcripts.get(spk, ""), voice_cast)
+                                     transcripts.get(spk, ""), voice_cast,
+                                     blends)
             # normalise every engine's output into the master sample rate
             if clip_sr and int(clip_sr) != sr:
                 clip = _resample_1d(clip, int(clip_sr), sr)
