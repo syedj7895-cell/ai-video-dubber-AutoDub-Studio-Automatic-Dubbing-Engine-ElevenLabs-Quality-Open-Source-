@@ -235,14 +235,13 @@ check("terminal engine never silently substitutes a voice",
       rt_term.spec["id"] == "_unit_terminal")
 
 # ── 11 · Chatterbox checkpoint resolution (mocked HF hub, offline) ─────────
-# Regression guard for the reported bug: from_pretrained() has no `repo_id`
-# argument and hardcodes REPO_ID, so we drive snapshot_download ourselves.
+# Regression guard for the reported bug: 0.1.7's from_pretrained() takes
+# neither `repo_id` nor `t3_model`, so we drive snapshot_download ourselves and
+# present a finetune under the filename the wheel hardcodes.
 try:
     import tempfile
     import huggingface_hub
 
-    _base = ["ve.pt", "conds.pt", "s3gen.pt", "t3_cfg.pt",
-             "grapheme_mtl_merged_expanded_v1.json", "t3_mtl23ls_v2.safetensors"]
     _hub_calls = []
     _orig_sd = huggingface_hub.snapshot_download
     _spec = pipeline.TTS_ENGINES["chatterbox"]
@@ -251,7 +250,8 @@ try:
     def _fake_sd(repo_id, token=None, allow_patterns=None):
         _hub_calls.append((repo_id, token, tuple(allow_patterns or ())))
         d = Path(tempfile.mkdtemp())
-        for f in (_base if repo_id == "unit/base" else ["t3_hi.safetensors"]):
+        for f in (pipeline._CHATTERBOX_FILES if repo_id == "unit/base"
+                  else ["t3_hi.safetensors"]):
             (d / f).write_bytes(b"x")
         return str(d)
 
@@ -270,22 +270,29 @@ try:
 
     _hub_calls.clear()
     _d2 = pipeline._chatterbox_ckpt_dir(pipeline.Log(), "t3_hi.safetensors")
-    check("Hindi finetune merges the overlay repo on top of the base",
-          [c[0] for c in _hub_calls] == ["unit/base", "unit/overlay"]
-          and (_d2 / "t3_hi.safetensors").exists())
+    check("Hindi finetune pulls the overlay repo on top of the base",
+          [c[0] for c in _hub_calls] == ["unit/base", "unit/overlay"])
+    check("finetune is served under the filename 0.1.7 hardcodes",
+          (_d2 / pipeline._T3_FILENAME).exists()
+          and not (_d2 / "t3_hi.safetensors").exists())
+    check("finetune lands in its own dir — the base cache is untouched",
+          _d2 != _d1
+          and not (_d1 / pipeline._T3_FILENAME).samefile(
+              _d2 / pipeline._T3_FILENAME))
 
     # overlay unavailable ⇒ degrade to the multilingual default, never crash
     def _no_overlay(repo_id, token=None, allow_patterns=None):
         d = Path(tempfile.mkdtemp())
         if repo_id == "unit/base":
-            for f in _base:
+            for f in pipeline._CHATTERBOX_FILES:
                 (d / f).write_bytes(b"x")
         return str(d)
 
     huggingface_hub.snapshot_download = _no_overlay
     _d3 = pipeline._chatterbox_ckpt_dir(pipeline.Log(), "t3_hi.safetensors")
     check("missing overlay degrades to the default T3 instead of dangling",
-          not (_d3 / "t3_hi.safetensors").exists())
+          (_d3 / pipeline._T3_FILENAME).exists()
+          and not (_d3 / "t3_hi.safetensors").exists())
 
     # incomplete base checkpoint must be reported, not silently used
     huggingface_hub.snapshot_download = lambda *a, **k: str(tempfile.mkdtemp())
@@ -301,6 +308,53 @@ try:
     _spec["t3_model"] = ""
 except ImportError as exc:                    # huggingface_hub absent
     print(f"⏭ chatterbox checkpoint checks skipped ({exc})")
+
+# ── 11b · Chatterbox LOAD, end-to-end against a 0.1.7-shaped stub ──────────
+# This reproduces the exact reported failure — an installed, importable
+# chatterbox whose from_local(cls, ckpt_dir, device) has no `t3_model` — and
+# proves the whole load path now completes instead of aborting the run.
+import types as _types
+
+_cb_calls = []
+
+
+class _StubMTL:
+    @classmethod
+    def from_local(cls, ckpt_dir, device):
+        _cb_calls.append(("from_local", str(ckpt_dir), device))
+        return {"loaded": True}
+
+
+_cb_pkg = _types.ModuleType("chatterbox")
+_cb_mod = _types.ModuleType("chatterbox.mtl_tts")
+_cb_mod.ChatterboxMultilingualTTS = _StubMTL
+_cb_pkg.mtl_tts = _cb_mod
+_mods = ("chatterbox", "chatterbox.mtl_tts", "torch")
+_saved_mods = {k: sys.modules.get(k) for k in _mods}
+if _saved_mods["torch"] is None:              # this box may have no torch
+    _fake_torch = _types.ModuleType("torch")
+    _fake_torch.cuda = _types.SimpleNamespace(is_available=lambda: False)
+    sys.modules["torch"] = _fake_torch
+sys.modules["chatterbox"] = _cb_pkg
+sys.modules["chatterbox.mtl_tts"] = _cb_mod
+
+_orig_ckpt_fn = pipeline._chatterbox_ckpt_dir
+pipeline._chatterbox_ckpt_dir = lambda log, t3_model="": Path("unit-ckpt")
+try:
+    _loaded = pipeline._load_chatterbox(pipeline.Log())
+    check("load_chatterbox succeeds against a 0.1.7-style from_local",
+          _loaded == {"loaded": True})
+    check("…calling from_local(ckpt_dir, device) and never t3_model",
+          len(_cb_calls) == 1 and _cb_calls[0][:2] == ("from_local",
+                                                       "unit-ckpt")
+          and len(_cb_calls[0]) == 3)
+finally:
+    pipeline._chatterbox_ckpt_dir = _orig_ckpt_fn
+    for _k, _v in _saved_mods.items():
+        if _v is None:
+            sys.modules.pop(_k, None)
+        else:
+            sys.modules[_k] = _v
 
 # ── 12 · automatic gender detection (validated on synthetic voices) ────────
 # These are the exact regressions found while building this: plain YIN labelled
@@ -788,6 +842,120 @@ with _tf.TemporaryDirectory() as _td:
           _raises(SystemExit, lambda: _bs.preflight(_t, "no_such_module", True)))
     check("preflight accepts an existing target in dry-run mode",
           _bs.preflight(_t, "pipeline", True) == _src)
+
+
+# ── Chatterbox call plumbing · the 0.1.7 `t3_model` regression ─────────────
+# The released wheel declares from_local(cls, ckpt_dir, device). Calling it with
+# `t3_model=` raised "unexpected keyword argument" and killed every Chatterbox
+# run even though the install was perfect. These pin the fix.
+import numpy as _np
+
+
+class _CB017:
+    """chatterbox-tts 0.1.7 — the signature that actually ships."""
+
+    @classmethod
+    def from_local(cls, ckpt_dir, device):
+        return {"ckpt": str(ckpt_dir), "device": device}
+
+
+class _CBMaster:
+    """Unreleased master — from_local grew a t3_model keyword."""
+
+    seen = "unset"
+
+    @classmethod
+    def from_local(cls, ckpt_dir, device, t3_model=None):
+        cls.seen = t3_model
+        return {"t3": t3_model}
+
+
+class _CBSoppy:
+    """A build that swallows anything (**kwargs)."""
+
+    seen = None
+
+    @classmethod
+    def from_local(cls, ckpt_dir, device, **kw):
+        cls.seen = kw
+        return kw
+
+
+check("adaptive call drops t3_model for the real 0.1.7 from_local",
+      pipeline._call_with_supported_kwargs(
+          _CB017.from_local, "ckpt", "cuda",
+          t3_model="t3_hi.safetensors") == {"ckpt": "ckpt", "device": "cuda"})
+_CBMaster.seen = "unset"
+pipeline._call_with_supported_kwargs(_CBMaster.from_local, "c", "cuda",
+                                     t3_model="t3_hi.safetensors")
+check("adaptive call still forwards t3_model to a master-style signature",
+      _CBMaster.seen == "t3_hi.safetensors")
+_CBSoppy.seen = None
+pipeline._call_with_supported_kwargs(_CBSoppy.from_local, "c", "cuda",
+                                     t3_model="x", other=1)
+check("adaptive call forwards everything to a **kwargs signature",
+      _CBSoppy.seen == {"t3_model": "x", "other": 1})
+check("adaptive call survives a callable with no readable signature",
+      isinstance(pipeline._call_with_supported_kwargs(type, "X", (), {}), type))
+
+check("T3 filename matches the name hardcoded in the wheel",
+      pipeline._T3_FILENAME == "t3_mtl23ls_v2.safetensors")
+check("t3_cfg.pt is NOT requested (0.1.7's from_local never reads it)",
+      "t3_cfg.pt" not in pipeline._CHATTERBOX_FILES)
+check("every mandatory file appears in the snapshot list",
+      set(pipeline._CHATTERBOX_REQUIRED) <= set(pipeline._CHATTERBOX_FILES))
+
+with _tf.TemporaryDirectory() as _td:
+    _t = Path(_td)
+    _base = _t / "base"
+    _base.mkdir()
+    for _n in ("ve.pt", "s3gen.pt", "grapheme_mtl_merged_expanded_v1.json",
+               "Cangjie5_TC.json", "conds.pt"):
+        (_base / _n).write_bytes(b"BASE:" + _n.encode())
+    (_base / pipeline._T3_FILENAME).write_bytes(b"BASE:v2-t3")
+    _fine = _t / "t3_hi.safetensors"
+    _fine.write_bytes(b"HINDI-FINETUNE")
+
+    _out = pipeline._chatterbox_overlay_dir(_base, _fine, lambda _m: None)
+
+    check("overlay dir carries every base checkpoint file",
+          all((_out / _n).exists() for _n in
+              ("ve.pt", "s3gen.pt", "grapheme_mtl_merged_expanded_v1.json",
+               "Cangjie5_TC.json", "conds.pt")))
+    check("overlay swaps the finetune in under the HARDCODED T3 name",
+          (_out / pipeline._T3_FILENAME).read_bytes() == b"HINDI-FINETUNE")
+    check("overlay dir is exactly from_local-ready (no missing/extra files)",
+          sorted(p.name for p in _out.iterdir())
+          == sorted(pipeline._CHATTERBOX_FILES))
+    check("overlay never pollutes the shared base cache",
+          (_base / pipeline._T3_FILENAME).read_bytes() == b"BASE:v2-t3")
+    check("base cache still holds exactly its own files",
+          sorted(p.name for p in _base.iterdir())
+          == sorted(pipeline._CHATTERBOX_FILES))
+
+
+class _LegacyGen:
+    """A build whose generate() has no cfg_weight → the TypeError-retry path."""
+
+    sr = 24_000
+
+    def __init__(self):
+        self.got = {}
+
+    def generate(self, text, language_id, audio_prompt_path=None,
+                 exaggeration=0.5):
+        self.got = {"text": text, "lang": language_id,
+                    "ref": audio_prompt_path, "exag": exaggeration}
+        return [[0.0, 0.1, -0.1]]
+
+
+_g = _LegacyGen()
+_y, _sr = pipeline._chatterbox_speak(_g, "नमस्ते", ref_audio="r.wav",
+                                     language="hi", exaggeration=0.7)
+check("speak() retries without cfg_weight on a legacy generate()",
+      _g.got.get("exag") == 0.7 and _sr == 24_000)
+check("speak() returns mono float32 audio",
+      _y.shape == (3,) and _y.dtype == _np.float32)
 
 
 # ── cleanup self-test artifacts (leave a pristine tree) ────────────────────

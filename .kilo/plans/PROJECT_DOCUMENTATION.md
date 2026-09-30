@@ -610,7 +610,7 @@ python tools/selftest.py
 | **Phase 3** | Diarization + emotion analysis + SRT assembly (steps 3-5) | ✅ Complete | Pyannote + SenseVoice integration |
 | **Phase 4** | Speaker splitting + CosyVoice 3.0 zero-shot TTS (steps 6-7) | ✅ Complete | TTS-safe processing + voice cloning |
 | **Phase 5** | Master mixdown, lookahead ducking, video remux (step 8) | ✅ Complete | Sophisticated audio mixing |
-| **Phase 6** | Cython obfuscation builder (`build_secure.py`) | 🔜 Planned | References in README |
+| **Phase 6** | Cython obfuscation builder (`build_secure.py`) | ✅ Complete | Verify-then-scrub builder; source deleted only after a child process imports the compiled binary |
 | **Phase 7** | Windows/macOS desktop bridge tunnels | ✅ Complete | `tools/bridge.py` + launchers |
 | **Phase 8** | Ready-made Colab `.ipynb` one-click launcher | ✅ Complete | `Colab_Runner.ipynb` |
 

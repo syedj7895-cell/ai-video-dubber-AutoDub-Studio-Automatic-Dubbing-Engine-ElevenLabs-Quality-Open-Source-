@@ -214,6 +214,18 @@ CosyVoice takes a separate `instruct` string, Chatterbox maps to its
 `exaggeration` scalar (0–2), Fish embeds `[tag]` inline, and Edge/Kokoro have no
 emotion control.
 
+**Chatterbox's installed API — worth knowing before debugging it.** The released
+`chatterbox-tts` 0.1.7 wheel exposes
+`ChatterboxMultilingualTTS.from_local(ckpt_dir, device)` and
+`from_pretrained(device)`. **Neither accepts `repo_id` or `t3_model`**, because
+`REPO_ID` *and* the T3 checkpoint filename are hardcoded inside the package. The
+loader is therefore invoked through `_call_with_supported_kwargs()`, which
+passes only the keywords the installed build actually declares — that keeps
+0.1.7 working while picking up the unreleased master's `t3_model` argument
+automatically, instead of dying on an unknown keyword. The checkpoint snapshot
+requests exactly the six names `from_local()` opens, and Hindi is already one of
+its 23 languages, so no extra weights are needed.
+
 > ⚠️ **Licence & watermark notice** — Chatterbox stamps a Resemble **PerTh**
 > neural watermark into every clip it generates. Fish Audio S2-Pro output falls
 > under the **Fish Audio Research License (non-commercial)**. Edge-TTS audio is

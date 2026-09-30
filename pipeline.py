@@ -2259,15 +2259,21 @@ TTS_ENGINES: Dict[str, dict] = {
     "chatterbox": {
         "label": "Chatterbox  (Resemble AI · offline)",
         "kind": "chatterbox",
-        # VERIFIED: ChatterboxMultilingualTTS hardcodes REPO_ID =
-        # "ResembleAI/chatterbox" and its from_pretrained() takes NO repo_id
-        # argument. "ResembleAI/Chatterbox-Multilingual-hi" is an OVERLAY repo
-        # (t3_hi.safetensors + s3gen_v3 only — no ve.pt/conds.pt) which we merge
-        # in on top of the base when `t3_model` is set. Hindi is already one of
-        # the 23 languages in the base multilingual weights.
+        # VERIFIED against the released chatterbox-tts 0.1.7 wheel:
+        #   ChatterboxMultilingualTTS.from_local(cls, ckpt_dir, device)
+        #   ChatterboxMultilingualTTS.from_pretrained(cls, device)
+        # Both take NO `repo_id` and NO `t3_model` — REPO_ID *and* the T3
+        # checkpoint filename ("t3_mtl23ls_v2.safetensors") are hardcoded in
+        # the package, so a T3 cannot be selected by argument in 0.1.7. The
+        # finetune therefore has to be *present under that filename*; see
+        # `_chatterbox_overlay_dir`.
+        # "ResembleAI/Chatterbox-Multilingual-hi" is a v3 OVERLAY repo
+        # (t3_hi.safetensors + s3gen_v3 only — no ve.pt/conds.pt). Hindi is
+        # already one of the 23 languages in the base weights, so this is
+        # opt-in and empty by default.
         "repo": "ResembleAI/chatterbox",
         "overlay_repo": "ResembleAI/Chatterbox-Multilingual-hi",
-        "t3_model": "",                     # e.g. "t3_hi.safetensors" (opt-in)
+        "t3_model": "",            # e.g. "t3_hi.safetensors" (opt-in, see above)
         "clone": True, "fallback": "", "vram": "~2 GB", "sr": 24_000,
     },
     "fishs2": {
@@ -3291,14 +3297,25 @@ def _kokoro_speak(model, text: str, voice: str = "", speed: float = 1.0,
 # `pip install chatterbox-tts` downgrades NumPy, torch and Gradio out from
 # under the running pipeline — which is fatal on Colab (NumPy 2.x) and breaks
 # the Gradio UI we are rendering from.
+# Shown verbatim in every Chatterbox failure report. The `--no-deps` install is
+# NOT a micro-optimisation: chatterbox-tts pins numpy<2.0.0 (python<3.13),
+# torch==2.6.0, torchaudio==2.6.0, transformers==5.2.0 and gradio==6.8.0, so a
+# plain `pip install chatterbox-tts` rewrites NumPy / torch / Gradio out from
+# under the running pipeline — which is fatal on Colab (NumPy 2.x) and breaks
+# the Gradio UI we are rendering from.
 _CHATTERBOX_FIX = """
 pip install --no-deps chatterbox-tts
 pip install resemble-perth s3tokenizer conformer safetensors omegaconf pyloudnorm pykakasi spacy-pkuseg diffusers "librosa>=0.10"
 
 Do NOT run a plain `pip install chatterbox-tts`: it pins numpy<2,
-torch==2.6.0, torchaudio==2.6.0 and gradio==6.8.0 and will downgrade
-NumPy / torch / Gradio out from under this pipeline.
+torch==2.6.0, torchaudio==2.6.0, transformers==5.2.0 and gradio==6.8.0
+and will downgrade NumPy / torch / Gradio out from under this pipeline.
 `resemble-perth` is mandatory — chatterbox does a top-level `import perth`.
+
+Chatterbox also imports torchaudio, transformers, einops, scipy, tokenizers
+and huggingface_hub at module scope. Colab already ships all six, so they are
+deliberately NOT in the list above (reinstalling them would risk the very
+downgrade we are avoiding). Only add one by hand if the traceback names it.
 """
 
 
@@ -3332,15 +3349,86 @@ def _install_chatterbox(log: Log) -> List[str]:
     return notes
 
 
-def _chatterbox_ckpt_dir(log: Log, t3_model: str = "") -> Path:
-    """Download the base multilingual weights (+ optional Hindi overlay).
+# `from_local()` opens exactly these names and nothing else:
+#   ve.pt · t3_mtl23ls_v2.safetensors · s3gen.pt · conds.pt (optional) ·
+#   grapheme_mtl_merged_expanded_v1.json · Cangjie5_TC.json
+# This is byte-for-byte the `allow_patterns` chatterbox-tts 0.1.7 uses in its
+# own from_pretrained(), so the snapshot can never come up short a file the
+# loader opens. The T3 name is hardcoded in the wheel — see the overlay helper.
+_T3_FILENAME = "t3_mtl23ls_v2.safetensors"
+_CHATTERBOX_FILES = ["ve.pt", _T3_FILENAME, "s3gen.pt", "conds.pt",
+                     "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json"]
+# Missing any of these is fatal; conds.pt is a graceful `if exists` in the wheel.
+_CHATTERBOX_REQUIRED = ["ve.pt", _T3_FILENAME, "s3gen.pt",
+                        "grapheme_mtl_merged_expanded_v1.json"]
 
-    We cannot go through `from_pretrained`: its signature is
-    `from_pretrained(cls, device, t3_model=None)` — no `repo_id` argument —
-    and `REPO_ID` is hardcoded inside the package. Downloading explicitly is
-    therefore the only way to (a) pass our HF token and (b) merge the separate
-    `Chatterbox-Multilingual-hi` overlay (t3_hi.safetensors) on top of the
-    base checkpoint, which is what actually selects the Hindi finetune.
+
+def _call_with_supported_kwargs(fn, *args, **kwargs):
+    """Call `fn` passing only the keyword arguments it actually declares.
+
+    Engine wheels drift under us: chatterbox-tts 0.1.7 ships
+    `from_local(cls, ckpt_dir, device)`, while the unreleased master adds
+    `t3_model=None`. A keyword the installed build never heard of is an
+    instant TypeError *at model-load time* — which is exactly how a perfectly
+    good install was being reported as a broken one. Filtering against the
+    real signature keeps 0.1.7 working and lets a future release pick the
+    value up for free.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):            # C builtin / exotic callable
+        return fn(*args, **kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(*args, **kwargs)             # declares **kwargs → pass all
+    return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
+
+
+def _chatterbox_overlay_dir(base: Path, finetune: Path, log: Log) -> Path:
+    """A `from_local()`-ready dir = base checkpoint + the finetune T3.
+
+    `from_local()` hardcodes the T3 filename, so a finetune cannot be handed
+    over as an argument — it has to be *present under that name*. Overwriting
+    the file inside the shared HuggingFace cache would silently change the
+    voice of every later run, so we build a private directory of links instead
+    (free, no multi-GB copy), degrading to hard links then a real copy when
+    the platform refuses symlinks.
+    """
+    out = base.parent / f"{base.name}-{finetune.stem}"
+    out.mkdir(parents=True, exist_ok=True)
+    for f in sorted(base.iterdir()):
+        if not f.is_file() or f.name == _T3_FILENAME:
+            continue
+        dst = out / f.name
+        if dst.exists():
+            continue
+        try:
+            dst.symlink_to(f.resolve())
+        except OSError:
+            try:
+                os.link(f, dst)
+            except OSError:
+                shutil.copy2(f, dst)           # Windows / no privs
+    target = out / _T3_FILENAME
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    try:
+        target.symlink_to(finetune.resolve())
+    except OSError:
+        shutil.copy2(finetune, target)
+    log(f"   ↗ overlay checkpoint → {out}")
+    return out
+
+
+def _chatterbox_ckpt_dir(log: Log, t3_model: str = "") -> Path:
+    """Download the base multilingual weights (+ optional T3 finetune).
+
+    We cannot select the T3 through `from_pretrained()`: in 0.1.7 it is
+    `from_pretrained(cls, device)` — no `repo_id` and no `t3_model` — and the
+    wheel hardcodes both REPO_ID and the T3 filename. Snapshotting explicitly
+    is therefore the only way to merge the separate
+    `Chatterbox-Multilingual-hi` finetune onto the base checkpoint.
     """
     from huggingface_hub import snapshot_download
 
@@ -3348,41 +3436,24 @@ def _chatterbox_ckpt_dir(log: Log, t3_model: str = "") -> Path:
     overlay = str(TTS_ENGINES["chatterbox"].get("overlay_repo") or "")
     token = os.environ.get("HF_TOKEN") or None
 
-    # Exactly the files from_local() reads (+ the default T3 weights).
-    keep = ["ve.pt", "conds.pt", "s3gen.pt", "t3_cfg.pt",
-            "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json",
-            "t3_mtl23ls_v2.safetensors"]
-    if t3_model and t3_model not in keep:
-        keep.append(t3_model)
-
     log(f"[⇩] Chatterbox weights ← {repo}")
     ckpt_dir = Path(snapshot_download(repo_id=repo, token=token,
-                                      allow_patterns=keep))
+                                      allow_patterns=_CHATTERBOX_FILES))
 
     if t3_model and overlay:
-        log(f"[⇩] Chatterbox Hindi overlay ← {overlay} ({t3_model})")
+        log(f"[⇩] Chatterbox T3 finetune ← {overlay} ({t3_model})")
         try:
-            src = Path(snapshot_download(repo_id=overlay, token=token,
-                                         allow_patterns=[t3_model])) / t3_model
-            if not src.exists():
+            finetune = Path(snapshot_download(
+                repo_id=overlay, token=token,
+                allow_patterns=[t3_model])) / t3_model
+            if not finetune.exists():
                 raise FileNotFoundError(f"{t3_model} absent from {overlay}")
-            dst = ckpt_dir / t3_model
-            if not dst.exists():
-                try:
-                    dst.symlink_to(src)                 # free, no 100s of MB
-                except OSError:
-                    shutil.copy2(src, dst)              # Windows / no privs
+            ckpt_dir = _chatterbox_overlay_dir(ckpt_dir, finetune, log)
         except Exception as e:
-            log(f"   ⚠ Hindi overlay unavailable ({str(e)[:110]}) — "
-                f"using the multilingual default T3 instead.")
-            t3_model = ""
+            log(f"   ⚠ T3 finetune unavailable ({str(e)[:110]}) — using the "
+                f"multilingual default T3 instead.")
 
-    if t3_model and not (ckpt_dir / t3_model).exists():
-        raise RuntimeError(f"T3 weights '{t3_model}' missing from {ckpt_dir}")
-
-    missing = [f for f in ("ve.pt", "s3gen.pt",
-                           "grapheme_mtl_merged_expanded_v1.json")
-               if not (ckpt_dir / f).exists()]
+    missing = [f for f in _CHATTERBOX_REQUIRED if not (ckpt_dir / f).exists()]
     if missing:
         raise RuntimeError(f"Chatterbox checkpoint incomplete — missing "
                            f"{', '.join(missing)} in {ckpt_dir}")
@@ -3391,14 +3462,20 @@ def _chatterbox_ckpt_dir(log: Log, t3_model: str = "") -> Path:
 def _load_chatterbox(log: Log):
     """Load Chatterbox Multilingual — TERMINAL engine (no fallback).
 
-    Verified against resemble-ai/chatterbox@master (src/chatterbox/mtl_tts.py):
-      · `REPO_ID` is hardcoded to "ResembleAI/chatterbox"
-      · `from_pretrained(cls, device, t3_model=None)` — there is NO `repo_id`
-        keyword, so passing one is an instant TypeError
-      · `from_local(ckpt_dir, device, t3_model=None)` is the real entry point
+    Verified against the released chatterbox-tts 0.1.7 wheel
+    (src/chatterbox/mtl_tts.py), not against master:
+      · REPO_ID and the T3 checkpoint name are hardcoded in the package
+      · `from_local(cls, ckpt_dir, device)` — NO `t3_model` keyword
+      · `from_pretrained(cls, device)` — NO `repo_id`, NO `t3_model`; it reads
+        HF_TOKEN from the environment itself before calling from_local
       · `generate()` returns a (1, N) torch tensor, `model.sr == S3GEN_SR`
-      · `__init__` builds `perth.PerthImplicitWatermarker()`, and the module
+        (24000), and "hi" is already one of its 23 languages
+      · `__init__` builds `perth.PerthImplicitWatermarker()` and the module
         does a top-level `import perth` — so `resemble-perth` is mandatory
+
+    The call goes through `_call_with_supported_kwargs` so that a build which
+    *does* add `t3_model` (unreleased master) is used while 0.1.7 keeps
+    working instead of dying on an unknown keyword.
 
     Any failure raises TerminalEngineError with the full diagnosis instead of
     silently falling back to a different voice.
@@ -3418,6 +3495,12 @@ def _load_chatterbox(log: Log):
             raise TerminalEngineError(engine_error_report(
                 "Chatterbox", attempts, detail=traceback.format_exc(),
                 fixes=_CHATTERBOX_FIX)) from e2
+        # The install fixed it, so the first error was a missing-package blip
+        # and not the real fault. Demote it — leaving "No module named
+        # 'chatterbox'" in the report sends people chasing a module that is
+        # now perfectly importable.
+        attempts[:] = ["[i] chatterbox was missing and was installed on the "
+                       "fly; the import now succeeds."]
 
     import torch
 
@@ -3428,10 +3511,17 @@ def _load_chatterbox(log: Log):
     t3_model = str(TTS_ENGINES["chatterbox"].get("t3_model") or "")
     try:
         ckpt_dir = _chatterbox_ckpt_dir(log, t3_model)
-        model = ChatterboxMultilingualTTS.from_local(
-            ckpt_dir, device, t3_model=(t3_model or None))
+        loader = getattr(ChatterboxMultilingualTTS, "from_local", None)
+        if callable(loader):
+            args = (ckpt_dir, device)
+        else:                          # a future build without from_local
+            loader = ChatterboxMultilingualTTS.from_pretrained
+            args = (device,)
+            attempts.append("[i] from_local absent — used from_pretrained")
+        model = _call_with_supported_kwargs(
+            loader, *args, t3_model=(t3_model or None))
     except Exception as e:
-        attempts.append(f"[from_local] {type(e).__name__}: {str(e)[:300]}")
+        attempts.append(f"[load] {type(e).__name__}: {str(e)[:300]}")
         raise TerminalEngineError(engine_error_report(
             "Chatterbox", attempts, detail=traceback.format_exc(),
             fixes=_CHATTERBOX_FIX)) from e
