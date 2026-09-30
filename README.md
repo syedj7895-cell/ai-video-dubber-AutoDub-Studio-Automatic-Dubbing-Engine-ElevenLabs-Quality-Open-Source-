@@ -18,7 +18,7 @@ zero-shot emotional TTS.
 | 4 | Emotion detection (7 emotions) | **SenseVoice-Small** (FunASR) | ✅ Phase 3 |
 | 5 | SRT mapping & merging | **pysrt** | ✅ Phase 3 |
 | 6 | Speaker text splitting (TTS-safe) | custom algorithmic engine | ✅ Phase 4 |
-| 7 | Multilingual emotional TTS | **CosyVoice 2.0 / 3.0 · Chatterbox · Fish S2-Pro · Edge-TTS** (5-way selector) | ✅ Phase 4 |
+| 7 | Multilingual emotional TTS | **CosyVoice 2.0 / 3.0 · Chatterbox · Fish S2-Pro · Kokoro-82M · Edge-TTS** (6-way selector) | ✅ Phase 4 |
 | 8 | Master mixdown + ducking + remux | **numpy / FFmpeg** | ✅ Phase 5 |
 
 ---
@@ -111,7 +111,7 @@ clone prompts appear in Tab 2.
 
 ---
 
-## 🎙 Pluggable TTS engines (5-way selector · Tab 1)
+## 🎙 Pluggable TTS engines (6-way selector · Tab 1)
 
 Pick the synthesizer at the very top of **Tab 1**. Every engine shares the same
 per-speaker clone prompts and the same silent-master timeline, so swapping an
@@ -120,25 +120,74 @@ engine only changes *who* speaks — never *when*.
 | Engine | Params | VRAM | Zero-shot clone | Fallback |
 |---|---|---|---|---|
 | **CosyVoice 2.0** *(default)* | 0.5 B | ~2 GB | ✅ | Edge-TTS |
-| **CosyVoice 3.0** | 0.5 B | ~2 GB | ✅ | Edge-TTS |
-| **Chatterbox** (Resemble AI) | 0.5 B | ~2 GB | ✅ | Edge-TTS |
-| **Fish Audio S2-Pro** | — | 4–12 GB | ✅ | Edge-TTS |
-| **Edge-TTS** *(lightweight)* | cloud | 0 | ❌ | — terminal — |
+| **CosyVoice 3.0** | 0.5 B | ~2 GB | ✅ | — terminal — |
+| **Chatterbox** (Resemble AI) | 0.5 B | ~2 GB | ✅ | — terminal — |
+| **Fish Audio S2-Pro** | — | 4–12 GB | ✅ | — terminal — |
+| **Kokoro-82M** *(lightest)* | 82 M | ~1 GB | ❌ | — terminal — |
+| **Edge-TTS** *(cloud)* | cloud | 0 | ❌ | — terminal — |
 
-**Automatic fallback.** Every non-Edge engine degrades to **Edge-TTS** when it
+**One automatic fallback.** **CosyVoice 2.0** degrades to **Edge-TTS** when it
 fails to load (missing package, OOM, absent weights) *or* after **3 consecutive
-line failures** mid-render. Edge-TTS is the **terminal node** — if Edge itself
-fails, the error is surfaced instead of silently substituting a different voice.
-Changing the engine in Tab 1 invalidates the Step 7 cache and re-renders
-automatically.
+line failures** mid-render. Every other engine is **terminal**: it must either
+deliver the real dubbed mix or abort with a detailed report. Nothing is ever
+silently substituted, because a quiet voice swap hides the bug you actually
+need to fix. Changing the engine in Tab 1 invalidates the Step 7 cache and
+re-renders automatically.
 
-**Distinct voice per speaker.** Edge-TTS cannot clone, so voices are cast per
-speaker instead — deterministically, in name order, matched to the diarized
-gender. Microsoft ships only **two** true Hindi neural voices, so the pool is
-tiered by phonetic fidelity (`hi-IN` → `mr-IN`/`ne-NP`, which are written in
-Devanagari and read Hindi natively → other Indic locales, flagged in the console
-because they *will* mispronounce Devanagari). That gives **15 female + 15 male**
-verified voices, of which 3 per gender are Devanagari-faithful.
+**Terminal failures are loud.** When a terminal engine dies, Step 7 raises with:
+
+- one line per cause, in chronological order (`[import]`, `[from_local]`,
+  `[row 12 · SPEAKER_00]`, …)
+- a fingerprint of what is actually installed (`python`, `torch`, `numpy`,
+  `gradio`, `librosa`, `transformers`, CUDA + free VRAM)
+- a copy-pasteable fix, where one is known
+- the **full traceback** in `outputs/engine_error.log`
+
+Step 7 also refuses to write all-zero master tracks: if no row produced audio,
+the render aborts *before* Step 8, so you can never end up with a "successful"
+final mix that contains no speech at all.
+
+**Distinct voice per speaker.** Engines that cannot clone (Edge-TTS, Kokoro)
+have voices cast per speaker instead — deterministically, matched to the
+**auto-detected** gender (see below). Two pools are used:
+
+- **Edge** — Microsoft ships only **two** true Hindi neural voices, so the pool
+  is tiered by phonetic fidelity (`hi-IN` → `mr-IN`/`ne-NP`, written in
+  Devanagari and read Hindi natively → other Indic locales, flagged in the
+  console because they *will* mispronounce Devanagari). That gives **15 female
+  + 15 male** verified voices, of which 3 per gender are Devanagari-faithful.
+- **Kokoro** — the **4** shipped Hindi voices (`hf_alpha`, `hf_beta`, `hm_omega`,
+  `hm_psi`). A cast larger than two per gender necessarily shares voices, and
+  that is reported rather than hidden.
+
+**Automatic gender detection (no more "everyone sounds female").** Pyannote
+reports *how many* voices there are, never *which is which* — it emits no gender
+field at all. Step 3 therefore profiles each speaker from their own mined clone
+prompt: median **F0** via pYIN, with the well-established 150 Hz / 175 Hz
+male-female split. A speaker in the ambiguous 150–175 Hz band needs a decisive
+long-term spectral centroid, otherwise the gender is left **undetermined** and
+their voice **rotates** through a gender-interleaved pool instead of defaulting
+to female. Your Tab 2 override always wins over the estimate.
+
+> Why pYIN and not plain YIN: plain YIN has no way to say "there is no pitch
+> here". Measured on synthetic input it labelled **pure silence** as *female,
+> 400 Hz* and **white noise** as *male, 73 Hz* — both at full confidence. pYIN's
+> voiced/unvoiced flag rejects every non-voice input, and both regressions are
+> now locked down in `tools/selftest.py`.
+
+**Kokoro voice blending.** Kokoro has no per-voice dictionary —
+`KPipeline.load_voice(name)` is the accessor and it returns a tensor, so a blend
+is a weighted average of two voice tensors (the mechanism Kokoro's own docs
+showcase via `voice=<tensor>`). The weight is clamped to **0.30–0.70**: outside
+that range the mix is just a worse copy of one voice. A partner of the *other*
+gender is refused, so a blend can never de-gender a speaker. Set it with
+`set_kokoro_blend(partner, weight)`.
+
+**Edge prosody.** Edge cannot clone, so `pitch` (Hz), `rate` and `volume`
+(percent) are its only expressive controls — persisted via
+`set_engine_prosody()` and applied to every line. Pitch support is probed at
+runtime, since it only exists in edge-tts ≥ 6.1, and is skipped rather than
+crashing on older builds.
 
 **Cross-lingual guard.** Clone prompts are recorded in the *source* language but
 we dub *into Hindi*, so Chatterbox is driven with `cfg_weight=0.0` to stop the
@@ -146,13 +195,13 @@ reference clip's accent bleeding into the Hindi output.
 
 **Emotion mapping.** SenseVoice's 7 emotions drive each engine natively:
 CosyVoice takes a separate `instruct` string, Chatterbox maps to its
-`exaggeration` scalar (0–2), Fish embeds `[tag]` inline, and Edge has no
+`exaggeration` scalar (0–2), Fish embeds `[tag]` inline, and Edge/Kokoro have no
 emotion control.
 
 > ⚠️ **Licence & watermark notice** — Chatterbox stamps a Resemble **PerTh**
 > neural watermark into every clip it generates. Fish Audio S2-Pro output falls
 > under the **Fish Audio Research License (non-commercial)**. Edge-TTS audio is
-> synthesised remotely by Microsoft.
+> synthesised remotely by Microsoft. Kokoro-82M weights are Apache-2.0.
 
 Validate the heaviest engine before committing to it:
 

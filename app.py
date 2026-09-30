@@ -476,8 +476,22 @@ def _run_rendering(diagnostic):
 
 def _spk_overview_rows():
     return [[pipeline.display_name(r["speaker"]), r["gender"] or "?",
+             (f"{r['f0_hz']:.0f} Hz" if r.get("f0_hz") else "—"),
+             r.get("gender_source", "—"),
              r["lines"], r["first"], r["last"], f"{r['total_s']}s"]
             for r in pipeline.speaker_overview()]
+
+
+def _spk_prefill(speaker):
+    """Fill the editor when a speaker is picked — so Save = confirm, not retype."""
+    if not speaker:
+        return "", ""
+    row = next((r for r in pipeline.speaker_overview()
+                if r["speaker"] == speaker), None)
+    if row is None:
+        return "", ""
+    return (row.get("name") or "",
+            row.get("gender_override") or row.get("auto_gender") or "")
 
 
 def _spk_ids():
@@ -498,11 +512,41 @@ def _save_profile(speaker, name, gender):
 def _fix_line(row_no, speaker):
     if not row_no or not speaker:
         return (_script_rows(), _chip("err", "Pick a row # and a speaker"))
+
     ok = pipeline.set_row_speaker(int(row_no), speaker)
     return (_script_rows(),
             _chip("ok" if ok else "err",
                   f"Row {row_no} -> {speaker}" if ok else
                   f"Row {row_no} not found"))
+
+
+def _preview_voice_app(engine_id, speaker, voice, pitch, rate, volume,
+                       speed, partner, weight):
+    """Synthesize one audition line and return it as a playable clip."""
+    try:
+        path, msg = pipeline.preview_voice(
+            engine_id=engine_id or "", speaker=speaker or "",
+            voice=voice or "", pitch=int(pitch or 0), rate=int(rate or 0),
+            volume=int(volume or 0), speed=float(speed or 1.0),
+            blend_partner=partner or "", blend_weight=float(weight or 0.5))
+    except Exception as e:  # never let a preview crash the app
+        return None, _chip("err", f"Preview failed ({type(e).__name__}: {e})")
+    return (path, _chip("ok", msg)) if path else (None, _chip("err", msg))
+
+
+def _save_voice_settings(pitch, rate, volume, speed, partner, weight):
+    """Persist Edge prosody + Kokoro speed/blend; report exactly what is stored."""
+    prosody = pipeline.set_engine_prosody(pitch=int(pitch or 0),
+                                          rate=int(rate or 0),
+                                          volume=int(volume or 0))
+    spd = pipeline.set_kokoro_speed(float(speed or 1.0))
+    blend = pipeline.set_kokoro_blend(partner or "", float(weight or 0.5))
+    parts = [f"Edge pitch {prosody['pitch']:+d} Hz, rate {prosody['rate']:+d}%, "
+             f"volume {prosody['volume']:+d}%",
+             f"Kokoro speed ×{spd:.2f}"]
+    if blend.get("partner"):
+        parts.append(f"blend {blend['partner']} @ {float(blend['weight']):.2f}")
+    return _chip("ok", "Saved · " + " · ".join(parts))
 
 
 
@@ -561,6 +605,7 @@ def _refresh_speakers():
     return (gr.DataFrame(value=_spk_overview_rows()),
             gr.Dropdown(choices=ids, value=v),
             gr.Dropdown(choices=row_nos, value=r0),
+            gr.Dropdown(choices=ids, value=v),
             gr.Dropdown(choices=ids, value=v))
 
 
@@ -600,6 +645,11 @@ def _make_theme() -> gr.themes.Soft:
 
 
 def build_ui() -> gr.Blocks:
+    # Persisted voice/prosody settings → slider defaults (read once per build).
+    _prosody = pipeline.get_engine_prosody()
+    _kokoro_speed = pipeline.get_kokoro_speed()
+    _kokoro_blend = pipeline.get_kokoro_blend()
+
     # Gradio ≥ 6 wants theme/css/head on launch(); ≤ 5 takes them here.
     block_kwargs = {} if _IS_G6 else dict(theme=_make_theme(), css=CSS, head=HEAD)
     with gr.Blocks(title="AutoDub Studio · Automatic Dubbing Engine",
@@ -619,8 +669,10 @@ def build_ui() -> gr.Blocks:
                             value=pipeline.get_tts_engine(),
                             label="Engine",
                             info="CosyVoice 2.0 is the default. Every engine casts "
-                                 "a DISTINCT Hindi voice per speaker; all non-Edge "
-                                 "engines fall back to Edge-TTS automatically.",
+                                 "a DISTINCT Hindi voice per speaker. CosyVoice 2 "
+                                 "falls back to Edge-TTS on failure; the other "
+                                 "five are TERMINAL and report a detailed error "
+                                 "instead of silently swapping voices.",
                             interactive=True)
                         tts_engine_note = gr.HTML(
                             _chip("ok", "Active: " + pipeline.TTS_ENGINES[
@@ -756,8 +808,8 @@ def build_ui() -> gr.Blocks:
                             "and pick its gender - saves instantly and applies "
                             "everywhere.")
                 spk_table = gr.DataFrame(
-                    headers=["Speaker", "Gender", "Lines", "First", "Last",
-                             "Total"],
+                    headers=["Speaker", "Gender", "Pitch", "Detected from",
+                             "Lines", "First", "Last", "Total"],
                     interactive=False, elem_classes=["glass"])
                 with gr.Row():
                     spk_pick = gr.Dropdown(label="Speaker",
@@ -772,6 +824,61 @@ def build_ui() -> gr.Blocks:
                                              allow_custom_value=False)
                     spk_save_btn = gr.Button("Save", variant="primary")
                 spk_save_msg = gr.HTML("")
+                gr.Markdown("### 🎚 Voice audition & prosody")
+                gr.Markdown("Gender is **auto-detected** per speaker from their "
+                            "pitch (Step 3) — the table above shows the measured "
+                            "F0 and where it came from, and your override always "
+                            "wins. Use **Preview** to *hear* a voice / pitch / "
+                            "blend choice before committing to a full render.")
+                with gr.Row():
+                    voz_speaker = gr.Dropdown(label="Speaker", interactive=True,
+                                              allow_custom_value=False)
+                    voz_voice = gr.Textbox(
+                        label="Voice (blank = auto-cast for that speaker)",
+                        placeholder="hi-IN-MadhurNeural · hm_omega",
+                        interactive=True)
+                    voz_engine = gr.Dropdown(
+                        choices=list(pipeline.TTS_ENGINES.keys()),
+                        value=pipeline.get_tts_engine(),
+                        label="Engine to audition", interactive=True,
+                        allow_custom_value=False)
+                with gr.Row():
+                    with gr.Column(elem_classes=["glass", "pad"]):
+                        gr.Markdown("**Edge-TTS prosody** · pitch needs "
+                                    "edge-tts ≥ 6.1")
+                        voz_pitch = gr.Slider(minimum=-100, maximum=100,
+                                              value=int(_prosody.get("pitch", 0)),
+                                              step=1, label="Pitch (Hz)")
+                        voz_rate = gr.Slider(minimum=-50, maximum=100,
+                                             value=int(_prosody.get("rate", 0)),
+                                             step=1, label="Rate (%)")
+                        voz_volume = gr.Slider(minimum=-100, maximum=100,
+                                               value=int(_prosody.get("volume", 0)),
+                                               step=1, label="Volume (%)")
+                    with gr.Column(elem_classes=["glass", "pad"]):
+                        gr.Markdown("**Kokoro speed & blending** · same-gender "
+                                    "partners only, weight clamped 0.30–0.70")
+                        voz_speed = gr.Slider(minimum=0.5, maximum=1.5,
+                                              value=float(_kokoro_speed),
+                                              step=0.05, label="Speed ×")
+                        voz_partner = gr.Dropdown(
+                            choices=["", "hf_alpha", "hf_beta", "hm_omega",
+                                     "hm_psi"],
+                            value=str(_kokoro_blend.get("partner", "") or ""),
+                            label="Blend partner (empty = no blend)",
+                            interactive=True, allow_custom_value=False)
+                        voz_weight = gr.Slider(
+                            minimum=0.30, maximum=0.70,
+                            value=float(_kokoro_blend.get("weight", 0.5)),
+                            step=0.05, label="Blend weight")
+                with gr.Row():
+                    voz_preview_btn = gr.Button("🔊 Preview voice",
+                                                variant="primary")
+                    voz_save_btn = gr.Button("💾 Save voice settings",
+                                             variant="secondary")
+                voz_preview = gr.Audio(label="🎧 Audition", interactive=False,
+                                       elem_classes=["glass", "pad"])
+                voz_msg = gr.HTML("")
                 gr.Markdown("### ⚙️ Fix a line's speaker")
                 gr.Markdown("Diarization got a line wrong? Pick its row # and "
                             "the correct speaker.")
@@ -783,7 +890,6 @@ def build_ui() -> gr.Blocks:
                                           allow_custom_value=False)
                     fix_btn = gr.Button("Apply", variant="primary")
                 fix_msg = gr.HTML("")
-                gr.Markdown("### 📄 Consolidated dubbing script")
                 gr.Markdown("### 🧾 Consolidated dubbing script")
                 script_df = gr.DataFrame(
                     headers=["#", "Start", "End", "Speaker", "Emotion",
@@ -872,7 +978,7 @@ def build_ui() -> gr.Blocks:
         ).then(
             fn=_refresh_speakers,
             inputs=None,
-            outputs=[spk_table, spk_pick, fix_row, fix_spk],
+            outputs=[spk_table, spk_pick, fix_row, fix_spk, voz_speaker],
         )
         auto_btn.click(
             fn=_run_full_auto,
@@ -898,6 +1004,25 @@ def build_ui() -> gr.Blocks:
             fn=_save_profile,
             inputs=[spk_pick, spk_name, spk_gender],
             outputs=[spk_table, spk_save_msg],
+        )
+        # pick a speaker → pre-fill the editor (Save becomes "confirm")
+        spk_pick.change(
+            fn=_spk_prefill,
+            inputs=[spk_pick],
+            outputs=[spk_name, spk_gender],
+        )
+        # voice audition + persisted prosody / blend settings
+        voz_preview_btn.click(
+            fn=_preview_voice_app,
+            inputs=[voz_engine, spk_pick, voz_voice, voz_pitch, voz_rate,
+                    voz_volume, voz_speed, voz_partner, voz_weight],
+            outputs=[voz_preview, voz_msg],
+        )
+        voz_save_btn.click(
+            fn=_save_voice_settings,
+            inputs=[voz_pitch, voz_rate, voz_volume, voz_speed, voz_partner,
+                    voz_weight],
+            outputs=[voz_msg],
         )
         fix_btn.click(
             fn=_fix_line,

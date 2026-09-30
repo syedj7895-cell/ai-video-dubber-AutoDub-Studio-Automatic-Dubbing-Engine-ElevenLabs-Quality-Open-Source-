@@ -32,5 +32,17 @@ ffmpeg-python==0.2.0
 tqdm
 librosa>=0.10.0              # Step 7 · non-pitch-shifting time-stretch (overlap protection)
 
+# ── TTS engines · installed LAZILY at load time, on purpose ────────
+# chatterbox-tts and kokoro are deliberately NOT listed here:
+#   · chatterbox-tts pins numpy<2, torch==2.6.0, torchaudio==2.6.0,
+#     transformers==5.2.0 and gradio==6.8.0. A plain `pip install` would
+#     downgrade NumPy/torch/Gradio out from under this pipeline, so it is
+#     fetched with `--no-deps` plus only its true runtime deps.
+#   · kokoro needs the espeak-ng SYSTEM package (apt-get install espeak-ng)
+#     for Hindi G2P, which pip cannot express.
+# Both are installed on demand by pipeline._load_chatterbox / _load_kokoro,
+# and both are TERMINAL engines: if they cannot start you get a detailed
+# report in outputs/engine_error.log rather than a silent voice swap.
+
 # ── dev / build helpers ─────────────────────────────────────────────
 setuptools>=68.0
