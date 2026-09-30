@@ -248,8 +248,13 @@ Step 1 extract ──▶ Step 2 Demucs ──🧹──▶ Step 3 Pyannote ─�
 ```
 ├── app.py                 # Phase 1 · glassmorphism Gradio UI (3 tabs)
 ├── pipeline.py            # Phases 2–3 · steps 1–5 + clear_gpu_cache OOM defense
+├── build_secure.py        # Phase 6 · Cython obfuscation builder (compile + scrub)
+├── Colab_Runner.ipynb     # Phase 8 · one-click Colab launcher
 ├── requirements.txt
 ├── assets/icons/          # premium gradient SVG button icons
+├── tools/
+│   ├── selftest.py        # 128 pure-Python checks · python tools/selftest.py
+│   └── bridge.py          # Phase 7 · desktop tunnel poller
 ├── uploads/               # runtime · user uploads
 └── outputs/               # runtime artifacts
     ├── step1_audio.wav          # extracted master audio
@@ -259,6 +264,11 @@ Step 1 extract ──▶ Step 2 Demucs ──🧹──▶ Step 3 Pyannote ─�
     ├── emotion_log.txt          # "[00:50.000] Speaker1 [calm]"
     ├── emotion_grid.json        # machine emotion grid
     ├── final_script.json        # consolidated dubbing script ★
+    ├── voice_preview.wav        # Tab 2 ▸ 🔊 Preview audition clip
+    ├── track_speaker*.wav       # one silent-grid track per speaker (step 7)
+    ├── tts_report.json          # step 7 verdict (engine, rows, cache key)
+    ├── engine_error.log         # full traceback for any terminal-engine abort
+    ├── final_mix.wav            # master mix (step 8)
     └── state.json               # pipeline stage cache
 ```
 
@@ -288,6 +298,34 @@ python build_secure.py                 # → pipeline.*.so + pipeline.py deleted
 `app.py` keeps working unchanged — the compiled binary shadows the source
 module. (Use `--keep-source` in development.)
 
+**The scrub is guarded, not blind.** `pipeline.py` is deleted *only after* a
+child process has imported the compiled binary **with the source hidden** and
+confirmed the public API (13 names, incl. `step7_synthesize`, `resolve_engine`,
+`auto_kokoro_blends`) is present. If that import fails — wrong architecture,
+missing symbol, broken build — the source is kept and the run exits non-zero.
+The child restores the source in a `finally` and the parent restores it again,
+so even a killed verifier leaves a working tree. `--no-verify` can never scrub:
+you cannot opt out of the one check that makes deletion safe.
+
+| Flag | Effect |
+|---|---|
+| *(none)* | compile → verify → scrub |
+| `--keep-source` | compile → verify, keep `pipeline.py` (development) |
+| `--dry-run` | translate to C only — no compiler, nothing written or deleted |
+| `--force` | rebuild even if an extension already exists |
+| `--no-verify` | skip the import check; **scrubbing is refused** |
+| `--target NAME` | compile a different module (default `pipeline`) |
+
+Verified here: Cython translates `pipeline.py` cleanly (7.4 MB of C, no
+warnings). The actual C compile needs a compiler — Colab ships `gcc`; a bare
+Windows box does not, and `build_secure.py` detects that and exits **before**
+touching anything rather than failing halfway.
+
+> After obfuscation, `tools/selftest.py`'s two *source-scanning* checks are
+> reported as **skipped** instead of passing vacuously: compiled code has no
+> retrievable source for `inspect.getsource`.
+
+
 ## 🖥 Desktop bridge tunnels (Phase 7)
 
 1. Paste your Colab `*.gradio.live` URL into **`tunnel.txt`**
@@ -307,7 +345,7 @@ default browser straight into the hosted UI — no console windows, no clutter.
 - ✅ **Phase 5** — master mixdown, lookahead ducking, video remux (step 8)
 - ✅ **Phase 6** — Cython obfuscation builder (`build_secure.py`)
 - ✅ **Phase 7** — Windows/macOS desktop bridge tunnels
-- 🔜 **Phase 8** — ready-made Colab `.ipynb` one-click launcher
+- ✅ **Phase 8** — ready-made Colab `.ipynb` one-click launcher
 
 ## ⚠️ Notes
 

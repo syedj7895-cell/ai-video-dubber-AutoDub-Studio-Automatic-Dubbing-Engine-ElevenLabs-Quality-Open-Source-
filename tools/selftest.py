@@ -22,6 +22,12 @@ def check(name: str, cond: bool) -> None:
     print(f"{'✅' if cond else '❌'} {name}")
 
 
+def skip(name: str, why: str) -> None:
+    """Report a check that cannot run in this build — deliberately NOT counted
+    as a pass, so an obfuscated build can never inflate the score."""
+    print(f"⏭  {name}  ({why})")
+
+
 # ── 1 · timestamp formatting (spec log format) ──────────────────────────────
 check("fmt_ts(50.0) == '00:50.000'", pipeline.fmt_ts(50.0) == "00:50.000")
 check("fmt_ts rolls hours (01:02:03.500)", pipeline.fmt_ts(3723.5) == "01:02:03.500")
@@ -382,18 +388,35 @@ check("_interleave_voices alternates genders",
       pipeline._interleave_voices({"Female": ["F1", "F2"], "Male": ["M1"]})
       == ["F1", "M1", "F2"])
 
-def _code_only(fn) -> str:
-    """Source of `fn` with comments stripped — so comments can't fail the test."""
-    return "\n".join(ln.split("#")[0] for ln in
-                     inspect.getsource(fn).splitlines())
+def _code_only(fn) -> "str | None":
+    """Source of `fn` with comments stripped, or None when there is no source.
+
+    Phase 6 (`build_secure.py`) compiles pipeline.py into a native extension,
+    and compiled code has no retrievable source — `inspect.getsource` raises.
+    Returning None lets the source-scanning checks SKIP instead of either
+    crashing or passing vacuously against an empty string.
+    """
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):          # built-in / extension module
+        return None
+    return "\n".join(ln.split("#")[0] for ln in src.splitlines())
 
 
-_edge_src = (_code_only(pipeline.allocate_speaker_voices)
-             + _code_only(pipeline._edge_speak))
-check("no hardcoded female voice left in the Edge casting path",
-      "SwaraNeural" not in _edge_src)
-check("_edge_speak refuses an empty voice instead of defaulting",
-      "raise RuntimeError" in _code_only(pipeline._edge_speak))
+_edge_src_parts = [_code_only(pipeline.allocate_speaker_voices),
+                   _code_only(pipeline._edge_speak)]
+_edge_speak_src = _edge_src_parts[1]
+if any(p is None for p in _edge_src_parts):
+    _why = "pipeline is a compiled extension — no source to scan"
+    skip("no hardcoded female voice left in the Edge casting path", _why)
+    skip("_edge_speak refuses an empty voice instead of defaulting", _why)
+else:
+    _edge_src = "".join(_edge_src_parts)
+    check("no hardcoded female voice left in the Edge casting path",
+          "SwaraNeural" not in _edge_src)
+    check("_edge_speak refuses an empty voice instead of defaulting",
+          "raise RuntimeError" in _edge_speak_src)
+
 
 pipeline._edge_voice_list = _orig_pool
 pipeline.load_speaker_profiles = _orig_profs
@@ -697,6 +720,75 @@ finally:
     pipeline._load_edge, pipeline._edge_speak = _orig_load_edge, _orig_edge_speak
     pipeline._load_kokoro, pipeline._kokoro_speak = _orig_load_koko, _orig_koko_speak
     pipeline.PREVIEW_WAV.unlink(missing_ok=True)
+
+# ── Phase 6 · build_secure.py (Cython obfuscation builder) ───────────────────
+import importlib.util as _ilu
+import tempfile as _tf
+
+
+def _raises(exc, fn) -> bool:
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _is_valid(src: str) -> bool:
+    try:
+        compile(src, "<embedded>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+_bs_spec = _ilu.spec_from_file_location(
+    "build_secure", Path(__file__).resolve().parents[1] / "build_secure.py")
+_bs = _ilu.module_from_spec(_bs_spec)
+_bs_spec.loader.exec_module(_bs)
+
+check("build_secure REQUIRED_API names all exist on pipeline",
+      all(hasattr(pipeline, n) for n in _bs.REQUIRED_API))
+check("build_secure's embedded verifier is syntactically valid Python",
+      _is_valid(_bs._VERIFY_SRC))
+check("verifier's marker survives embedding", _bs.MARKER in _bs._VERIFY_SRC)
+
+# The scrub safety contract: neither flag alone nor both may scrub unverified.
+check("--keep-source never scrubs", not _bs.can_scrub(True, False))
+check("--no-verify can NEVER scrub", not _bs.can_scrub(False, True))
+check("--keep-source + --no-verify never scrubs", not _bs.can_scrub(True, True))
+check("default flags are the only ones that allow scrubbing",
+      _bs.can_scrub(False, False))
+
+with _tf.TemporaryDirectory() as _td:
+    _t = Path(_td)
+    check("no extension present → _binary_of returns None",
+          _bs._binary_of(_t, "pipeline") is None)
+    (_t / "pipeline.cp310-win_amd64.pyd").write_bytes(b"MZ")
+    check("a planted extension is discovered",
+          _bs._binary_of(_t, "pipeline") is not None)
+    check("unrelated extensions are ignored",
+          _bs._binary_of(_t, "other") is None)
+
+    # The verifier hides the source then restores it; this is that restore.
+    _src = _t / "pipeline.py"
+    _bak = _t / f"pipeline.py{_bs.HIDDEN_SUFFIX}"
+    _src.write_text("X = 1\n", encoding="utf-8")
+    _src.replace(_bak)
+    check("hidden source starts out hidden", not _src.exists())
+    check("_ensure_restored puts the source back",
+          _bs._ensure_restored(_t, "pipeline") and _src.exists())
+    check("_ensure_restored leaves no backup behind", not _bak.exists())
+    check("_ensure_restored is a no-op when the source is present",
+          _bs._ensure_restored(_t, "pipeline") is False)
+
+    check("preflight refuses a missing target",
+          _raises(SystemExit, lambda: _bs.preflight(_t, "no_such_module", True)))
+    check("preflight accepts an existing target in dry-run mode",
+          _bs.preflight(_t, "pipeline", True) == _src)
+
 
 # ── cleanup self-test artifacts (leave a pristine tree) ────────────────────
 for p in (srt_path, tsrt, pipeline.DIARIZATION_JSON, pipeline.EMOTION_GRID_JSON,
