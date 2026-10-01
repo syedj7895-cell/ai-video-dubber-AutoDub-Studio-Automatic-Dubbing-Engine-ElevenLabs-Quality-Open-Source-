@@ -644,6 +644,53 @@ def _make_theme() -> gr.themes.Soft:
     )
 
 
+def _pretty_engine(eid: str) -> str:
+    """'CosyVoice 2.0  (default · offline)' → 'CosyVoice 2.0' for prose."""
+    return pipeline.TTS_ENGINES.get(eid, {}).get("label", eid).split("  ")[0].strip()
+
+
+def _engine_info() -> str:
+    """Tab 1 helper copy, computed from the engines THIS build publishes.
+
+    The original text hard-coded "CosyVoice 2.0 is the default … the other five
+    are TERMINAL", which stops being true the moment a launcher narrows the
+    registry (AutoDub Studio 2.0 publishes Chatterbox alone). Deriving it keeps
+    the sentence honest in both builds without maintaining two strings.
+    """
+    ids = list(pipeline.TTS_ENGINES)
+    act = pipeline.get_tts_engine()
+    soft = [e for e in ids if pipeline.engine_fallback(e)]
+    hard = [e for e in ids if not pipeline.engine_fallback(e)]
+    out = [f"{_pretty_engine(act)} is the engine in use.",
+           "Every engine casts a DISTINCT Hindi voice per speaker."]
+    if len(ids) == 1:
+        out.append(f"{_pretty_engine(act)} is TERMINAL — if it cannot load, the "
+                   "run stops with a detailed report instead of silently "
+                   "swapping in another voice.")
+    elif soft:
+        out.append(f"{_pretty_engine(soft[0])} falls back to Edge-TTS on failure; "
+                   f"the other {len(hard)} are TERMINAL and report a detailed "
+                   "error instead of silently swapping voices.")
+    elif hard:
+        out.append(f"All {len(hard)} are TERMINAL and report a detailed error "
+                   "instead of silently swapping voices.")
+    return " ".join(out)
+
+
+def _engine_licence() -> str:
+    """Licence/watermark notice — emitted only for engines actually published."""
+    bits = []
+    if "chatterbox" in pipeline.TTS_ENGINES:
+        bits.append("Chatterbox embeds a Resemble PerTh neural watermark in "
+                    "every clip it generates.")
+    if "fishs2" in pipeline.TTS_ENGINES:
+        bits.append("Fish Audio S2-Pro output is governed by the Fish Audio "
+                    "Research License (non-commercial use).")
+    if "edge" in pipeline.TTS_ENGINES:
+        bits.append("Edge-TTS audio is synthesised remotely by Microsoft.")
+    return ("⚠️ **Licence & watermark notice** — " + " ".join(bits)) if bits else ""
+
+
 def build_ui() -> gr.Blocks:
     # Persisted voice/prosody settings → slider defaults (read once per build).
     _prosody = pipeline.get_engine_prosody()
@@ -668,22 +715,14 @@ def build_ui() -> gr.Blocks:
                             choices=pipeline.engine_choices(),
                             value=pipeline.get_tts_engine(),
                             label="Engine",
-                            info="CosyVoice 2.0 is the default. Every engine casts "
-                                 "a DISTINCT Hindi voice per speaker. CosyVoice 2 "
-                                 "falls back to Edge-TTS on failure; the other "
-                                 "five are TERMINAL and report a detailed error "
-                                 "instead of silently swapping voices.",
+                            info=_engine_info(),
                             interactive=True)
                         tts_engine_note = gr.HTML(
                             _chip("ok", "Active: " + pipeline.TTS_ENGINES[
                                 pipeline.get_tts_engine()]["label"]))
-                        gr.Markdown(
-                            "⚠️ **Licence & watermark notice** — Chatterbox "
-                            "embeds a Resemble PerTh neural watermark in every "
-                            "clip it generates. Fish Audio S2-Pro output is "
-                            "governed by the Fish Audio Research License "
-                            "(non-commercial use). Edge-TTS audio is "
-                            "synthesised remotely by Microsoft.")
+                        _lic = _engine_licence()
+                        if _lic:
+                            gr.Markdown(_lic)
                         gr.Markdown("---")
                         gr.Markdown("### 📥 Source material")
                         media_in = gr.File(label="🎬 Audio / Video master",

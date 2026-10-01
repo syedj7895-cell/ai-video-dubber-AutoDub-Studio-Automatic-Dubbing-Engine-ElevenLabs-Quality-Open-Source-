@@ -134,6 +134,22 @@ silently substituted, because a quiet voice swap hides the bug you actually
 need to fix. Changing the engine in Tab 1 invalidates the Step 7 cache and
 re-renders automatically.
 
+**Narrowing the selector.** A launcher can publish a *subset* of this table by
+setting `AUTODUB_TTS_ENGINES` to a comma-separated list of engine ids before
+starting the app. The variable filters the registry itself, so the Tab 1 radio,
+the Tab 2 audition dropdown, the default engine and the fallback rules all follow
+from one rule instead of each re-implementing it:
+
+| Launcher | Engines published |
+|---|---|
+| `Colab_Runner.ipynb` | all six — variable never set |
+| `AutoDub Studio 2.0.ipynb` | **Chatterbox only** (`AUTODUB_TTS_ENGINES=chatterbox`) |
+
+Requesting an engine that was filtered out degrades to the active one rather
+than raising. A single-engine build's Tab 1 helper text and licence notice are
+*computed* from what is actually published, so they never advertise an engine the
+build no longer ships.
+
 **Terminal failures are loud.** When a terminal engine dies, Step 7 raises with:
 
 - one line per cause, in chronological order (`[import]`, `[from_local]`,
@@ -261,11 +277,12 @@ Step 1 extract ──▶ Step 2 Demucs ──🧹──▶ Step 3 Pyannote ─�
 ├── app.py                 # Phase 1 · glassmorphism Gradio UI (3 tabs)
 ├── pipeline.py            # Phases 2–3 · steps 1–5 + clear_gpu_cache OOM defense
 ├── build_secure.py        # Phase 6 · Cython obfuscation builder (compile + scrub)
-├── Colab_Runner.ipynb     # Phase 8 · one-click Colab launcher
+├── Colab_Runner.ipynb     # Phase 8 · one-click Colab launcher (all 6 engines)
+├── AutoDub Studio 2.0.ipynb  # Chatterbox-only launcher (AUTODUB_TTS_ENGINES)
 ├── requirements.txt
 ├── assets/icons/          # premium gradient SVG button icons
 ├── tools/
-│   ├── selftest.py        # 128 pure-Python checks · python tools/selftest.py
+│   ├── selftest.py        # 156 pure-Python checks · python tools/selftest.py
 │   └── bridge.py          # Phase 7 · desktop tunnel poller
 ├── uploads/               # runtime · user uploads
 └── outputs/               # runtime artifacts

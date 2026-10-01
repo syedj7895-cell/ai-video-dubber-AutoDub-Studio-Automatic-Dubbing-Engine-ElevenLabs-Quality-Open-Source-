@@ -958,6 +958,79 @@ check("speak() returns mono float32 audio",
       _y.shape == (3,) and _y.dtype == _np.float32)
 
 
+# ── 13 · engine allow-list — AutoDub Studio 2.0 publishes Chatterbox only ───
+# AUTODUB_TTS_ENGINES narrows the registry at IMPORT time, so the already
+# imported `pipeline` above can never observe it: the real mechanism has to be
+# probed in a fresh interpreter, which is also exactly how the notebook's launch
+# cell reaches `python app.py`.
+import os as _os
+import subprocess as _sp
+
+_ROOT = str(Path(__file__).resolve().parents[1])
+_PROBE = (
+    "import json, sys\n"
+    "sys.path.insert(0, %r)\n"
+    "import pipeline as p\n"
+    "import app\n"
+    "print(json.dumps({\n"
+    "  'engines': list(p.TTS_ENGINES),\n"
+    "  'default': p.DEFAULT_TTS_ENGINE,\n"
+    "  'active': p.get_tts_engine(),\n"
+    "  'choices': [e for _, e in p.engine_choices()],\n"
+    "  'fb': p.engine_fallback('chatterbox'),\n"
+    "  'resolve': p.resolve_engine('cosyvoice2')['id'],\n"
+    "  'set': p.set_tts_engine('cosyvoice2'),\n"
+    "  'info': app._engine_info(),\n"
+    "  'lic': app._engine_licence(),\n"
+    "}))\n" % _ROOT)
+
+
+def _probe(value):
+    """Run the probe above with AUTODUB_TTS_ENGINES forced to `value`."""
+    env = dict(_os.environ)
+    env["AUTODUB_TTS_ENGINES"] = value
+    proc = _sp.run([sys.executable, "-c", _PROBE], capture_output=True,
+                   text=True, env=env, cwd=_ROOT, timeout=180)
+    if proc.returncode != 0:
+        return None, proc.stderr[-1200:]
+    return json.loads(proc.stdout.strip().splitlines()[-1]), ""
+
+
+_d, _err = _probe("chatterbox")
+if _d is None:
+    check("allow-list probe runs in a fresh interpreter", False)
+    print(_err)
+else:
+    check("allow-list publishes chatterbox only",
+          _d["engines"] == ["chatterbox"])
+    check("…and makes it both the default and the active engine",
+          _d["default"] == _d["active"] == "chatterbox")
+    check("Tab 1's selector offers exactly one engine",
+          _d["choices"] == ["chatterbox"])
+    check("chatterbox stays TERMINAL under the allow-list", _d["fb"] == "")
+    check("asking for a filtered-out engine degrades instead of raising",
+          _d["resolve"] == _d["set"] == "chatterbox")
+    check("Tab 1 copy names Chatterbox and no removed engine",
+          "Chatterbox" in _d["info"] and "CosyVoice" not in _d["info"])
+    check("licence notice covers only published engines",
+          "PerTh" in _d["lic"] and "Fish" not in _d["lic"]
+          and "Microsoft" not in _d["lic"])
+
+# An empty/unset value must publish the FULL registry — that is what keeps the
+# original Colab_Runner.ipynb (which never sets the variable) unchanged.
+_e, _err = _probe("")
+if _e is None:
+    check("no allow-list → full registry still loads", False)
+    print(_err)
+else:
+    check("unset allow-list keeps all six engines (original Colab_Runner)",
+          _e["engines"] == list(pipeline.TTS_ENGINES) and len(_e["engines"]) == 6)
+    check("…and the default is still cosyvoice2",
+          _e["default"] == "cosyvoice2")
+    check("Tab 1 copy falls back to the six-engine wording",
+          "CosyVoice" in _e["info"])
+
+
 # ── cleanup self-test artifacts (leave a pristine tree) ────────────────────
 for p in (srt_path, tsrt, pipeline.DIARIZATION_JSON, pipeline.EMOTION_GRID_JSON,
           pipeline.FINAL_SCRIPT_JSON, pipeline.STATE_JSON,

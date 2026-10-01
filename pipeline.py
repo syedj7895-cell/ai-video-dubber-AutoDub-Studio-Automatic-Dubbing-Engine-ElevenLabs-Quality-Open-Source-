@@ -2294,6 +2294,34 @@ TTS_ENGINES: Dict[str, dict] = {
     },
 }
 
+# ── Engine allow-list (launcher-controlled) ────────────────────────────────────
+# A launcher can publish a SUBSET of the registry without forking this file by
+# setting AUTODUB_TTS_ENGINES to a comma-separated list of engine ids:
+#
+#     os.environ["AUTODUB_TTS_ENGINES"] = "chatterbox"
+#
+# …which is exactly what the Chatterbox-only "AutoDub Studio 2.0" notebook does.
+# Unset, empty, or consisting only of unknown ids publishes the FULL registry,
+# so the original Colab_Runner.ipynb — which never sets it — behaves as before.
+#
+# The filter sits here, immediately after the dict literal and before any reader,
+# because EVERY consumer indexes TTS_ENGINES: engine_choices(),
+# get/set_tts_engine(), resolve_engine(), engine_fallback() and app.py's Tab 1
+# radio + Tab 2 audition dropdown all derive from this one object. Narrowing it
+# once keeps them consistent instead of each re-implementing the rule — and a
+# request for an engine that was filtered out degrades to the active one
+# (resolve_engine) rather than raising KeyError.
+_AUTODUB_ALLOW = [e.strip() for e in
+                  (os.environ.get("AUTODUB_TTS_ENGINES") or "").split(",")
+                  if e.strip() and e.strip() in TTS_ENGINES]
+if _AUTODUB_ALLOW:
+    _allowed = {eid: TTS_ENGINES[eid] for eid in _AUTODUB_ALLOW}
+    TTS_ENGINES.clear()          # mutate in place so earlier references stay
+    TTS_ENGINES.update(_allowed) # valid, while honouring the requested order
+    if DEFAULT_TTS_ENGINE not in TTS_ENGINES:
+        DEFAULT_TTS_ENGINE = next(iter(TTS_ENGINES))
+    print(f"[tts] engine allow-list → {', '.join(TTS_ENGINES)}")
+
 _TTS_ENGINE = DEFAULT_TTS_ENGINE
 
 
