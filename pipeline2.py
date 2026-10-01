@@ -1,6 +1,24 @@
-#   AUTOMATIC DUBBING ENGINE — pipeline.py
+#   AUTOMATIC DUBBING ENGINE — pipeline2.py · AutoDub Studio 2.0
 #   Core file-routing layer · sequential GPU execution · OOM defense
 #   Target runtime: Google Colab Free T4 (16 GB VRAM) — CPU-safe fallbacks
+#
+#   ╔═════════════════════════════════════════════════════════════════════════╗
+#   ║  DEDICATED COPY — AutoDub Studio 2.0 runs THIS file, never pipeline.py.  ║
+#   ╚═════════════════════════════════════════════════════════════════════════╝
+#
+#   It is a byte-for-byte duplicate of pipeline.py apart from this header and
+#   the two identity constants (PIPELINE_VARIANT, ENGINE_ALLOWLIST), so
+#       diff pipeline.py pipeline2.py
+#   shows exactly what makes 2.0 2.0 — and nothing else. Because the two are
+#   separate files, a fix made HERE does not reach the original build and a fix
+#   made to pipeline.py does not reach this one: port changes deliberately.
+#
+#   Selection: AutoDub Studio 2.0.ipynb sets AUTODUB_PIPELINE=pipeline2 before
+#   launching app.py, which then binds this module. Colab_Runner.ipynb never
+#   sets it and keeps driving pipeline.py.
+#
+#   Chatterbox-only: ENGINE_ALLOWLIST below bakes the registry down to
+#   Chatterbox, so this build needs no env var to stay single-engine.
 # ═══════════════════════════════════════════════════════════════════════════
 #
 #   EXECUTION MAP
@@ -2247,13 +2265,13 @@ def _cosyvoice_speak(model, text: str, instruct: str, prompt_speech,
 # independently without either file importing or referencing the other.
 # Running `diff pipeline.py pipeline2.py` therefore shows exactly what makes
 # 2.0 2.0 — nothing else.
-PIPELINE_VARIANT = "1.0"
+PIPELINE_VARIANT = "2.0"
 
 # Engines published when AUTODUB_TTS_ENGINES is unset. Wording kept accurate in
 # BOTH pipeline files — only the value itself differs between them:
 #   ()              → no baked filter: publish the full registry below
 #   ("chatterbox",) → baked narrow: AutoDub Studio 2.0 is Chatterbox-only
-ENGINE_ALLOWLIST: tuple = ()
+ENGINE_ALLOWLIST: tuple = ("chatterbox",)
 
 DEFAULT_TTS_ENGINE = "cosyvoice2"
 

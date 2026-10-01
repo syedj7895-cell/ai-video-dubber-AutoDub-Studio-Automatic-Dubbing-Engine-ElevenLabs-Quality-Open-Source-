@@ -20,14 +20,28 @@
 from __future__ import annotations
 
 import html
+import importlib
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
 import gradio as gr
 
-import pipeline
+# ── which pipeline module to drive ───────────────────────────────────────────
+# `pipeline.py` is the original six-engine build; `pipeline2.py` is the
+# DEDICATED copy that AutoDub Studio 2.0 launches. One env var picks between
+# them, so app.py never hard-codes a variant and neither pipeline file has to
+# reference the other — they can evolve independently.
+#   Colab_Runner.ipynb        → never sets it → pipeline
+#   AutoDub Studio 2.0.ipynb  → AUTODUB_PIPELINE=pipeline2
+_PIPELINE_NAME = (os.environ.get("AUTODUB_PIPELINE") or "pipeline").strip()
+if not _PIPELINE_NAME.isidentifier():
+    raise RuntimeError(
+        f"AUTODUB_PIPELINE must be a plain Python module name, got "
+        f"{_PIPELINE_NAME!r} — refusing to import it.")
+pipeline = importlib.import_module(_PIPELINE_NAME)
 
 # ── global stop signal for the auto-pilot ──────────────────────────────────
 # Set by the STOP button; checked by _run_full_auto between every stage.

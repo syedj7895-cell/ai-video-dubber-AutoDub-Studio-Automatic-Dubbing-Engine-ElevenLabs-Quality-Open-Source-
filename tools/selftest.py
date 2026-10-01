@@ -1031,6 +1031,108 @@ else:
           "CosyVoice" in _e["info"])
 
 
+# ── 14 · dedicated pipeline — AutoDub Studio 2.0 runs pipeline2.py ───────────
+# app.py binds whichever module AUTODUB_PIPELINE names, and that binding happens
+# at app import time, so it too can only be observed from OUTSIDE the process.
+import importlib as _il
+
+
+def _exec_body(path, drop=("PIPELINE_VARIANT =", "ENGINE_ALLOWLIST:")):
+    """Executable lines only (comments/blank stripped), minus the identity pair."""
+    out = []
+    for _l in Path(path).read_text(encoding="utf-8").splitlines():
+        _s = _l.strip()
+        if not _s or _s.startswith("#"):
+            continue
+        if _s.startswith(drop):
+            continue
+        out.append(_s)
+    return out
+
+
+check("pipeline.py identifies as the 1.0 build",
+      pipeline.PIPELINE_VARIANT == "1.0"
+      and pipeline.ENGINE_ALLOWLIST == ()
+      and len(pipeline.TTS_ENGINES) == 6)
+
+_p2 = _il.import_module("pipeline2")
+check("pipeline2.py imports and identifies as the 2.0 build",
+      _p2.PIPELINE_VARIANT == "2.0"
+      and _p2.ENGINE_ALLOWLIST == ("chatterbox",))
+check("pipeline2 is Chatterbox-only with NO env var set (baked, not inherited)",
+      list(_p2.TTS_ENGINES) == ["chatterbox"]
+      and _p2.DEFAULT_TTS_ENGINE == "chatterbox"
+      and _p2.engine_fallback("chatterbox") == "")
+check("pipeline2 exposes build_secure's whole public API",
+      all(hasattr(_p2, n) for n in _bs.REQUIRED_API))
+check("pipeline2 differs from pipeline ONLY in its identity constants",
+      _exec_body(pipeline.__file__) == _exec_body(_p2.__file__))
+check("…so the 2.0 variant is a real duplicate, not a divergent fork",
+      len(_exec_body(_p2.__file__)) > 1000)
+
+_SEL = (
+    "import json, os, sys\n"
+    "sys.path.insert(0, %r)\n"
+    "try:\n"
+    "    import app\n"
+    "    p = app.pipeline\n"
+    "    out = {'module': p.__name__, 'variant': p.PIPELINE_VARIANT,\n"
+    "           'engines': list(p.TTS_ENGINES),\n"
+    "           'missing_api': [n for n in %r if not hasattr(p, n)]}\n"
+    "except RuntimeError as e:\n"
+    "    out = {'error': str(e)}\n"
+    "print(json.dumps(out))\n"
+) % (_ROOT, tuple(_bs.REQUIRED_API))
+
+
+def _sel(**over):
+    """Import app in a fresh interpreter with these env vars, return its answer."""
+    env = dict(_os.environ)
+    for _k in ("AUTODUB_PIPELINE", "AUTODUB_TTS_ENGINES"):
+        env.pop(_k, None)
+    env.update({k: str(v) for k, v in over.items()})
+    proc = _sp.run([sys.executable, "-c", _SEL], capture_output=True,
+                   text=True, env=env, cwd=_ROOT, timeout=180)
+    if proc.returncode != 0:
+        return None, proc.stderr[-1200:]
+    return json.loads(proc.stdout.strip().splitlines()[-1]), ""
+
+
+_sel_d, _err = _sel(AUTODUB_PIPELINE="pipeline2")
+if _sel_d is None:
+    check("app binds pipeline2 when AUTODUB_PIPELINE=pipeline2", False)
+    print(_err)
+else:
+    check("app binds pipeline2 when AUTODUB_PIPELINE=pipeline2",
+          _sel_d.get("module") == "pipeline2"
+          and _sel_d.get("variant") == "2.0")
+    check("…so the 2.0 build's UI offers Chatterbox only",
+          _sel_d.get("engines") == ["chatterbox"])
+    check("…and pipeline2 carries every name app.py needs",
+          _sel_d.get("missing_api") == [])
+
+_base_d, _err = _sel()
+if _base_d is None:
+    check("app defaults to pipeline.py when unset", False)
+    print(_err)
+else:
+    check("app defaults to pipeline.py when AUTODUB_PIPELINE is unset",
+          _base_d.get("module") == "pipeline"
+          and _base_d.get("variant") == "1.0")
+    check("…so Colab_Runner keeps all six engines",
+          len(_base_d.get("engines") or []) == 6)
+    check("…and pipeline.py carries every name app.py needs",
+          _base_d.get("missing_api") == [])
+
+_bad_d, _err = _sel(AUTODUB_PIPELINE="../evil")
+if _bad_d is None:
+    check("a non-identifier AUTODUB_PIPELINE is rejected, not imported", False)
+    print(_err)
+else:
+    check("a non-identifier AUTODUB_PIPELINE is rejected, not imported",
+          "plain Python module name" in (_bad_d.get("error") or ""))
+
+
 # ── cleanup self-test artifacts (leave a pristine tree) ────────────────────
 for p in (srt_path, tsrt, pipeline.DIARIZATION_JSON, pipeline.EMOTION_GRID_JSON,
           pipeline.FINAL_SCRIPT_JSON, pipeline.STATE_JSON,

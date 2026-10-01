@@ -134,21 +134,36 @@ silently substituted, because a quiet voice swap hides the bug you actually
 need to fix. Changing the engine in Tab 1 invalidates the Step 7 cache and
 re-renders automatically.
 
-**Narrowing the selector.** A launcher can publish a *subset* of this table by
-setting `AUTODUB_TTS_ENGINES` to a comma-separated list of engine ids before
-starting the app. The variable filters the registry itself, so the Tab 1 radio,
-the Tab 2 audition dropdown, the default engine and the fallback rules all follow
-from one rule instead of each re-implementing it:
+**Two builds, two pipelines.** The table above belongs to `pipeline.py`.
+`pipeline2.py` is AutoDub Studio 2.0's **dedicated copy** of it — byte-for-byte
+identical apart from its header and two identity constants, so
+`diff pipeline.py pipeline2.py` shows exactly what makes 2.0 2.0 and nothing
+else:
 
-| Launcher | Engines published |
-|---|---|
-| `Colab_Runner.ipynb` | all six — variable never set |
-| `AutoDub Studio 2.0.ipynb` | **Chatterbox only** (`AUTODUB_TTS_ENGINES=chatterbox`) |
+```python
+PIPELINE_VARIANT = "2.0"             # pipeline.py has "1.0"
+ENGINE_ALLOWLIST = ("chatterbox",)   # pipeline.py has ()
+```
+
+`app.py` binds whichever module `AUTODUB_PIPELINE` names, so neither pipeline
+file references the other and the two can evolve independently. A non-identifier
+value is rejected at import rather than imported:
+
+| Launcher | Pipeline module | Engines published |
+|---|---|---|
+| `Colab_Runner.ipynb` | `pipeline.py` | all six |
+| `AutoDub Studio 2.0.ipynb` | `pipeline2.py` | **Chatterbox only** — baked into `ENGINE_ALLOWLIST` |
+
+**Narrowing further.** `AUTODUB_TTS_ENGINES` (comma-separated ids) still narrows
+whichever build you launched, and takes precedence over `ENGINE_ALLOWLIST` when
+set. Both mechanisms filter the registry itself, so the Tab 1 radio, the Tab 2
+audition dropdown, the default engine and the fallback rules all follow from one
+rule instead of each re-implementing it.
 
 Requesting an engine that was filtered out degrades to the active one rather
-than raising. A single-engine build's Tab 1 helper text and licence notice are
-*computed* from what is actually published, so they never advertise an engine the
-build no longer ships.
+than raising, and a single-engine build's Tab 1 helper text and licence notice
+are *computed* from what is actually published — so neither build ever advertises
+an engine it does not ship.
 
 **Terminal failures are loud.** When a terminal engine dies, Step 7 raises with:
 
@@ -276,13 +291,14 @@ Step 1 extract ──▶ Step 2 Demucs ──🧹──▶ Step 3 Pyannote ─�
 ```
 ├── app.py                 # Phase 1 · glassmorphism Gradio UI (3 tabs)
 ├── pipeline.py            # Phases 2–3 · steps 1–5 + clear_gpu_cache OOM defense
+├── pipeline2.py           # AutoDub Studio 2.0's DEDICATED copy (Chatterbox only)
 ├── build_secure.py        # Phase 6 · Cython obfuscation builder (compile + scrub)
-├── Colab_Runner.ipynb     # Phase 8 · one-click Colab launcher (all 6 engines)
-├── AutoDub Studio 2.0.ipynb  # Chatterbox-only launcher (AUTODUB_TTS_ENGINES)
+├── Colab_Runner.ipynb     # Phase 8 · one-click Colab launcher (pipeline.py · 6 engines)
+├── AutoDub Studio 2.0.ipynb  # launcher → pipeline2.py (AUTODUB_PIPELINE=pipeline2)
 ├── requirements.txt
 ├── assets/icons/          # premium gradient SVG button icons
 ├── tools/
-│   ├── selftest.py        # 156 pure-Python checks · python tools/selftest.py
+│   ├── selftest.py        # 169 pure-Python checks · python tools/selftest.py
 │   └── bridge.py          # Phase 7 · desktop tunnel poller
 ├── uploads/               # runtime · user uploads
 └── outputs/               # runtime artifacts
@@ -343,7 +359,7 @@ you cannot opt out of the one check that makes deletion safe.
 | `--dry-run` | translate to C only — no compiler, nothing written or deleted |
 | `--force` | rebuild even if an extension already exists |
 | `--no-verify` | skip the import check; **scrubbing is refused** |
-| `--target NAME` | compile a different module (default `pipeline`) |
+| `--target NAME` | compile a different module (default `pipeline`; use `--target pipeline2` for the 2.0 build) |
 
 Verified here: Cython translates `pipeline.py` cleanly (7.4 MB of C, no
 warnings). The actual C compile needs a compiler — Colab ships `gcc`; a bare
