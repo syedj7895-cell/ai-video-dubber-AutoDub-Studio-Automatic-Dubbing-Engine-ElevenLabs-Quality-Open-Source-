@@ -1142,6 +1142,27 @@ for p in (srt_path, tsrt, pipeline.DIARIZATION_JSON, pipeline.EMOTION_GRID_JSON,
           pipeline.OUTPUTS_DIR / "Project_Speaker2.txt"):
     p.unlink(missing_ok=True)
 
+# ── § 15 · Tab 3 diagnostics must name the engine that actually ran ──────────
+# Step 7's report used to hard-code "cosyvoice_tts", so the Chatterbox-only
+# 2.0 build blamed a cosyvoice run for a chatterbox failure — and the printed
+# fix never mentioned the protobuf mismatch that actually caused it.
+_src = {name: (Path(_ROOT) / f"{name}.py").read_text(encoding="utf-8")
+        for name in ("pipeline", "pipeline2")}
+for _name, _text in _src.items():
+    check(f"[{_name}] Step 7 diagnostic label is derived, not hard-coded",
+          '"Step 7 · cosyvoice_tts"' not in _text
+          and 'f"Step 7 · {get_tts_engine()}"' in _text)
+    check(f"[{_name}] Step 7 SKIPPED line names the active engine too",
+          "cosyvoice_tts SKIPPED" not in _text
+          and "{get_tts_engine()} SKIPPED" in _text)
+    check(f"[{_name}] carries the protobuf gencode/runtime repair",
+          "def _ensure_protobuf_runtime(" in _text
+          and '"protobuf>=6.31.1"' in _text)
+    check(f"[{_name}] repair is wired into the chatterbox loader, not dead code",
+          "attempts.extend(_ensure_protobuf_runtime(log))" in _text
+          and "_CHATTERBOX_FIX" in _text
+          and "protobuf>=6.31.1" in _text.split("_CHATTERBOX_FIX", 1)[1][:4000])
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)
