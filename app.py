@@ -778,6 +778,11 @@ def build_ui() -> gr.Blocks:
                             srt_trans_in = gr.File(label="🌍 Translated SRT",
                                                    file_types=[".srt"])
                         with gr.Row():
+                            # language_choices() returns (label, value) pairs in
+                            # the exact order Gradio unpacks them. Never reorder
+                            # to (value, label): preprocess() would then reject
+                            # the code the browser posts and Tab 1 shows
+                            # "Error · Value: … is not in the list of choices".
                             lang_orig_in = gr.Dropdown(
                                 choices=pipeline.language_choices(
                                     include_auto=True),

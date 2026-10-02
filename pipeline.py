@@ -2414,14 +2414,26 @@ def language_choices(include_auto: bool = False) -> List[Tuple[str, str]]:
     picker, where "let the ASR work it out" is a real option; the dub-side
     picker must name a language because that code is handed to generate().
 
+    ⚠ Tuple order is (label, code) — NOT the (code, label) that
+    DUBBING_LANGUAGES / ENGINE_LANGUAGES are stored in. Gradio unpacks every
+    choice as `for _, value in choices` (gradio/components/dropdown.py →
+    Dropdown.preprocess), so the SECOND element is the value the browser posts
+    back and the first is only what gets painted on screen. Handing it
+    (code, label) made each human-readable name a "legal" value while the code
+    the UI actually sends was rejected with:
+
+        Value: auto is not in the list of choices: ['🌐 Auto-detect', 'English']
+
+    — the red "Error" banner in Tab 1. The swap below is therefore deliberate.
+
     An engine with no published set (edge, fishs2) falls back to the curated
     DUBBING_LANGUAGES rather than showing an empty menu.
     """
-    langs = [(c, l) for c, l in
+    langs = [(label, code) for code, label in
              (ENGINE_LANGUAGES.get(get_tts_engine()) or DUBBING_LANGUAGES)
-             if c != "auto"]
+             if code != "auto"]
     if include_auto:
-        return [("auto", "🌐 Auto-detect")] + list(langs)
+        return [("🌐 Auto-detect", "auto")] + list(langs)
     return list(langs)
 
 

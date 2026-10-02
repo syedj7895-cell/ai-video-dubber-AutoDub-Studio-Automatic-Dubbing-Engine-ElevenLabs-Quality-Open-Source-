@@ -1297,14 +1297,71 @@ for _eng in pipeline.TTS_ENGINES:
     _ca = pipeline.language_choices(include_auto=True)
     check(f"[{_eng}] offers at least one language", bool(_c))
     check(f"[{_eng}] source menu opens with auto-detect",
-          _ca and _ca[0][0] == "auto")
+          _ca and _ca[0][1] == "auto")
     check(f"[{_eng}] dub menu has no auto-detect (generate needs a code)",
-          all(c != "auto" for c, _ in _c))
+          all(v != "auto" for _, v in _c))
     check(f"[{_eng}] no duplicate codes",
-          len({c for c, _ in _c}) == len(_c))
+          len({v for _, v in _c}) == len(_c))
     if _eng == "chatterbox":
         check("[chatterbox] never offers Cantonese, which it cannot speak",
-              "yue" not in {c for c, _ in _c})
+              "yue" not in {v for _, v in _c})
+pipeline._TTS_ENGINE = _checking
+
+
+# ── the (label, value) contract, proven against Gradio itself ────────────────
+# Gradio unpacks every choice as `for _, value in choices` (see
+# gradio/components/dropdown.py → Dropdown.preprocess), so the SECOND element is
+# the value the browser posts back and the first is pure cosmetics. Shipping
+# (code, label) made each pretty name a "legal" value while rejecting the code
+# the UI actually sends:
+#     Error · Value: auto is not in the list of choices: ['🌐 Auto-detect', …]
+# — the red banner in Tab 1. The tuple-order checks below fail loudly if the
+# order is ever swapped back; the round-trip reproduces the exact user error.
+def _accepts(comp, value) -> bool:
+    """True when Gradio's own preprocess() accepts `value` for `comp`."""
+    try:
+        return comp.preprocess(value) == value
+    except Exception:                # gradio.exceptions.Error, or an older API
+        return False
+
+
+try:
+    import gradio as _gr
+except Exception:                    # compiled / headless build
+    _gr = None
+
+for _eng in pipeline.TTS_ENGINES:
+    pipeline._TTS_ENGINE = _eng
+    _c = pipeline.language_choices()
+    _ca = pipeline.language_choices(include_auto=True)
+    # Compared against the source table rather than a shape heuristic: the
+    # projections are the exact thing Gradio splits, so if the tuple order
+    # regresses the values become the names and this fails immediately.
+    _tbl = pipeline.ENGINE_LANGUAGES.get(_eng) or pipeline.DUBBING_LANGUAGES
+    _codes = {c for c, _ in _tbl if c != "auto"}
+    _names = {l for c, l in _tbl if c != "auto"}
+    check(f"[{_eng}] choice VALUES are the engine's language codes",
+          {v for _, v in _c} == _codes)
+    check(f"[{_eng}] choice LABELS are the human-readable names",
+          {l for l, _ in _c} == _names)
+    check(f"[{_eng}] the code is second, not first — Gradio reads it there",
+          not ({l for l, _ in _c} & _codes))
+    if _gr is None:
+        skip(f"[{_eng}] Gradio accepts its own menu values", "no gradio here")
+        continue
+    if not (_c and _ca):
+        check(f"[{_eng}] menus are non-empty for the Gradio round-trip", False)
+        continue
+    _src_pick = _gr.Dropdown(choices=_ca, value="auto",
+                             allow_custom_value=False)
+    _dub_pick = _gr.Dropdown(choices=_c, value=_c[0][1],
+                             allow_custom_value=False)
+    check(f"[{_eng}] preprocess() accepts the source picker's own 'auto'",
+          _accepts(_src_pick, "auto"))
+    check(f"[{_eng}] preprocess() accepts every dub-side code",
+          all(_accepts(_dub_pick, v) for _, v in _c))
+    check(f"[{_eng}] a label is never accepted in place of a code",
+          not _accepts(_dub_pick, _c[0][0]) or _c[0][0] == _c[0][1])
 pipeline._TTS_ENGINE = _checking
 
 check("Tab 1's original-language menu derives from language_choices",
