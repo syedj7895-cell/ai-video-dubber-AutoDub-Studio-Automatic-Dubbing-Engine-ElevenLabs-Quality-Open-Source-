@@ -406,11 +406,13 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, tra
 
     def emit_msg(text, status):
         con["text"] = (con["text"] + "\n" + text).strip("\n")
-        return con["text"], None, None, None, None, _chip(status, text)
+        return (con["text"], None, None, None, None, _chip(status, text),
+                _original_audio())
 
     def emit_stage(line, status, start, label):
         con["text"] = con["text"][:start] + line
-        return con["text"], None, None, None, None, _chip(status, label)
+        return (con["text"], None, None, None, None, _chip(status, label),
+                _original_audio())
 
     def pause_or_stop(label: str, seconds: int = 15):
         """Yields status updates each second; stops early if user hits STOP."""
@@ -468,23 +470,38 @@ def _stop_auto():
     return _chip("err", "STOP signalled — halting after current stage")
 
 
+def _original_audio():
+    """TAB 3 · path to the source audio extracted in Step 1, else None.
+
+    This is the file Step 1 pulled out of the upload, i.e. the track that is
+    about to be replaced — not the Demucs vocal stem, which would be a
+    stripped-down half of it. Returns None until Tab 1 has run, so the player
+    simply stays empty rather than pointing at a file that isn't there.
+    """
+    p = pipeline.AUDIO_WAV
+    return str(p) if p.exists() else None
+
+
 def _run_rendering(diagnostic):
-    """TAB 3 · steps 6–8 → (console, final mix, final video, status)."""
-    yield "⏳ Booting render engine …", None, None, _chip("run", "Steps 6–8 rendering")
+    """TAB 3 · steps 6–8 → (console, final mix, final video, status, source)."""
+    src = _original_audio()
+    yield "⏳ Booting render engine …", None, None, \
+        _chip("run", "Steps 6–8 rendering"), src
     last = ""
     try:
         for line in pipeline.run_rendering(force=False, diagnostic=bool(diagnostic)):
             last = line
-            yield line, None, None, _chip("run", "Steps 6–8 rendering")
+            yield line, None, None, _chip("run", "Steps 6–8 rendering"), src
         state = pipeline.PipelineState.load()
         if state.is_done("step8"):
             mix = str(pipeline.FINAL_MIX_WAV) if pipeline.FINAL_MIX_WAV.exists() else None
             vid = str(pipeline.FINAL_VIDEO_MP4) if pipeline.FINAL_VIDEO_MP4.exists() else None
-            yield last, mix, vid, _chip("ok", "Render complete — download below")
+            yield last, mix, vid, _chip("ok", "Render complete — download below"), src
         else:
-            yield last, None, None, _chip("err", "Halted — read the console")
+            yield last, None, None, _chip("err", "Halted — read the console"), src
     except Exception as e:  # pragma: no cover
-        yield f"❌ Unexpected error: {e}", None, None, _chip("err", "Unexpected error")
+        yield f"❌ Unexpected error: {e}", None, None, \
+            _chip("err", "Unexpected error"), src
 
 
 
@@ -596,13 +613,27 @@ def _toggle_persist(on):
                  if on else "Persistence OFF")
 
 
-def _switch_tts_engine(engine_id: str):
-    """Persist the selected TTS engine and return a descriptive status chip."""
+def _switch_tts_engine(engine_id, orig, target):
+    """Persist the engine, refresh its chip, and re-derive BOTH language menus.
+
+    Each engine speaks a different set, so leaving the old choices on screen
+    after a switch would keep offering languages the newly selected engine
+    cannot synthesise — the target code goes straight to generate(). A pick the
+    new engine still supports is kept; one it doesn't falls back to a sensible
+    default rather than leaving the box blank.
+    """
     actual = pipeline.set_tts_engine(engine_id)
     label = pipeline.TTS_ENGINES.get(actual, {}).get("label", actual)
     fb = pipeline.engine_fallback(actual)
     fb_note = f" · falls back to {fb}" if fb else " · terminal tier"
-    return _chip("ok", f"TTS Engine: {label}{fb_note}")
+    orig_new = pipeline.language_choices(include_auto=True)
+    tgt_new = pipeline.language_choices()
+    o_val = orig if any(c == orig for _, c in orig_new) else "auto"
+    t_val = target if any(c == target for _, c in tgt_new) else \
+        (tgt_new[0][1] if tgt_new else None)
+    return (_chip("ok", f"TTS Engine: {label}{fb_note}"),
+            gr.update(choices=orig_new, value=o_val),
+            gr.update(choices=tgt_new, value=t_val))
 
 
 def _clear_cloud():
@@ -748,18 +779,17 @@ def build_ui() -> gr.Blocks:
                                                    file_types=[".srt"])
                         with gr.Row():
                             lang_orig_in = gr.Dropdown(
-                                choices=[(lbl, code) for code, lbl
-                                         in pipeline.DUBBING_LANGUAGES],
+                                choices=pipeline.language_choices(
+                                    include_auto=True),
                                 value="auto", label="🎙 Original language",
                                 info="Language of the source audio — used by "
                                      "the emotion/ASR scan",
                                 interactive=True, allow_custom_value=False)
                             lang_target_in = gr.Dropdown(
-                                choices=[(lbl, code) for code, lbl
-                                         in pipeline.DUBBING_LANGUAGES],
+                                choices=pipeline.language_choices(),
                                 value="en", label="🌍 Target / dub language",
-                                info="Language of your Translated SRT — the "
-                                     "cloned voices speak this",
+                                info="Limited to what the active TTS engine "
+                                     "can speak — the cloned voices speak this",
                                 interactive=True, allow_custom_value=False)
                         spk_hint_in = gr.Dropdown(
                             choices=["Auto", "1", "2", "3", "4", "5",
@@ -970,7 +1000,7 @@ def build_ui() -> gr.Blocks:
                         clone_files = gr.Files(label=None, interactive=False)
 
             # ════════════════ TAB 3 · RENDERING ENGINE ══════════════════════
-            with gr.Tab("🚀 Rendering Engine"):
+            with gr.Tab("🚀 Rendering Engine") as tab3:
                 with gr.Row():
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
                         gr.Markdown("### ⚡ Auto-pilot (one-click)")
@@ -1019,6 +1049,10 @@ def build_ui() -> gr.Blocks:
                             fn=None, inputs=[render_log], js=_COPY_JS)
                 final_audio = gr.Audio(label="🎧 Final master mix",
                                        elem_classes=["glass", "pad"])
+                gr.Markdown("#### 🔉 Original audio")
+                original_audio = gr.Audio(
+                    label="🔈 The source as uploaded — before dubbing",
+                    elem_classes=["glass", "pad"])
                 final_video = gr.Video(label="🎬 Final dubbed video "
                                              "(when the source was a video)",
                                        elem_classes=["glass", "pad"])
@@ -1045,13 +1079,21 @@ def build_ui() -> gr.Blocks:
                     lang_orig_in, lang_target_in, diag_in, spk_hint_in,
                     translit_in],
             outputs=[render_log, final_audio, final_video, render_status,
-                     match_status, analysis_status],
+                     match_status, analysis_status, original_audio],
         )
         render_btn.click(
             fn=_run_rendering,
             inputs=[diag_in],
-            outputs=[render_log, final_audio, final_video, render_status],
+            outputs=[render_log, final_audio, final_video, render_status,
+                     original_audio],
         )
+        # The source track exists from Step 1, so fill the player as soon as the
+        # tab is opened instead of making people render first. Guarded because
+        # it is a convenience — the render and auto-pilot callbacks above already
+        # populate it, so losing this never leaves the player unreachable.
+        if hasattr(tab3, "select"):
+            tab3.select(fn=_original_audio, inputs=None,
+                        outputs=[original_audio])
         preflight_btn.click(
             fn=_run_readiness,
             inputs=None,
@@ -1095,8 +1137,11 @@ def build_ui() -> gr.Blocks:
         )
         persist_on.change(fn=_toggle_persist, inputs=[persist_on],
                           outputs=[analysis_status])
-        tts_engine_in.change(fn=_switch_tts_engine, inputs=[tts_engine_in],
-                             outputs=[tts_engine_note])
+        tts_engine_in.change(fn=_switch_tts_engine,
+                             inputs=[tts_engine_in, lang_orig_in,
+                                     lang_target_in],
+                             outputs=[tts_engine_note, lang_orig_in,
+                                      lang_target_in])
         clear_cloud_btn.click(fn=_clear_cloud, inputs=None,
                               outputs=[clear_cloud_msg])
     return demo

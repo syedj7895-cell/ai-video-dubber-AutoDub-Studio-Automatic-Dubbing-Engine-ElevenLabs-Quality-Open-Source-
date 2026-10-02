@@ -89,7 +89,7 @@ SENSEVOICE_EMO_MAP = {
 LANG_MAP = {"zh": "Chinese", "en": "English", "yue": "Cantonese",
             "ja": "Japanese", "ko": "Korean"}
 
-# Dubbing languages offered in the UI · (code, label) — consumed by Steps 4 & 7
+# Dubbing languages offered in the UI · (code, label) — the curated fallback
 DUBBING_LANGUAGES = [
     ("auto", "🌐 Auto-detect"),
     ("en", "English"),
@@ -100,6 +100,56 @@ DUBBING_LANGUAGES = [
     ("ja", "日本語 · Japanese"),
     ("ko", "한국어 · Korean"),
 ]
+
+# ── What each engine can actually SAY · (code, label) ────────────────────────
+# The target code reaches the synthesiser as `model.generate(text,
+# language_id=...)`, and chatterbox's generate() raises ValueError for anything
+# outside its own SUPPORTED_LANGUAGES. The curated list above offers "yue"
+# (Cantonese), which Chatterbox does not have — so offering it wasn't just
+# unhelpful, it guaranteed a failure one line into Step 7. These entries are
+# copied from each vendor's published set rather than guessed:
+#   chatterbox  chatterbox/mtl_tts.py SUPPORTED_LANGUAGES — all 23, verbatim
+#   cosyvoice2/3 FunAudioLLM/CosyVoice2-0.5B model card — "9 languages"
+#   kokoro      hexgrad/Kokoro-82M model card — "Langs & Voices: 8 & 54"
+#               (lang codes a/b/e/f/h/i/j/p → 7 distinct ISO tags)
+# edge and fishs2 publish no machine-readable language set, so they fall back
+# to DUBBING_LANGUAGES rather than have us invent one for them.
+ENGINE_LANGUAGES: Dict[str, List[Tuple[str, str]]] = {
+    "chatterbox": [
+        ("ar", "العربية · Arabic"), ("da", "Dansk · Danish"),
+        ("de", "Deutsch · German"), ("el", "Ελληνικά · Greek"),
+        ("en", "English"), ("es", "Español · Spanish"),
+        ("fi", "Suomi · Finnish"), ("fr", "Français · French"),
+        ("he", "עברית · Hebrew"), ("hi", "हिन्दी · Hindi"),
+        ("it", "Italiano · Italian"), ("ja", "日本語 · Japanese"),
+        ("ko", "한국어 · Korean"), ("ms", "Bahasa Melayu · Malay"),
+        ("nl", "Nederlands · Dutch"), ("no", "Norsk · Norwegian"),
+        ("pl", "Polski · Polish"), ("pt", "Português · Portuguese"),
+        ("ru", "Русский · Russian"), ("sv", "Svenska · Swedish"),
+        ("sw", "Kiswahili · Swahili"), ("tr", "Türkçe · Turkish"),
+        ("zh", "中文 · Chinese"),
+    ],
+    "cosyvoice2": [
+        ("zh", "中文 · Chinese"), ("en", "English"),
+        ("ja", "日本語 · Japanese"), ("ko", "한국어 · Korean"),
+        ("de", "Deutsch · German"), ("es", "Español · Spanish"),
+        ("fr", "Français · French"), ("it", "Italiano · Italian"),
+        ("ru", "Русский · Russian"),
+    ],
+    "cosyvoice3": [
+        ("zh", "中文 · Chinese"), ("en", "English"),
+        ("ja", "日本語 · Japanese"), ("ko", "한국어 · Korean"),
+        ("de", "Deutsch · German"), ("es", "Español · Spanish"),
+        ("fr", "Français · French"), ("it", "Italiano · Italian"),
+        ("ru", "Русский · Russian"),
+    ],
+    "kokoro": [
+        ("en", "English"), ("es", "Español · Spanish"),
+        ("fr", "Français · French"), ("hi", "हिन्दी · Hindi"),
+        ("it", "Italiano · Italian"), ("ja", "日本語 · Japanese"),
+        ("pt", "Português · Portuguese"),
+    ],
+}
 
 # CosyVoice-3 friendly instruct hints (consumed by the later TTS phase)
 EMOTION_INSTRUCT = {
@@ -2353,6 +2403,26 @@ def engine_choices() -> List[Tuple[str, str]]:
 
 def get_tts_engine() -> str:
     return _TTS_ENGINE if _TTS_ENGINE in TTS_ENGINES else DEFAULT_TTS_ENGINE
+
+
+def language_choices(include_auto: bool = False) -> List[Tuple[str, str]]:
+    """[(label, code)] the ACTIVE engine can speak — ready for a Gradio dropdown.
+
+    Mirrors engine_choices(): one object decides, so switching engines
+    re-derives it and the UI can never advertise a language the newly selected
+    engine will reject at synthesis time. `include_auto` is for the source-side
+    picker, where "let the ASR work it out" is a real option; the dub-side
+    picker must name a language because that code is handed to generate().
+
+    An engine with no published set (edge, fishs2) falls back to the curated
+    DUBBING_LANGUAGES rather than showing an empty menu.
+    """
+    langs = [(c, l) for c, l in
+             (ENGINE_LANGUAGES.get(get_tts_engine()) or DUBBING_LANGUAGES)
+             if c != "auto"]
+    if include_auto:
+        return [("auto", "🌐 Auto-detect")] + list(langs)
+    return list(langs)
 
 
 def set_tts_engine(engine_id: str) -> str:

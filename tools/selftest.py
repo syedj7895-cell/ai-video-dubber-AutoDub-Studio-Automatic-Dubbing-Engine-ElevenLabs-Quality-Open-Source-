@@ -1204,6 +1204,118 @@ check("protobuf detector rejects an unrelated import failure",
 check("protobuf detector rejects a plain runtime error mentioning neither",
       not pipeline._is_protobuf_gencode_error(RuntimeError("CUDA out of memory")))
 
+# ── § 16 · Tab 3's original-audio player must be wired, not just declared ────
+# A Gradio generator that yields the wrong number of values fails only at click
+# time inside the browser, so the arity is verified here against the outputs
+# list each callback was actually wired with.
+import ast as _ast                      # noqa: E402
+
+_APP = (Path(_ROOT) / "app.py").read_text(encoding="utf-8")
+_tree = _ast.parse(_APP)
+
+
+def _click_outputs(event: str):
+    for node in _ast.walk(_tree):
+        if not (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "click"):
+            continue
+        if not (_ast.get_source_segment(_APP, node) or "").startswith(event + "."):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "outputs" and isinstance(kw.value, _ast.List):
+                return len(kw.value.elts)
+    return None
+
+
+def _tuple_arities(fn_name: str):
+    """(line, width) for every tuple the function yields or returns.
+
+    Walks nested closures too — _run_full_auto only ever yields emit_msg(...)
+    and emit_stage(...), so its arity lives in those helpers' returns.
+    """
+    fn = next((n for n in _ast.walk(_tree)
+               if isinstance(n, _ast.FunctionDef) and n.name == fn_name), None)
+    if fn is None:
+        return []
+    return [(n.lineno, len(n.value.elts))
+            for n in _ast.walk(fn)
+            if isinstance(n, (_ast.Yield, _ast.Return))
+            and isinstance(n.value, _ast.Tuple)]
+
+
+for _ev, _fn in (("render_btn", "_run_rendering"),
+                 ("auto_btn", "_run_full_auto")):
+    _n = _click_outputs(_ev)
+    _found = _tuple_arities(_fn)
+    check(f"{_ev} wired with {_n} outputs", _n is not None)
+    check(f"{_fn}: all {len(_found)} tuples are {_n}-wide",
+          _found and all(w == _n for _, w in _found))
+
+check("original_audio component declared", "original_audio = gr.Audio(" in _APP)
+_i_mix = _APP.find('label="🎧 Final master mix"')
+_i_src = _APP.find("original_audio = gr.Audio(")
+_i_vid = _APP.find('label="🎬 Final dubbed video')
+check("original_audio sits below Final master mix, above the video player",
+      -1 < _i_mix < _i_src < _i_vid)
+_hlpr = _APP.split("def _original_audio():", 1)
+check("_original_audio helper defined", len(_hlpr) == 2)
+if len(_hlpr) == 2:
+    _body = _hlpr[1].split("\ndef ", 1)[0]
+    check("_original_audio reads Step 1's AUDIO_WAV",
+          "pipeline.AUDIO_WAV" in _body)
+    check("_original_audio does not serve the Demucs vocal stem",
+          "VOCALS_WAV" not in _body)
+    check("_original_audio yields None rather than a missing path",
+          "exists()" in _body)
+check("original_audio wired into the render callback",
+      "render_status,\n                     original_audio]" in _APP)
+check("original_audio wired into the auto-pilot callback",
+      "match_status, analysis_status, original_audio]" in _APP)
+
+# ── § 17 · the language menus must offer only what the engine can speak ──────
+# target_lang travels straight to generate(language_id=...), where Chatterbox
+# raises on anything outside its own SUPPORTED_LANGUAGES. The old static menu
+# offered "yue", which that engine does not have.
+_CB23 = {"ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it",
+         "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh"}
+
+check("ENGINE_LANGUAGES declared in both pipelines",
+      all("ENGINE_LANGUAGES" in t for t in _src.values()))
+check("chatterbox entry is the vendor's full 23-language set",
+      {c for c, _ in pipeline.ENGINE_LANGUAGES["chatterbox"]} == _CB23
+      and len(pipeline.ENGINE_LANGUAGES["chatterbox"]) == 23)
+check("chatterbox entry is verbatim in pipeline2 too",
+      "ENGINE_LANGUAGES" in _src.get("pipeline2", "")
+      and all(c in _src["pipeline2"] for c in _CB23))
+check("language_choices() exists", hasattr(pipeline, "language_choices"))
+
+_checking = pipeline.get_tts_engine()
+for _eng in pipeline.TTS_ENGINES:
+    pipeline._TTS_ENGINE = _eng
+    _c = pipeline.language_choices()
+    _ca = pipeline.language_choices(include_auto=True)
+    check(f"[{_eng}] offers at least one language", bool(_c))
+    check(f"[{_eng}] source menu opens with auto-detect",
+          _ca and _ca[0][0] == "auto")
+    check(f"[{_eng}] dub menu has no auto-detect (generate needs a code)",
+          all(c != "auto" for c, _ in _c))
+    check(f"[{_eng}] no duplicate codes",
+          len({c for c, _ in _c}) == len(_c))
+    if _eng == "chatterbox":
+        check("[chatterbox] never offers Cantonese, which it cannot speak",
+              "yue" not in {c for c, _ in _c})
+pipeline._TTS_ENGINE = _checking
+
+check("Tab 1's original-language menu derives from language_choices",
+      "pipeline.language_choices(\n                                    include_auto=True)"
+      in _APP)
+check("Tab 1's target-language menu derives from language_choices",
+      "choices=pipeline.language_choices()," in _APP)
+check("switching engines re-derives both language menus",
+      "outputs=[tts_engine_note, lang_orig_in,\n                                      lang_target_in]"
+      in _APP)
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)
