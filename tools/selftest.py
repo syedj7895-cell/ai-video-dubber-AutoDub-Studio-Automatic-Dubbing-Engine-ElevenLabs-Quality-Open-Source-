@@ -1148,6 +1148,13 @@ for p in (srt_path, tsrt, pipeline.DIARIZATION_JSON, pipeline.EMOTION_GRID_JSON,
 # fix never mentioned the protobuf mismatch that actually caused it.
 _src = {name: (Path(_ROOT) / f"{name}.py").read_text(encoding="utf-8")
         for name in ("pipeline", "pipeline2")}
+# The exact text Colab produced in the failed Tab 3 run.
+_PB_VERSION_ERROR = (
+    "VersionError: Detected incompatible Protobuf Gencode/Runtime versions "
+    "when loading onnx/onnx-ml.proto: gencode 6.31.1 runtime 5.29.6. Runtime "
+    "version cannot be older than the linked gencode version. See Protobuf "
+    "version guarantees at https://protobuf.dev/support/"
+    "cross-version-runtime-guarantee.")
 for _name, _text in _src.items():
     check(f"[{_name}] Step 7 diagnostic label is derived, not hard-coded",
           '"Step 7 · cosyvoice_tts"' not in _text
@@ -1156,12 +1163,46 @@ for _name, _text in _src.items():
           "cosyvoice_tts SKIPPED" not in _text
           and "{get_tts_engine()} SKIPPED" in _text)
     check(f"[{_name}] carries the protobuf gencode/runtime repair",
-          "def _ensure_protobuf_runtime(" in _text
+          "def _repair_protobuf_runtime(" in _text
           and '"protobuf>=6.31.1"' in _text)
     check(f"[{_name}] repair is wired into the chatterbox loader, not dead code",
-          "attempts.extend(_ensure_protobuf_runtime(log))" in _text
+          "attempts.extend(_repair_protobuf_runtime(log))" in _text
           and "_CHATTERBOX_FIX" in _text
           and "protobuf>=6.31.1" in _text.split("_CHATTERBOX_FIX", 1)[1][:4000])
+    # Regression guard for the shipped-but-never-ran repair: the first version
+    # decided whether to repair by PROBEing `import onnx.onnx_ml_pb2`, and
+    # because that module imports cleanly on its own the probe returned early
+    # and the repair never executed — while the printed fix still told people
+    # to run the very command the code would not. Detection must come from the
+    # exception actually raised, and there must be an attempt after the repair.
+    check(f"[{_name}] repair is driven by the caught exception, not a probe",
+          "def _is_protobuf_gencode_error(" in _text
+          and "_is_protobuf_gencode_error(e2)" in _text)
+    # ...and the repair itself must go straight to pip instead of pre-flighting
+    # with `python -c`. Scoped to the function body so the docstring's account
+    # of why the probe was abandoned does not defeat the check.
+    _repair = (_text.split("def _repair_protobuf_runtime(", 1)[1]
+               .split("\ndef ", 1)[0])
+    check(f"[{_name}] repair runs pip directly instead of probing first",
+          '"-c"' not in _repair
+          and '"protobuf>=6.31.1"' in _repair
+          and "subprocess.run" in _repair)
+    check(f"[{_name}] retries once more after repairing protobuf",
+          "[import retry 2]" in _text)
+
+# Behaviour, not just source shape — the previous bug was invisible to
+# string-matching because every symbol was present and wired up.
+_VErr = type("VersionError", (Exception,), {})
+check("protobuf detector matches the exact Colab VersionError",
+      pipeline._is_protobuf_gencode_error(_VErr(_PB_VERSION_ERROR)))
+check("protobuf detector rejects a missing module",
+      not pipeline._is_protobuf_gencode_error(
+          ModuleNotFoundError("No module named 'chatterbox'")))
+check("protobuf detector rejects an unrelated import failure",
+      not pipeline._is_protobuf_gencode_error(
+          ImportError("cannot import name 'Tokenizers' from 'transformers'")))
+check("protobuf detector rejects a plain runtime error mentioning neither",
+      not pipeline._is_protobuf_gencode_error(RuntimeError("CUDA out of memory")))
 
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")

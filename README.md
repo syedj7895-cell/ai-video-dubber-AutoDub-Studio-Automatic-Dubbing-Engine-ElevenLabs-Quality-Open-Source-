@@ -298,7 +298,7 @@ Step 1 extract ──▶ Step 2 Demucs ──🧹──▶ Step 3 Pyannote ─�
 ├── requirements.txt
 ├── assets/icons/          # premium gradient SVG button icons
 ├── tools/
-│   ├── selftest.py        # 177 pure-Python checks · python tools/selftest.py
+│   ├── selftest.py        # 187 pure-Python checks · python tools/selftest.py
 │   └── bridge.py          # Phase 7 · desktop tunnel poller
 ├── uploads/               # runtime · user uploads
 └── outputs/               # runtime artifacts
