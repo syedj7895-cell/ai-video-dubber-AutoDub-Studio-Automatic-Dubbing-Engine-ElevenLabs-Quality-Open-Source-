@@ -1088,7 +1088,10 @@ _SEL = (
 def _sel(**over):
     """Import app in a fresh interpreter with these env vars, return its answer."""
     env = dict(_os.environ)
-    for _k in ("AUTODUB_PIPELINE", "AUTODUB_TTS_ENGINES"):
+    # Drop the pipeline vars too: a host that happens to export them would
+    # otherwise leak into the "unset" cases below and test the wrong thing.
+    for _k in ("AUTODUB_PIPELINE", "AUTODUB_TTS_ENGINES",
+               "AUTODUB_PIPELINE_VARIANTS"):
         env.pop(_k, None)
     env.update({k: str(v) for k, v in over.items()})
     proc = _sp.run([sys.executable, "-c", _SEL], capture_output=True,
@@ -1372,6 +1375,122 @@ check("Tab 1's target-language menu derives from language_choices",
 check("switching engines re-derives both language menus",
       "outputs=[tts_engine_note, lang_orig_in,\n                                      lang_target_in]"
       in _APP)
+
+# ── § 16 · Tab 1 pipeline switcher — flip modules WITHOUT a restart ──────────
+# Opt-in by design: the control renders only when AUTODUB_PIPELINE_VARIANTS
+# names MORE THAN ONE module that actually exists as a file. That gate is what
+# leaves Colab_Runner.ipynb — which sets no such variable — with the exact Tab 1
+# it had before, while AutoDub Studio 2.0 gets a switcher on top.
+_SWITCH = (
+    "import json, sys\n"
+    "sys.path.insert(0, %r)\n"
+    "import app\n"
+    "cfg = app.build_ui().get_config_file()\n"
+    "radios = [c for c in cfg['components']\n"
+    "          if c['props'].get('label') == 'Pipeline module']\n"
+    "wired = [x for x in cfg['dependencies']\n"
+    "         if x.get('api_name') == '_bind_pipeline']\n"
+    "out = {'variants': list(app._PIPELINE_VARIANTS),\n"
+    "       'bound': app.pipeline.__name__,\n"
+    "       'switcher': len(radios),\n"
+    "       'choice_vals': [c[1] for c in radios[0]['props']['choices']] if radios else [],\n"
+    "       'default': radios[0]['props'].get('value') if radios else None,\n"
+    "       'wired': len(wired),\n"
+    "       'outputs': len(wired[0]['outputs']) if wired else 0,\n"
+    "       'self_trig': bool(radios and wired and\n"
+    "                          (radios[0]['id'], 'change') in wired[0]['targets'])}\n"
+    "r = app._bind_pipeline('new_pipeline', 'auto', 'en')\n"
+    "out['after'] = app.pipeline.__name__\n"
+    "out['radio'] = r[0].get('value') if isinstance(r[0], dict) else None\n"
+    "out['pipe_chip'] = r[1] if isinstance(r[1], str) else ''\n"
+    "out['eng_chip'] = r[2] if isinstance(r[2], str) else ''\n"
+    "out['eng_vals'] = ([c[1] for c in r[3].get('choices')]\n"
+    "                   if isinstance(r[3], dict) and r[3].get('choices') else None)\n"
+    "out['pre_evil'] = app.pipeline.__name__\n"
+    "r = app._bind_pipeline('../evil', 'auto', 'en')\n"
+    "out['evil_bound'] = app.pipeline.__name__\n"
+    "out['evil_radio'] = r[0].get('value') if isinstance(r[0], dict) else None\n"
+    "out['evil_chip'] = r[1] if isinstance(r[1], str) else ''\n"
+    "out['arity'] = len(r)\n"
+    "print(json.dumps(out))\n"
+) % _ROOT
+
+
+def _switch(**over):
+    """Probe build_ui() + the live switcher with these env vars applied."""
+    env = dict(_os.environ)
+    for _k in ("AUTODUB_PIPELINE", "AUTODUB_TTS_ENGINES",
+               "AUTODUB_PIPELINE_VARIANTS"):
+        env.pop(_k, None)
+    env.update({k: str(v) for k, v in over.items()})
+    proc = _sp.run([sys.executable, "-c", _SWITCH], capture_output=True,
+                   text=True, env=env, cwd=_ROOT, timeout=300)
+    if proc.returncode != 0:
+        return None, proc.stderr[-1500:]
+    return json.loads(proc.stdout.strip().splitlines()[-1]), ""
+
+
+_on_d, _err = _switch(AUTODUB_PIPELINE="pipeline2",
+                      AUTODUB_PIPELINE_VARIANTS="pipeline2,new_pipeline")
+if _on_d is None:
+    check("the switcher builds when two variants are offered", False)
+    print(_err)
+else:
+    check("the switcher lists exactly the two variants asked for",
+          _on_d.get("variants") == ["pipeline2", "new_pipeline"]
+          and _on_d.get("choice_vals") == ["pipeline2", "new_pipeline"])
+    check("…and opens on the LAUNCH module, so it can't disagree with what is bound",
+          _on_d.get("bound") == "pipeline2"
+          and _on_d.get("default") == "pipeline2")
+    check("one handler, wired to the switcher's own change event",
+          _on_d.get("wired") == 1 and _on_d.get("self_trig") is True)
+    check("…and it returns a value for every output it claims (6)",
+          _on_d.get("outputs") == 6 and _on_d.get("arity") == 6)
+    check("flipping to new_pipeline rebinds the global app reads at call time",
+          _on_d.get("after") == "new_pipeline"
+          and _on_d.get("radio") == "new_pipeline")
+    check("…the switcher's chip names the module NOW driving the app",
+          "Pipeline: new_pipeline" in (_on_d.get("pipe_chip") or ""))
+    check("…and the engine chip is re-derived instead of left stale",
+          "TTS Engine:" in (_on_d.get("eng_chip") or ""))
+    check("…and the engine radio is re-derived with it",
+          _on_d.get("eng_vals") == ["chatterbox"])
+    # Rejection must be a true NO-OP: the module active before the call stays
+    # active, and the radio is pulled back to it rather than left on the name
+    # that was clicked (a half-switch would look like it silently worked).
+    check("a hostile module name leaves the ACTIVE module running, radio reverted",
+          _on_d.get("pre_evil") == "new_pipeline"
+          and _on_d.get("evil_bound") == _on_d.get("pre_evil")
+          and _on_d.get("evil_radio") == _on_d.get("pre_evil"))
+    check("…with an explanation in the switcher's own chip",
+          "Unknown pipeline" in (_on_d.get("evil_chip") or ""))
+
+# No variable at all ⇒ no switcher, no handler: this is the Colab_Runner case.
+_off_d, _err = _switch()
+if _off_d is None:
+    check("the switcher stays hidden when no variants are requested", False)
+    print(_err)
+else:
+    check("no AUTODUB_PIPELINE_VARIANTS → Tab 1 has NO switcher (Colab_Runner unchanged)",
+          _off_d.get("switcher") == 0 and _off_d.get("wired") == 0
+          and _off_d.get("outputs") == 0)
+    check("…and app still defaults to the 1.0 build with six engines",
+          _off_d.get("bound") == "pipeline" and _off_d.get("variants") == [])
+
+# Only ONE real variant (the other missing) ⇒ nothing to switch between, so the
+# control must not render either; and a non-identifier must never be offered.
+_forge_d, _err = _switch(AUTODUB_PIPELINE="pipeline2",
+                         AUTODUB_PIPELINE_VARIANTS="pipeline2,does_not_exist")
+check("variants with no matching file are dropped before rendering",
+      _forge_d is None or (_forge_d.get("variants") == ["pipeline2"]
+                           and _forge_d.get("switcher") == 0
+                           and _forge_d.get("wired") == 0))
+
+_evil_v, _err = _switch(AUTODUB_PIPELINE="pipeline2",
+                        AUTODUB_PIPELINE_VARIANTS="../evil,pipeline2")
+check("a path-shaped variant name is never offered as a choice",
+      _evil_v is None or ("../evil" not in (_evil_v.get("choice_vals") or [])
+                          and _evil_v.get("switcher") == 0))
 
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")

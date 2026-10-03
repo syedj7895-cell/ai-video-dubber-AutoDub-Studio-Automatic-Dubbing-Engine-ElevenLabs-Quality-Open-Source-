@@ -36,12 +36,53 @@ import gradio as gr
 # reference the other — they can evolve independently.
 #   Colab_Runner.ipynb        → never sets it → pipeline
 #   AutoDub Studio 2.0.ipynb  → AUTODUB_PIPELINE=pipeline2
+#
+# AUTODUB_PIPELINE_VARIANTS (optional, comma-separated) additionally renders a
+# SWITCHER at the very top of Tab 1, so the driving module can be changed in an
+# ALREADY-RUNNING app:
+#   AutoDub Studio 2.0.ipynb  → AUTODUB_PIPELINE_VARIANTS=pipeline2,new_pipeline
+# Leave it unset and no switcher is rendered at all, so Colab_Runner.ipynb's UI
+# stays exactly as it was. The launch module is always offered first and is
+# always the radio's default, so the control can never disagree with what is
+# actually bound. Names that are not plain identifiers, or whose .py file is
+# absent, drop out of the list instead of becoming a broken option.
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _is_module_name(name: str) -> bool:
+    """True for a bare module name — no dots, no separators, not empty."""
+    return bool(name) and name.isidentifier()
+
+
 _PIPELINE_NAME = (os.environ.get("AUTODUB_PIPELINE") or "pipeline").strip()
-if not _PIPELINE_NAME.isidentifier():
+if not _is_module_name(_PIPELINE_NAME):
     raise RuntimeError(
         f"AUTODUB_PIPELINE must be a plain Python module name, got "
         f"{_PIPELINE_NAME!r} — refusing to import it.")
-pipeline = importlib.import_module(_PIPELINE_NAME)
+
+_VARIANTS_RAW = (os.environ.get("AUTODUB_PIPELINE_VARIANTS") or "").strip()
+_PIPELINE_VARIANTS: tuple = ()
+if _VARIANTS_RAW:
+    _extra = [n for n in (v.strip() for v in _VARIANTS_RAW.split(","))
+              if _is_module_name(n) and n != _PIPELINE_NAME
+              and (BASE_DIR / f"{n}.py").is_file()]
+    _PIPELINE_VARIANTS = tuple(dict.fromkeys([_PIPELINE_NAME] + _extra))
+
+# One import per name, cached, so flipping back and forth in Tab 1 is instant.
+# Lazy on purpose: `new_pipeline.py` is the experimental twin, so a syntax
+# error while it is being edited must not stop the app from BOOTING — it is
+# caught by the switcher and reported in Tab 1 instead.
+_LOADED: dict = {}
+
+
+def _load_pipeline(name: str):
+    """Import `name` once, then serve it from the cache."""
+    if name not in _LOADED:
+        _LOADED[name] = importlib.import_module(name)
+    return _LOADED[name]
+
+
+pipeline = _load_pipeline(_PIPELINE_NAME)
 
 # ── global stop signal for the auto-pilot ──────────────────────────────────
 # Set by the STOP button; checked by _run_full_auto between every stage.
@@ -65,7 +106,6 @@ _COPY_JS = ("(text) => {"
             "navigator.clipboard.writeText(text||'').catch(()=>fb(text));}"
             "else{fb(text);}}")
 
-BASE_DIR = Path(__file__).resolve().parent
 ICONS_DIR = BASE_DIR / "assets" / "icons"
 
 
@@ -613,6 +653,69 @@ def _toggle_persist(on):
                  if on else "Persistence OFF")
 
 
+def _bind_pipeline(name, orig, target):
+    """TAB 1 · re-point the whole app at a DIFFERENT pipeline module.
+
+    `pipeline` is a module-level global that every callback resolves at CALL
+    time, so rebinding it here redirects Tab 1 analysis, Tab 2 matching, Tab 3
+    render, the auto-pilot and the pre-flight in one move. Nothing captured the
+    module at build time except the engine/language widgets — which is exactly
+    why they are re-derived below, mirroring _switch_tts_engine().
+
+    Deliberately tolerant: a name that was not offered, or that fails to
+    import, reverts the radio and explains itself in the chip. It must never
+    raise, because a raise would leave the radio showing the NEW name while
+    `pipeline` still points at the OLD one — a silent half-switch. Returning a
+    gr.update(value=<current>) keeps the two in step.
+
+    An already-running stage is unaffected: its generator was built from the old
+    module's function before the flip, so it finishes there and the new module
+    takes over from the next stage onward.
+    """
+    global pipeline
+
+    name = (name or "").strip()
+    cur = pipeline.__name__
+    if name not in _PIPELINE_VARIANTS:
+        return (gr.update(value=cur),
+                _chip("err", f"Unknown pipeline {name!r} — still on {cur}"),
+                gr.update(), gr.update(), gr.update(), gr.update())
+
+    try:
+        mod = _load_pipeline(name)
+    except Exception as e:  # a broken experimental twin must not be fatal
+        return (gr.update(value=cur),
+                _chip("err", f"Cannot load {name}.py — still on {cur} · "
+                             f"{type(e).__name__}: {str(e)[:160]}"),
+                gr.update(), gr.update(), gr.update(), gr.update())
+
+    pipeline = mod
+
+    # Same three re-derivations _switch_tts_engine does: the engine radio, and
+    # both language menus, which are engine-scoped and would otherwise keep
+    # advertising languages the new module's engine cannot speak.
+    actual = mod.get_tts_engine()
+    label = mod.TTS_ENGINES.get(actual, {}).get("label", actual)
+    fb = mod.engine_fallback(actual)
+    fb_note = f" · falls back to {fb}" if fb else " · terminal tier"
+    orig_new = mod.language_choices(include_auto=True)
+    tgt_new = mod.language_choices()
+    o_val = orig if any(c == orig for _, c in orig_new) else "auto"
+    t_val = target if any(c == target for _, c in tgt_new) else \
+        (tgt_new[0][1] if tgt_new else None)
+    # ⚠ This tuple must line up with outputs=[pipe_in, pipe_note,
+    # tts_engine_note, tts_engine_in, lang_orig_in, lang_target_in]: the two
+    # RADIOs take a `value`, the two HTML chips take markup. Swapping any pair
+    # leaves a radio holding an HTML string that is not one of its choices —
+    # the switch then looks like it silently did nothing.
+    return (gr.update(value=name),
+            _chip("ok", f"Pipeline: {name} (v{mod.PIPELINE_VARIANT})"),
+            _chip("ok", f"TTS Engine: {label}{fb_note}"),
+            gr.update(choices=mod.engine_choices(), value=actual),
+            gr.update(choices=orig_new, value=o_val),
+            gr.update(choices=tgt_new, value=t_val))
+
+
 def _switch_tts_engine(engine_id, orig, target):
     """Persist the engine, refresh its chip, and re-derive BOTH language menus.
 
@@ -694,6 +797,17 @@ def _pretty_engine(eid: str) -> str:
     return pipeline.TTS_ENGINES.get(eid, {}).get("label", eid).split("  ")[0].strip()
 
 
+def _pipeline_note() -> str:
+    """Tab 1 chip naming the module CURRENTLY driving the app.
+
+    Reads the live global rather than the launch-time choice, so after a
+    switcher flip it reports the new module instead of staying stale.
+    """
+    return _chip("ok", f"Pipeline: {pipeline.__name__} "
+                       f"(v{getattr(pipeline, 'PIPELINE_VARIANT', '?')}) · "
+                       f"engine {_pretty_engine(pipeline.get_tts_engine())}")
+
+
 def _engine_info() -> str:
     """Tab 1 helper copy, computed from the engines THIS build publishes.
 
@@ -753,6 +867,30 @@ def build_ui() -> gr.Blocks:
 
             # ════════════════ TAB 1 · FILE IMPORT & ANALYSIS ════════════════
             with gr.Tab("📂 File Import & Analysis"):
+                # ── 🧩 pipeline switcher — the VERY top of Tab 1 ────────────
+                # Rendered ONLY when the launcher asks for it (see the bind
+                # block at the top of this file), so Colab_Runner.ipynb's Tab 1
+                # is left byte-for-byte as it was.
+                if len(_PIPELINE_VARIANTS) > 1:
+                    with gr.Column(elem_classes=["glass", "pad"]):
+                        gr.Markdown("### 🧩 Active pipeline")
+                        gr.Markdown(
+                            "Pick which build drives the three tabs — **no "
+                            "restart needed**. Both share this session's "
+                            "`outputs/` folder, so an in-flight project carries "
+                            "on where it left off. The switch applies from the "
+                            "**next stage you run**; a stage already iterating "
+                            "finishes on the module it started with.")
+                        pipe_in = gr.Radio(
+                            choices=[(n, n) for n in _PIPELINE_VARIANTS],
+                            value=_PIPELINE_NAME,
+                            label="Pipeline module",
+                            info="The launch default is listed first. "
+                                 "new_pipeline.py is the experimental twin: "
+                                 "edit it freely — a broken copy is reported "
+                                 "here rather than stopping the app.",
+                            interactive=True)
+                        pipe_note = gr.HTML(_pipeline_note())
                 with gr.Row():
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
                         gr.Markdown("### 🎙 TTS Engine — pick the voice synthesizer")
@@ -1147,6 +1285,14 @@ def build_ui() -> gr.Blocks:
                                      lang_target_in],
                              outputs=[tts_engine_note, lang_orig_in,
                                       lang_target_in])
+        # Pipeline switcher — only built when _PIPELINE_VARIANTS has >1 entry,
+        # so this reference is unreachable (and therefore never NameErrors)
+        # on builds without it, e.g. Colab_Runner.ipynb.
+        if len(_PIPELINE_VARIANTS) > 1:
+            pipe_in.change(fn=_bind_pipeline,
+                           inputs=[pipe_in, lang_orig_in, lang_target_in],
+                           outputs=[pipe_in, pipe_note, tts_engine_note,
+                                    tts_engine_in, lang_orig_in, lang_target_in])
         clear_cloud_btn.click(fn=_clear_cloud, inputs=None,
                               outputs=[clear_cloud_msg])
     return demo
