@@ -1873,6 +1873,46 @@ if _on_d is not None:
     check("…and names new_pipeline's real stack (no Pyannote/SenseVoice)",
           "Silero" in _chip_txt and "emotion2vec" in _chip_txt
           and "Pyannote" not in _chip_txt and "SenseVoice" not in _chip_txt)
+# ── § 19c · "Auto" must never reach int() ────────────────────────────────────
+# `spk_hint_in` is a gr.Dropdown with choices=["Auto","1"…"10"] and
+# value="Auto", so `num_speakers` arrives as a STRING on every run. The old
+# `int(num_speakers) if num_speakers else 0` only guarded the empty case and
+# died with `invalid literal for int() with base 10: 'Auto'` — before Step 3
+# ever started.
+_lines = _app_src.splitlines()
+
+
+def _fn_src(name: str) -> str:
+    for _n in _app_tree.body:
+        if isinstance(_n, _ast.FunctionDef) and _n.name == name:
+            return "\n".join(_lines[_n.lineno - 1:_n.end_lineno])
+    return ""
+
+
+_sh_node = next((_n for _n in _app_tree.body
+                 if isinstance(_n, _ast.FunctionDef)
+                 and _n.name == "_speaker_hint"), None)
+check("app defines a _speaker_hint() converter", _sh_node is not None)
+if _sh_node is not None:
+    # Exec just that one function — importing all of app.py would run Gradio.
+    _ns: dict = {}
+    exec(compile(_ast.Module(body=[_sh_node], type_ignores=[]),
+                 "app.py", "exec"), _ns)
+    _hint = _ns["_speaker_hint"]
+    check("_speaker_hint maps the dropdown's 'Auto' to 0 (auto-detect)",
+          _hint("Auto") == 0)
+    check("_speaker_hint survives '', None and arbitrary text",
+          _hint("") == 0 and _hint(None) == 0 and _hint("four") == 0)
+    check("_speaker_hint still honours a real numeric hint",
+          _hint("3") == 3 and _hint(3) == 3 and _hint(10) == 10)
+    check("_speaker_hint clamps a negative hint to 0", _hint("-4") == 0)
+
+for _fn in ("_run_matching", "_run_full_auto"):
+    _fs = _fn_src(_fn)
+    check(f"{_fn} converts num_speakers through _speaker_hint",
+          "_speaker_hint(num_speakers)" in _fs
+          and "int(num_speakers) if" not in _fs)
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

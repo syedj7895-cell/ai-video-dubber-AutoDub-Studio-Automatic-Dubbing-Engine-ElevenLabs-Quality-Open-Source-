@@ -438,6 +438,28 @@ def _refresh_tables():
             _sidecar_rows("EMOTION_GRID_CSV"))
 
 
+def _speaker_hint(value) -> int:
+    """TAB 2 · '👥 Expected speakers' dropdown → int, where 0 means "detect it".
+
+    The control is a `gr.Dropdown` with `choices=["Auto","1",…"10"]` and
+    `value="Auto"`, so it ALWAYS hands us a string — never a number. The old
+    `int(num_speakers) if num_speakers else 0` evaluated `int("Auto")` and
+    raised `ValueError: invalid literal for int() with base 10: 'Auto'`, which
+    killed Tab 2 before Step 3 started.
+
+    The guard only handled the empty/`None` case; "Auto" is a non-empty string
+    and so sailed straight into `int()`. Anything non-numeric means
+    auto-detect, i.e. 0 — which is what `run_script_matching` and both
+    pipelines already treat as "no hint".
+    """
+    if value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _run_matching(token, srt_o, srt_t, num_speakers, diagnostic):
     """TAB 2 · steps 3–5 → (console, dataframe, emotion log, clones, status)."""
     yield "⏳ Booting speaker matching …", None, None, None, _chip("run", "Steps 3–5 in progress")
@@ -445,7 +467,7 @@ def _run_matching(token, srt_o, srt_t, num_speakers, diagnostic):
     try:
         for line in pipeline.run_script_matching(
                 _fp(token), _fp(srt_o), _fp(srt_t), force=False,
-                num_speakers=int(num_speakers) if num_speakers else 0,
+                num_speakers=_speaker_hint(num_speakers),
                 diagnostic=bool(diagnostic)):
             last = line
             yield line, None, None, None, _chip("run", "Steps 3–5 in progress")
@@ -513,7 +535,7 @@ def _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers, tra
     s_start = len(con["text"])
     for line in pipeline.run_script_matching(
             _fp(token), _fp(srt_o), _fp(srt_t), force=False,
-            num_speakers=int(num_speakers) if num_speakers else 0,
+            num_speakers=_speaker_hint(num_speakers),
             diagnostic=bool(diagnostic)):
         yield emit_stage(line, "run", s_start, "Tab 2 - steps 3-5 running")
     if _stop_event.is_set():
