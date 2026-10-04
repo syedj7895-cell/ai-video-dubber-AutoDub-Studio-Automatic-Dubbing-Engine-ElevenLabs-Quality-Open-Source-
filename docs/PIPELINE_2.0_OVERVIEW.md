@@ -36,6 +36,7 @@ A second, **optional** variable — `AUTODUB_PIPELINE_VARIANTS`, comma-separated
 - **Can't contradict reality.** The launch module is always offered first and is always the radio's default; anything else is appended. A name that is missing or malformed drops out instead of becoming a broken option.
 - **Session state survives.** Both modules derive `BASE_DIR` from their own `__file__` in the same directory, so they share `outputs/state.json` and the rest of `outputs/`. A switch applies from the **next** stage run; a stage already iterating finishes on the module it started with.
 - **Failure is contained.** `_load_pipeline()` caches per name, and loading is lazy, so a syntax error in the experimental twin is reported in the switcher's chip rather than preventing the app from booting. Rejection is a true no-op: the module active before the call stays active and the radio is pulled back to it.
+- **Self-reporting.** `app.py` prints one banner block to the cell output *before* Gradio starts: bound build and module, launch directory, engines offered, both env vars, and whether the switcher is ON. Both notebooks clone the **same** folder, so nothing on disk can tell them apart — without that line, launching the wrong one is indistinguishable from a broken UI. When the switcher is OFF *and* `pipeline2.py` sits next to `app.py`, the banner adds the explicit *"this is the 1.0 build"* note; when the 2.0 build is bound but the switcher is off, it says that instead. Deliberately ASCII: stdout is a pipe under Colab and when redirected on Windows, where a `─` raises `UnicodeEncodeError` under cp1252.
 
 `pipeline2.py` differs from `pipeline.py` by **exactly 31 diff lines** = 1 replaced header line + 18 added header lines + 2 identity constants (verified with `diff pipeline.py pipeline2.py | wc -l`):
 
@@ -59,10 +60,10 @@ Measured from the working tree (`wc -l` + `ls -la`).
 | File | Bytes | Lines | Role in 2.0 |
 |---|---:|---:|---|
 | `pipeline2.py` | 210,870 | **4,568** | **The engine 2.0 runs.** 8 steps, engine registry, OOM defense, persistence |
-| `new_pipeline.py` | 210,870 | 4,568 | Byte-identical twin of `pipeline2.py` at creation — the module Tab 1's switcher flips **to**, so it can be edited without touching `pipeline2.py` |
+| `new_pipeline.py` | 234,980 | 5,032 | Twin of `pipeline2.py` at creation (byte-identical until its Step 3/4 stack was swapped for Silero-VAD + CAM++ + emotion2vec, §9 · 10) — the module Tab 1's switcher flips **to**, so it can be edited without touching `pipeline2.py` |
 | `pipeline.py` | 209,516 | 4,550 | Original 1.0 engine — *not run by 2.0* (kept as the diff baseline) |
-| `app.py` | 67,639 | 1,318 | Gradio glassmorphism UI, 3 tabs, auto-pilot, engine binding, Tab 1 pipeline switcher |
-| `tools/selftest.py` | 85,369 | 1,766 | 330-check offline regression suite (no GPU required) |
+| `app.py` | 76,621 | 1,495 | Gradio glassmorphism UI, 3 tabs, auto-pilot, engine binding, Tab 1 pipeline switcher, launch banner |
+| `tools/selftest.py` | 97,878 | 2,005 | 366-check offline regression suite (no GPU required) |
 | `tts_tester.py` | 40,969 | 888 | Standalone TTS probe harness |
 | `fish_s2_probe.py` | 23,762 | 569 | Fish-S2 backend diagnostic |
 | `build_secure.py` | 14,077 | 323 | Cython obfuscation builder |
@@ -107,7 +108,7 @@ Measured from the working tree (`wc -l` + `ls -la`).
 | 4 | gradio-client realign + audit | Fixes Colab's stale `gradio-client 1.3.0` (bool-schema `/api/info` crash) to gradio's own pin |
 | 5 (4b) | **Cache check / restore** | HF-Hub → Google-Drive priority; explicit 401-vs-empty reporting |
 | 6 | **Persistence + pre-download** | Drive/HF persistence, then pre-downloads SenseVoice, the 6 Chatterbox files, and both pyannote repos |
-| 7 | 🚀 Launch | Sets `AUTODUB_PIPELINE=pipeline2` (which build runs) and `AUTODUB_PIPELINE_VARIANTS=pipeline2,new_pipeline` (turns on Tab 1's switcher), starts `app.py` → prints the `https://….gradio.live` link |
+| 7 | 🚀 Launch | Steps into the clone whatever the kernel's cwd is, sets `AUTODUB_PIPELINE=pipeline2` (which build runs) and `AUTODUB_PIPELINE_VARIANTS=pipeline2,new_pipeline` (turns on Tab 1's switcher), **echoes both variables**, then starts `app.py` → its launch banner names the build it bound, and it prints the `https://….gradio.live` link |
 
 ---
 
@@ -380,6 +381,7 @@ Auth subtleties documented in `README.md:433-455`: the repo is **private**, so r
 10. **FIXED · `new_pipeline.py` moved Silero-VAD onto the GPU and broke itself.** `_load_silero_vad()` did `model.to(device)`; the TorchScript bundle keeps its LSTM state (`_h`/`_c`/`_context`) inside the script as non-buffers, so on a T4 the weights landed on `cuda:0` while the state stayed on `cpu` and the first forward pass raised `Expected all tensors to be on the same device…`. Step 3 caught it and fell back to the energy VAD, so the *symptom* was a quieter diarization rather than a crash — which is exactly why it survived a release. Silero is now pinned to the CPU on purpose and `_vad_regions()` aligns the waveform with `_module_device(vad_model)`; both are locked by `tools/selftest.py`.
 11. **FIXED · Tab 3's 🛑 STOP button was rendered but never bound.** `stop_btn = gr.Button("🛑 STOP")` at `app.py` had no `.click()` handler at all (`pyflakes` reported `local variable 'stop_btn' is assigned to but never used` on every run), so `_stop_auto()` and the `_stop_event` the auto-pilot polls between stages could never be triggered from the UI, despite the caption promising "STOP halts between stages". With `demo.queue()` at the default concurrency the only way to abort a runaway render was killing the Colab cell — which the browser reports as **"Connection to the server was lost"**. The handler is now wired, and the comment records *why* it must not be given a shared `concurrency_id`: Gradio keys its queues by `concurrency_id or str(id(fn))`, so two distinct functions are two distinct queues and the click is dispatched while `_run_full_auto` is still streaming.
 12. **The launch cell must not assume the kernel is already inside the clone.** Cell 7 runs `!python app.py`, and `!` inherits the kernel's cwd. Cell 3 does the `git clone` + `os.chdir`, so a *fresh* runtime — or a browser reload, which resets cwd to `/content` — that runs cell 7 alone dies with `python3: can't open file '/content/app.py': [Errno 2] No such file or directory`. Cell 7 now steps into whichever of `os.getcwd()` / `ai-video-dubber` actually contains `app.py` before launching. "Run all" was always safe; running the last cell by itself was not.
+13. **FIXED · "the UI looks like the other notebook's" had no way to be diagnosed.** Both notebooks clone the same repo into the same folder, so the *only* difference between AutoDub Studio 2.0 (`pipeline2`, Chatterbox-only, Tab 1 switcher on) and `Colab_Runner.ipynb` (`pipeline`, six engines, no switcher) is the two env vars set inside the launch cell. Launch it any other way — a bare `python app.py`, a stale cell, or a browser tab still pointed at a previous `https://…gradio.live` link — and you get the 1.0 UI with nothing on screen saying why. Measured, not inferred: env set ⇒ **157 blocks** and a `Pipeline module` radio; env unset ⇒ **151 blocks** and a six-entry engine radio, same tabs, same CSS. `app.py` now prints a launch banner (build · module · launch dir · engines · both env vars · switcher ON/OFF) and cell 7 echoes both env vars *before* `!python app.py`, so the cell output names the build it started. All three configurations are asserted by `tools/selftest.py`.
 
 ---
 
@@ -404,7 +406,7 @@ Tab 1 radio  →  resolve_engine()  →  TTS_ENGINES  →  EngineRuntime
                         writes outputs/engine_error.log, Step 8 skipped
 ```
 
-**Verified invariants (asserted by `tools/selftest.py`, 330 checks):**
+**Verified invariants (asserted by `tools/selftest.py`, 366 checks):**
 
 - `diff pipeline.py pipeline2.py` = 31 lines (1 replaced + 18 added + 2 constants)
 - `PIPELINE_VARIANT` / `ENGINE_ALLOWLIST` are the only identity differences

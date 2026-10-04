@@ -1078,7 +1078,8 @@ _SEL = (
     "    p = app.pipeline\n"
     "    out = {'module': p.__name__, 'variant': p.PIPELINE_VARIANT,\n"
     "           'engines': list(p.TTS_ENGINES),\n"
-    "           'missing_api': [n for n in %r if not hasattr(p, n)]}\n"
+    "           'missing_api': [n for n in %r if not hasattr(p, n)],\n"
+    "           'banner': getattr(app, '_launch_banner', lambda: '')()}\n"
     "except RuntimeError as e:\n"
     "    out = {'error': str(e)}\n"
     "print(json.dumps(out))\n"
@@ -1113,6 +1114,16 @@ else:
           _sel_d.get("engines") == ["chatterbox"])
     check("…and pipeline2 carries every name app.py needs",
           _sel_d.get("missing_api") == [])
+    # The banner is the ONLY place the running process says which build it is:
+    # both notebooks clone one folder, so a wrong launch is otherwise just a UI
+    # that "looks like the other notebook's".
+    _b2 = _sel_d.get("banner") or ""
+    check("…and its launch banner reports the 2.0 build + a bare env",
+          "build 2.0" in _b2 and "module pipeline2" in _b2
+          and "AUTODUB_PIPELINE         = 'pipeline2'" in _b2)
+    check("…and it blames the missing SWITCHER, not the wrong build",
+          "build 2.0 with the switcher off" in _b2
+          and "this is the 1.0 build" not in _b2)
 
 _base_d, _err = _sel()
 if _base_d is None:
@@ -1126,6 +1137,12 @@ else:
           len(_base_d.get("engines") or []) == 6)
     check("…and pipeline.py carries every name app.py needs",
           _base_d.get("missing_api") == [])
+    # The Colab_Runner banner must NAME the trap it is in: the studio's own
+    # pipeline2.py is sitting next to app.py, unbound, so the fix is one env var.
+    _b1 = _base_d.get("banner") or ""
+    check("…and the unset banner warns this is the 1.0 build, with the fix",
+          "build 1.0" in _b1 and "this is the 1.0 build" in _b1
+          and "AUTODUB_PIPELINE=pipeline2" in _b1)
 
 _bad_d, _err = _sel(AUTODUB_PIPELINE="../evil")
 if _bad_d is None:
@@ -1392,6 +1409,7 @@ _SWITCH = (
     "         if x.get('api_name') == '_bind_pipeline']\n"
     "out = {'variants': list(app._PIPELINE_VARIANTS),\n"
     "       'bound': app.pipeline.__name__,\n"
+    "       'banner': app._launch_banner(),\n"
     "       'switcher': len(radios),\n"
     "       'choice_vals': [c[1] for c in radios[0]['props']['choices']] if radios else [],\n"
     "       'default': radios[0]['props'].get('value') if radios else None,\n"
@@ -1455,6 +1473,13 @@ else:
           "TTS Engine:" in (_on_d.get("eng_chip") or ""))
     check("…and the engine radio is re-derived with it",
           _on_d.get("eng_vals") == ["chatterbox"])
+    # Same process, switcher ON: the banner must agree with the radio rather
+    # than leaving the launch line contradicting the visible UI.
+    _b0 = _on_d.get("banner") or ""
+    check("the launch banner lists the switcher it just built",
+          "Tab 1 switcher  : ON" in _b0
+          and "pipeline2 | new_pipeline" in _b0
+          and "1.0 build" not in _b0)
     # Rejection must be a true NO-OP: the module active before the call stays
     # active, and the radio is pulled back to it rather than left on the name
     # that was clicked (a half-switch would look like it silently worked).

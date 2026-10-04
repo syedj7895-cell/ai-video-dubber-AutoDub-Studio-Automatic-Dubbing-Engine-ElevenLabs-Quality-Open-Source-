@@ -1427,6 +1427,54 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+def _launch_banner() -> str:
+    """Report which build this PROCESS bound, printed before Gradio starts.
+
+    Both notebooks clone the SAME folder, so nothing on disk distinguishes
+    them: the only difference between AutoDub Studio 2.0 (pipeline2, Chatterbox
+    only, Tab 1 switcher ON) and Colab_Runner (pipeline, six engines) is
+    AUTODUB_PIPELINE / AUTODUB_PIPELINE_VARIANTS in the child's environment. A
+    bare `python app.py` sets neither and renders the 1.0 UI, which is
+    indistinguishable from "the wrong notebook ran" unless the cell output says
+    so — and the symptom is otherwise just "the UI looks like the other one".
+    Deliberately ASCII: stdout is a pipe under Colab and when redirected on
+    Windows, where a box-drawing char raises UnicodeEncodeError under cp1252.
+    """
+    def _env(name: str) -> str:
+        return repr(os.environ[name]) if os.environ.get(name) else "unset"
+
+    out = ["-" * 64,
+           f" app.py  |  build {getattr(pipeline, 'PIPELINE_VARIANT', '?')}"
+           f"  |  module {pipeline.__name__}",
+           f" launch dir      : {BASE_DIR}",
+           f" engines offered : {', '.join(pipeline.TTS_ENGINES) or '(none)'}",
+           f" AUTODUB_PIPELINE         = {_env('AUTODUB_PIPELINE')}",
+           f" AUTODUB_PIPELINE_VARIANTS = {_env('AUTODUB_PIPELINE_VARIANTS')}"]
+    if len(_PIPELINE_VARIANTS) > 1:
+        out.append(" Tab 1 switcher  : ON  ->  "
+                   + " | ".join(_PIPELINE_VARIANTS))
+    else:
+        out.append(" Tab 1 switcher  : OFF (unset, or no listed name had a "
+                   "matching .py file)")
+        # Two DIFFERENT reasons to be switcher-less, and they need different
+        # advice: the bound module is the wrong build (pipeline2.py is sitting
+        # right there, unbound), or the right build simply has no twins listed.
+        if getattr(pipeline, "PIPELINE_VARIANT", "?") != "2.0" \
+                and (BASE_DIR / "pipeline2.py").is_file():
+            out.append(" NOTE: this is the 1.0 build - six engines, no "
+                       "switcher. AutoDub Studio 2.0")
+            out.append("       launches it as AUTODUB_PIPELINE=pipeline2 "
+                       "(see AutoDub Studio 2.0.ipynb).")
+        elif (BASE_DIR / "new_pipeline.py").is_file():
+            out.append(f" NOTE: build {getattr(pipeline, 'PIPELINE_VARIANT', '?')}"
+                       " with the switcher off - add "
+                       "AUTODUB_PIPELINE_VARIANTS=")
+            out.append(f"       {pipeline.__name__},new_pipeline to offer the "
+                       "Tab 1 module switch.")
+    out.append("-" * 64)
+    return "\n".join(out)
+
+
 def _in_colab() -> bool:
     try:
         import google.colab  # noqa: F401  (type: ignore)
@@ -1436,6 +1484,7 @@ def _in_colab() -> bool:
 
 
 if __name__ == "__main__":
+    print(_launch_banner(), flush=True)
     demo = build_ui()
     launch_kwargs = dict(
         share=_in_colab(),                     # public link when on Colab
