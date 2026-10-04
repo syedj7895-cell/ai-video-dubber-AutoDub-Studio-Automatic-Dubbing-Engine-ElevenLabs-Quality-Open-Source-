@@ -13,6 +13,7 @@
 | Build | Launcher | Pipeline module | Engines published | Default engine |
 |---|---|---|---|---|
 | **AutoDub Studio 2.0** | `AutoDub Studio 2.0.ipynb` | **`pipeline2.py`** | **Chatterbox only** | **Chatterbox** |
+| AutoDub Studio 2.0 · experimental twin | same, via the Tab 1 switcher | **`new_pipeline.py`** | Chatterbox only | Chatterbox |
 | Original (1.0) | `Colab_Runner.ipynb` | `pipeline.py` | all six | CosyVoice 2.0 |
 
 The binding happens at the top of `app.py`:
@@ -61,7 +62,7 @@ Measured from the working tree (`wc -l` + `ls -la`).
 | `new_pipeline.py` | 210,870 | 4,568 | Byte-identical twin of `pipeline2.py` at creation — the module Tab 1's switcher flips **to**, so it can be edited without touching `pipeline2.py` |
 | `pipeline.py` | 209,516 | 4,550 | Original 1.0 engine — *not run by 2.0* (kept as the diff baseline) |
 | `app.py` | 67,639 | 1,318 | Gradio glassmorphism UI, 3 tabs, auto-pilot, engine binding, Tab 1 pipeline switcher |
-| `tools/selftest.py` | 70,865 | 1,497 | 281-check offline regression suite (no GPU required) |
+| `tools/selftest.py` | 85,369 | 1,766 | 330-check offline regression suite (no GPU required) |
 | `tts_tester.py` | 40,969 | 888 | Standalone TTS probe harness |
 | `fish_s2_probe.py` | 23,762 | 569 | Fish-S2 backend diagnostic |
 | `build_secure.py` | 14,077 | 323 | Cython obfuscation builder |
@@ -122,6 +123,16 @@ Measured from the working tree (`wc -l` + `ls -la`).
 | 6 | `split_speaker_scripts` | custom sanitiser | CPU | `speaker_scripts.json`, `Project_<Speaker>.txt` |
 | 7 | `synthesize` | **Chatterbox** (+ librosa stretch) | GPU → flush | `track_speakerN.wav`, `tts_report.json` |
 | 8 | `mixdown` | numpy + soundfile + FFmpeg | CPU | `final_mix.wav`, `final_dubbed.mp4` |
+
+**Steps 3 and 4 differ by build.** The table above is `pipeline2.py` (the default). `new_pipeline.py` — selectable from the Tab 1 switcher — swaps exactly those two rows for an ungated stack and leaves Steps 1, 2 and 5–8 identical:
+
+| Step | `pipeline2.py` (default) | `new_pipeline.py` (experimental) |
+|---|---|---|
+| 3 | **Pyannote 3.1** + librosa pYIN gender | **Silero-VAD → FunASR CAM++ 192-d → scikit-learn agglomerative** + librosa pYIN gender |
+| 4 | **SenseVoice-Small** | **`iic/emotion2vec_plus_large`** |
+| gate | Pyannote repos are **gated** — an HF token is required | **none** — `NEEDS_HF_TOKEN = False` |
+
+`STEP34_TOOLS`, `DIAR_ENGINE` and `NEEDS_HF_TOKEN` are published by each module, and app.py's Tab 1 chip reads them, so the UI always names the stack that will actually run. The JSON artifacts (`diarization_map.json`, `emotion_grid.json`) keep their exact shape across both builds — Steps 5–7 read them by key and cannot tell the swap happened.
 
 **Design rule** (`pipeline2.py:32-35`): *exactly one heavy model lives on the GPU at any moment.* Every model step ends with `clear_gpu_cache()` (`pipeline2.py:213`) = drop reference → `gc.collect()` → `torch.cuda.empty_cache()`. All heavy imports are **lazy, inside step functions**, so importing the module is instant and the UI opens even without torch installed.
 
@@ -262,6 +273,23 @@ In 2.0 this is Chatterbox-only. Mechanism:
 | 9 | Chatterbox ve / conds / grapheme / Cangjie | `ResembleAI/chatterbox` | **7.8 MB** combined | MIT | none |
 | 10 | *(opt-in)* Hindi T3 finetune | `ResembleAI/Chatterbox-Multilingual-hi` | 2,144.0 MB | MIT | none |
 
+**Rows 2–6 are the *default* build.** `new_pipeline.py` (Tab 1 switcher) substitutes Steps 3 and 4 only, with everything ungated:
+
+| # | Model | Repo | Size (measured) | License | Gate |
+|---|---|---|---|---|---:|
+| 3a | Silero-VAD | PyPI `silero_vad` 6.2.3 wheel (bundles JIT + ONNX + states) | **11.3 MB** (11,317,527 B) | MIT | none |
+| 3b | CAM++ speaker embedding | `iic/speech_campplus_sv_en_voxceleb_16k` (ModelScope) | **30.4 MB** (30,431,202 B) | Apache-2.0 | none |
+| 4a | emotion2vec+ large | HF `emotion2vec/emotion2vec_plus_large` → `model.pt` | **1,945.8 MB** (1,945,790,254 B) | FunASR model-license | none |
+
+⚠️ **The saving here is gating, not weight.** Measured against the default build:
+
+- **Step 3 is size-neutral:** 43.4 MB gated (10.9 + 5.9 + 26.6) → 41.7 MB ungated (11.3 + 30.4). What disappears is the HF token and the two "Agree and access repository" checkboxes.
+- **Step 4 gets BIGGER, not smaller:** 936.3 MB → 1,945.8 MB = **+1,009.5 MB**, in exchange for emotion2vec+'s **9** classes where the ModelScope path would return 4.
+
+Net model cache for `new_pipeline.py` is therefore roughly **+1.0 GB** versus `pipeline2.py` (~4.27 GB → ~5.3 GB), while Steps 3–4 become completely gate-free. The previously quoted "−1 GB pyannote, −944 MB SenseVoice" is **wrong on both counts** and should not be reused: Pyannote's weights are ~43 MB, not 1 GB (the ~1 GB figure in §5 refers to the whole `pyannote.audio` dependency install, not the checkpoints), and emotion2vec+ costs more than SenseVoice saves.
+
+Sizes above come from the HF API (`usedStorage` / per-file `size`) and the ModelScope API (`StorageSize`), not from an estimate.
+
 **Steady-state 2.0 model cache ≈ 4,183 MB (4.08 GiB)** + 84 MB Demucs ⇒ **≈ 4.27 GB (~4.2 GiB)**. Two independent confirmations:
 
 - `README.md:405` states "Model caches (one-time) **~5 GB**" — close, and slightly conservative.
@@ -369,7 +397,7 @@ Tab 1 radio  →  resolve_engine()  →  TTS_ENGINES  →  EngineRuntime
                         writes outputs/engine_error.log, Step 8 skipped
 ```
 
-**Verified invariants (asserted by `tools/selftest.py`, 281 checks):**
+**Verified invariants (asserted by `tools/selftest.py`, 330 checks):**
 
 - `diff pipeline.py pipeline2.py` = 31 lines (1 replaced + 18 added + 2 constants)
 - `PIPELINE_VARIANT` / `ENGINE_ALLOWLIST` are the only identity differences

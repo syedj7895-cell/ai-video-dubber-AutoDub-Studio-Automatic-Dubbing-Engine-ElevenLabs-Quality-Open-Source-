@@ -1492,6 +1492,276 @@ check("a path-shaped variant name is never offered as a choice",
       _evil_v is None or ("../evil" not in (_evil_v.get("choice_vals") or [])
                           and _evil_v.get("switcher") == 0))
 
+
+# ── § 18 · Steps 3 & 4 · the ungated stack, its CSV side-cars, its labels ─────
+# new_pipeline.py replaces the GATED Pyannote 3.1 diarizer and SenseVoice-Small
+# with Silero-VAD + FunASR CAM++ + sklearn clustering and emotion2vec_plus_large.
+# Steps 5-7 must not notice the swap: diarization_map.json and emotion_grid.json
+# keep their exact shape. So this section pins the engines themselves, the four
+# CSV side-cars now emitted alongside the frozen JSON, the 9→7 emotion label
+# table, and the two Tab 2 input-order bugs fixed in app.py.
+try:
+    _npl = _il.import_module("new_pipeline")
+except Exception as _e:            # a broken twin must FAIL the suite, not pass
+    _npl, _np_err = None, f"{type(_e).__name__}: {_e}"
+else:
+    _np_err = ""
+
+check("new_pipeline imports cleanly", _npl is not None)
+if _npl is None:
+    print(_np_err)
+
+if _npl is not None:
+    # ── engine identity: who runs Steps 3 & 4 now ───────────────────────────
+    check("Step 3/4 engine string names the ungated stack (silero + campplus)",
+          "silero" in _npl.DIAR_ENGINE.lower()
+          and "campplus" in _npl.DIAR_ENGINE.lower())
+    check("emotion model is emotion2vec_plus_large (keeps all 9 classes)",
+          "emotion2vec_plus_large" in _npl.EMOTION2VEC_MODEL)
+    check("CAMPPlus repo is the public VoxCeleb checkpoint",
+          "voxceleb" in _npl.CAMPPLUS_MODEL.lower())
+    check("STEP34_TOOLS is published for the Tab 1 chip",
+          bool(getattr(_npl, "STEP34_TOOLS", "")))
+    check("NEEDS_HF_TOKEN is False — Steps 3/4 gate nothing",
+          getattr(_npl, "NEEDS_HF_TOKEN", None) is False)
+    check("legacy model ids survive as inert string aliases only",
+          isinstance(getattr(_npl, "PYANNOTE_MODEL", None), str)
+          and isinstance(getattr(_npl, "SENSEVOICE_MODEL", None), str))
+
+    # ── pyannote / SenseVoice must be OUT of the active path ────────────────
+    # Tested on the AST, NOT on raw source: both functions still carry
+    # docstrings/comments saying "UNCHANGED from the Pyannote version". Those
+    # document the swap, they do not perform it. Only an import or a string
+    # literal can actually reach a model, so those are what we check.
+    _s3_src = inspect.getsource(_npl.step3_diarization)
+    _s4_src = inspect.getsource(_npl.step4_emotion_analysis)
+    _s3, _s4 = _s3_src.lower(), _s4_src.lower()
+
+    def _live(fn):
+        """(imported module roots, string literals) inside `fn`, minus its
+        docstring and its comments — i.e. only what the interpreter can act on."""
+        _t = _ast.parse(inspect.getsource(fn))
+        _d = _t.body[0]
+        _body = list(_d.body) if isinstance(_d, _ast.FunctionDef) else list(_t.body)
+        if (_body and isinstance(_body[0], _ast.Expr)
+                and isinstance(_body[0].value, _ast.Constant)
+                and isinstance(_body[0].value.value, str)):
+            _body = _body[1:]
+        _mods, _strs = set(), set()
+        for _top in _body:
+            for _nd in _ast.walk(_top):
+                if isinstance(_nd, _ast.Import):
+                    _mods.update(a.name.split(".")[0] for a in _nd.names)
+                elif isinstance(_nd, _ast.ImportFrom) and _nd.module:
+                    _mods.add(_nd.module.split(".")[0])
+                elif isinstance(_nd, _ast.Constant) and isinstance(_nd.value, str):
+                    _strs.add(_nd.value)
+        return _mods, _strs
+
+    _m3, _t3 = _live(_npl.step3_diarization)
+    _m4, _t4 = _live(_npl.step4_emotion_analysis)
+    check("step3 imports no pyannote module", "pyannote" not in _m3)
+    check("step3 names no gated speaker-diarization repo",
+          not any("speaker-diarization" in _s for _s in _t3))
+    check("step3 runs silero-vad through the shared VAD region helper",
+          "silero" in _s3 and "_vad_regions" in _s3)
+    check("step3 still writes the frozen diarization_map.json",
+          _npl.DIARIZATION_JSON.name == "diarization_map.json"
+          and "DIARIZATION_JSON" in _s3_src)
+    check("step4 loads no SenseVoice model",
+          "sensevoice" not in _m4
+          and not any("sensevoice" in _s.lower() for _s in _t4))
+    check("step4 loads emotion2vec+ and reads utterance granularity",
+          "emotion2vec" in _s4 and "utterance" in _s4)
+    check("step4 still writes the frozen emotion_grid.json",
+          _npl.EMOTION_GRID_JSON.name == "emotion_grid.json"
+          and "EMOTION_GRID_JSON" in _s4_src)
+
+    # ── the Step 3 primitives the rewrite is built from ─────────────────────
+    for _fn in ("_load_silero_vad", "_vad_regions", "_campplus_embed",
+                "_cluster_speakers", "_write_csv", "_normalise_emotion"):
+        check(f"new_pipeline defines {_fn}()", callable(getattr(_npl, _fn, None)))
+
+    check("_cluster_speakers signature is (embs, n_hint, log)",
+          list(inspect.signature(_npl._cluster_speakers).parameters)
+          == ["embs", "n_hint", "log"])
+    check("legacy PYANNOTE/SENSEVOICE ids are never called as models",
+          "PYANNOTE_MODEL" not in _s3 and "SENSEVOICE_MODEL" not in _s4)
+
+
+    # ── the four CSV side-cars ──────────────────────────────────────────────
+    _CSVS = (("SPEAKER_TURNS_CSV", "speaker_turns.csv"),
+             ("DIAR_CUES_CSV", "diarization_cues.csv"),
+             ("EMOTION_GRID_CSV", "emotion_grid.csv"),
+             ("LINE_FIT_CSV", "line_fit_report.csv"))
+    check("all four CSV side-car paths are published as Path objects",
+          all(isinstance(getattr(_npl, _a, None), Path) for _a, _ in _CSVS))
+    check("all four side-cars land in outputs/ under the expected filename",
+          all(getattr(_npl, _a).parent.name == "outputs"
+              and getattr(_npl, _a).name == _n for _a, _n in _CSVS))
+    check("speaker_turns.csv header is [Speaker ID, Start_Time, End_Time]",
+          '["Speaker ID", "Start_Time", "End_Time"]' in _s3_src)
+    check("diarization_cues.csv adds the Text column",
+          '["Speaker ID", "Start_Time", "End_Time", "Text"]' in _s3_src)
+    check("emotion_grid.csv header adds the Emotion column",
+          '["Speaker ID", "Start_Time", "End_Time", "Emotion"]' in _s4_src)
+
+    # ── 9-class emotion2vec+ label → 7 canonical emotions ──────────────────
+    _EMO_CASES = (("生气/angry", "angry"), ("厌恶/disgusted", "disgusted"),
+                  ("恐惧/fearful", "fearful"), ("开心/happy", "happy"),
+                  ("中立/neutral", "neutral"), ("其他/other", "neutral"),
+                  ("难过/sad", "sad"), ("吃惊/surprised", "surprised"),
+                  ("未知/unknown", "neutral"), ("", "neutral"),
+                  ("angry", "angry"), (None, "neutral"))
+    _wrong = [_c for _c in _EMO_CASES
+              if _npl._normalise_emotion(_c[0]) != _c[1]]
+    check(f"_normalise_emotion maps all {len(_EMO_CASES)} label forms correctly",
+          not _wrong)
+    if _wrong:
+        print(f"   mismatches: "
+              f"{[(i, _npl._normalise_emotion(i), o) for i, o in _wrong]}")
+    check("unknown / GASP / blank labels degrade to 'neutral', never raise",
+          _npl._normalise_emotion("GASP") == "neutral"
+          and _npl._normalise_emotion("not-a-label") == "neutral")
+    check("every emotion2vec+ label collapses into the 7 canonical emotions",
+          len(_npl.EMOTIONS) == 7
+          and all(v in _npl.EMOTIONS for v in _npl.EMOTION2VEC_MAP.values()))
+    check("Chatterbox exaggeration table covers all 7 canonical emotions",
+          all(k in _npl.EMOTIONS for k in getattr(_npl, "_CHATTER_EXAG", {})))
+
+    # ── Step 7 · two-way per-line fit + its side-car ────────────────────────
+    _s7_src = inspect.getsource(_npl.step7_synthesize)
+    check("step7 exposes both fit caps as plain arguments",
+          {"fit_max_speed", "fit_min_speed", "fit_stretch_short"}
+          <= set(inspect.signature(_npl.step7_synthesize).parameters))
+    check("step7 may SLOW a short line down, not only speed a long one up",
+          "fit_stretch_short" in _s7_src and '"stretched"' in _s7_src)
+    check("step7 keeps the hard-snap + 30 ms fade as the last resort",
+          "last resort" in _s7_src and "linspace(1.0, 0.0" in _s7_src)
+    check("step7 writes line_fit_report.csv with per-row Rate and Mode",
+          "LINE_FIT_CSV" in _s7_src and '"Rate", "Mode"' in _s7_src)
+    check("step7 progress log no longer calls a speed-up a 'stretch'",
+          "overlap-protection stretch" not in _s7_src)
+
+# ── § 19 · app.py · Tab 2 side-car tables + the two input-order bugs ──────────
+_app_src = (Path(_ROOT) / "app.py").read_text(encoding="utf-8")
+_app_tree = _ast.parse(_app_src)
+
+
+def _wired(btn: str, arg: str):
+    """Names inside `<btn>.click(..., <arg>=[...])`, in source order."""
+    for _n in _ast.walk(_app_tree):
+        if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
+                and _n.func.attr == "click" and isinstance(_n.func.value, _ast.Name)
+                and _n.func.value.id == btn):
+            for _kw in _n.keywords:
+                if _kw.arg == arg and isinstance(_kw.value, _ast.List):
+                    return [getattr(_e, "id", None) for _e in _kw.value.elts]
+    return None
+
+
+def _fn_params(name: str):
+    for _n in _app_tree.body:
+        if isinstance(_n, _ast.FunctionDef) and _n.name == name:
+            return [a.arg for a in _n.args.args]
+    return None
+
+
+def _ret_widths(fn: str):
+    """Widths of the literal tuples `fn` RETURNS (helper-shaped callables)."""
+    for _n in _ast.walk(_app_tree):
+        if isinstance(_n, _ast.FunctionDef) and _n.name == fn:
+            return sorted({len(_r.value.elts) for _r in _ast.walk(_n)
+                           if isinstance(_r, _ast.Return)
+                           and isinstance(_r.value, _ast.Tuple)})
+    return []
+
+
+def _yield_widths(fn: str, _seen=None):
+    """Every distinct tuple width `fn` can hand to Gradio.
+
+    app.py uses both shapes: a literal `yield a, b, c`, and
+    `yield helper(...)`, where the tuple is RETURNED by the helper. A bare
+    `yield from other()` is followed too, which is how the auto-pilot's
+    per-second pause ticks reach the same seven outputs.
+    """
+    _seen = set() if _seen is None else _seen
+    if fn in _seen:
+        return []
+    _seen.add(fn)
+    for _n in _ast.walk(_app_tree):
+        if not (isinstance(_n, _ast.FunctionDef) and _n.name == fn):
+            continue
+        _w = set()
+        for _y in _ast.walk(_n):
+            if isinstance(_y, _ast.Yield):
+                _v = _y.value
+            elif isinstance(_y, _ast.YieldFrom):
+                _v = _y.value
+            else:
+                continue
+            if isinstance(_v, _ast.Tuple):
+                _w.add(len(_v.elts))
+            elif isinstance(_v, _ast.Call) and isinstance(_v.func, _ast.Name):
+                _w.update(_ret_widths(_v.func.id))
+                _w.update(_yield_widths(_v.func.id, _seen))
+        return sorted(x for x in _w if x)
+    return []
+
+
+check("app.py reads the CSV side-cars rather than re-deriving them",
+      "_sidecar_rows" in _app_src and "EMOTION_GRID_CSV" in _app_src
+      and "DIAR_CUES_CSV" in _app_src)
+check("app.py renders both new Tab 2 tables (diar cues + emotion grid)",
+      "diar_tbl" in _app_src and "emo_tbl" in _app_src)
+check("Tab 2 no longer promises a Pyannote HF token",
+      "Pyannote diarization)" not in _app_src)
+
+# BUG 1 · match_btn fed (…, diag_in, spk_hint_in) into _run_matching(
+# token, srt_o, srt_t, num_speakers, diagnostic): a bool landed in the
+# speaker-count slot, so int(num_speakers) threw before the step ran at all.
+_mn_in = _wired("match_btn", "inputs")
+_mn_fn = _fn_params("_run_matching")
+check("match_btn input count matches _run_matching's parameter count",
+      _mn_in is not None and _mn_fn is not None and len(_mn_in) == len(_mn_fn))
+check("match_btn puts spk_hint_in in the num_speakers slot (index 3)",
+      _mn_in is not None and len(_mn_in) > 3
+      and _mn_in[3] == "spk_hint_in" and _mn_in[4] == "diag_in")
+
+# BUG 2 · auto_btn fed (…, diag_in, spk_hint_in, translit_in) into
+# _run_full_auto(media, srt_o, srt_t, token, lang_o, lang_t, num_speakers,
+# translit, diagnostic) — three slots shifted, so the bool reached the
+# speaker count and the string reached the transliterate flag.
+_au_in = _wired("auto_btn", "inputs")
+_au_fn = _fn_params("_run_full_auto")
+check("auto_btn input count matches _run_full_auto's parameter count",
+      _au_in is not None and _au_fn is not None and len(_au_in) == len(_au_fn))
+check("auto_btn orders spk_hint → translit → diag like the signature does",
+      _au_in is not None
+      and _au_in.index("spk_hint_in") < _au_in.index("translit_in")
+      and _au_in.index("translit_in") < _au_in.index("diag_in"))
+check("auto_btn leaves diag_in (a bool) in the LAST, diagnostic slot",
+      _au_in is not None and _au_in[-1] == "diag_in")
+
+# Every generator yield must be as wide as the outputs list it feeds, or
+# Gradio silently drops the tail of the stream.
+for _fn, _btn in (("_run_matching", "match_btn"),
+                  ("_run_full_auto", "auto_btn")):
+    _out = _wired(_btn, "outputs")
+    _ys = _yield_widths(_fn)
+    check(f"{_fn}'s yields are uniform and match {_btn}'s output count",
+          _out is not None and len(_ys) == 1 and _ys[0] == len(_out))
+
+# ── § 19b · the switcher chip must describe the build it just bound ──────────
+if _on_d is not None:
+    _chip_txt = _on_d.get("pipe_chip") or ""
+    check("switcher chip still names the bound module (compat substring kept)",
+          "Pipeline: new_pipeline" in _chip_txt)
+    check("switcher chip now surfaces that build's Step 3/4 toolchain",
+          "steps 3–4:" in _chip_txt)
+    check("…and names new_pipeline's real stack (no Pyannote/SenseVoice)",
+          "Silero" in _chip_txt and "emotion2vec" in _chip_txt
+          and "Pyannote" not in _chip_txt and "SenseVoice" not in _chip_txt)
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

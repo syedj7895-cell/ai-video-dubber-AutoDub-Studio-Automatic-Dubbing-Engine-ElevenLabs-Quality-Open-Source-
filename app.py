@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import csv
 import html
 import importlib
 import json
@@ -408,6 +409,35 @@ def _run_analysis(media, srt_o, srt_t, token, lang_o, lang_t, translit,
         yield f"❌ Unexpected error: {e}", None, None, _chip("err", "Unexpected error")
 
 
+def _sidecar_rows(attr: str) -> list:
+    """TAB 2 · read one of the active module's CSV side-cars verbatim.
+
+    Reads the FILE rather than re-deriving from the JSON, so the table shows
+    exactly what the export contains. After a switcher flip it therefore shows
+    what the newly bound module wrote and never a stale blend of the two.
+    Returns [] when the attribute is missing or the file has not been emitted
+    yet (fresh session, or a build that predates side-cars).
+    """
+    path = getattr(pipeline, attr, None)
+    if path is None:
+        return []
+    p = Path(path)
+    if not p.is_file():
+        return []
+    try:
+        with p.open("r", encoding="utf-8", newline="") as fh:
+            rows = list(csv.reader(fh))
+    except Exception:
+        return []
+    return rows[1:] if rows else []
+
+
+def _refresh_tables():
+    """TAB 2 · reload the diarization-turn and emotion-grid tables."""
+    return (_sidecar_rows("DIAR_CUES_CSV"),
+            _sidecar_rows("EMOTION_GRID_CSV"))
+
+
 def _run_matching(token, srt_o, srt_t, num_speakers, diagnostic):
     """TAB 2 · steps 3–5 → (console, dataframe, emotion log, clones, status)."""
     yield "⏳ Booting speaker matching …", None, None, None, _chip("run", "Steps 3–5 in progress")
@@ -709,7 +739,8 @@ def _bind_pipeline(name, orig, target):
     # leaves a radio holding an HTML string that is not one of its choices —
     # the switch then looks like it silently did nothing.
     return (gr.update(value=name),
-            _chip("ok", f"Pipeline: {name} (v{mod.PIPELINE_VARIANT})"),
+            _chip("ok", f"Pipeline: {name} (v{mod.PIPELINE_VARIANT}) · "
+                        f"steps 3–4: {_step34_tools(mod)}"),
             _chip("ok", f"TTS Engine: {label}{fb_note}"),
             gr.update(choices=mod.engine_choices(), value=actual),
             gr.update(choices=orig_new, value=o_val),
@@ -797,6 +828,19 @@ def _pretty_engine(eid: str) -> str:
     return pipeline.TTS_ENGINES.get(eid, {}).get("label", eid).split("  ")[0].strip()
 
 
+def _step34_tools(mod) -> str:
+    """Human-readable Step 3/4 toolchain published by pipeline module `mod`.
+
+    Each build names its own stack in `STEP34_TOOLS` (Pyannote 3.1 +
+    SenseVoice-Small for pipeline/pipeline2, Silero-VAD + CAM++ + emotion2vec+
+    for new_pipeline). A module predating the switcher publishes no such
+    attribute, so fall back to the engines it actually ran rather than guessing
+    from its name.
+    """
+    return str(getattr(mod, "STEP34_TOOLS", None)
+               or "Pyannote 3.1 · SenseVoice-Small")
+
+
 def _pipeline_note() -> str:
     """Tab 1 chip naming the module CURRENTLY driving the app.
 
@@ -805,7 +849,8 @@ def _pipeline_note() -> str:
     """
     return _chip("ok", f"Pipeline: {pipeline.__name__} "
                        f"(v{getattr(pipeline, 'PIPELINE_VARIANT', '?')}) · "
-                       f"engine {_pretty_engine(pipeline.get_tts_engine())}")
+                       f"engine {_pretty_engine(pipeline.get_tts_engine())} · "
+                       f"steps 3–4: {_step34_tools(pipeline)}")
 
 
 def _engine_info() -> str:
@@ -945,14 +990,21 @@ def build_ui() -> gr.Blocks:
                             value=True,
                             label="🔤 Transliterate Roman text to native script (e.g. Hindi)",
                             info="Auto-converts Latin-script translated lines (Roman Hindi) into Devanagari so TTS can pronounce them.")
+                        # Both builds honour HUGGING_FACE_HUB_TOKEN, but only the
+                        # legacy one has a gated repo to spend it on — so the
+                        # label names the mechanism, not Pyannote, and does not
+                        # promise a token is required when it is not.
                         with gr.Accordion("🔑 Advanced — Hugging Face token "
-                                          "(Pyannote diarization)", open=False):
+                                          "(optional, gated models only)",
+                                          open=False):
                             hf_token_in = gr.Textbox(
                                 type="password",
                                 label="HF access token",
                                 placeholder="hf_xxxxxxxxxxxx  (or set HUGGING_FACE_HUB_TOKEN)",
-                                info="Accept the terms at huggingface.co/pyannote/"
-                                     "speaker-diarization-3.1 first.")
+                                info="Only used when the active build pulls a "
+                                     "gated repo. Silero-VAD, CAM++ and "
+                                     "emotion2vec are open — no token, no "
+                                     "terms-acceptance step.")
                             clear_cloud_btn = gr.Button("🧹 Clear cloud storage",
                                                         variant="secondary",
                                                         elem_classes=["icon-btn"])
@@ -1009,17 +1061,21 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=5, elem_classes=["glass", "pad"]):
                         gr.Markdown("### 🧬 Identity & emotion pass")
-                        gr.Markdown("Runs **Pyannote 3.1** diarization, mines each "
-                                    "speaker's cleanest 5–10 s clone prompts, scans "
-                                    "**SenseVoice-Small** for paralinguistic emotions, "
-                                    "and merges your translated SRT onto the grid.")
+                        gr.Markdown("Splits the speech into segments, clusters "
+                                    "each voice, mines every speaker's cleanest "
+                                    "5–10 s clone prompt, tags each line with its "
+                                    "emotion, and merges your translated SRT onto "
+                                    "the grid. It runs on whichever build the "
+                                    "Tab 1 switcher has active — that build's "
+                                    "toolchain is named in the Tab 1 chip.")
                         match_btn = gr.Button(value="", icon=icon("brain"),
                                               variant="primary",
                                               elem_classes=["icon-btn"])
                         gr.HTML('<div class="btn-caption">🧬 Match speakers & emotions, '
                                 'then assemble the translated script (Steps 3–5)</div>')
-                        gr.Markdown("ℹ️ Requires Tab 1 to be complete. The HF token from "
-                                    "Tab 1 ▸ Advanced is reused here.")
+                        gr.Markdown("ℹ️ Requires Tab 1 to be complete. Credentials "
+                                    "from Tab 1 ▸ Advanced are reused here only "
+                                    "when the active build needs them.")
                     with gr.Column(scale=6, elem_classes=["glass", "pad"]):
                         match_status = gr.HTML(_chip("idle", "Not started"))
                         match_log = gr.Textbox(label="Pipeline console",
@@ -1142,6 +1198,26 @@ def build_ui() -> gr.Blocks:
                                     "CosyVoice-ready for the render phase.")
                         clone_files = gr.Files(label=None, interactive=False)
 
+                # ── CSV side-cars (what Steps 3 & 4 actually export) ─────────
+                # Both tables read the FILE, not the JSON the UI also renders
+                # from, so what you see here is byte-for-byte what lands on disk
+                # for spreadsheet review or a re-run diff.
+                gr.Markdown("### 📊 Diarization & emotion side-cars (CSV)")
+                with gr.Row():
+                    with gr.Column(scale=5, elem_classes=["glass", "pad"]):
+                        gr.Markdown("`outputs/diarization_cues.csv` — one row per "
+                                    "detected turn.")
+                        diar_tbl = gr.Dataframe(
+                            headers=["Speaker ID", "Start_Time", "End_Time", "Text"],
+                            interactive=False, elem_classes=["glass"])
+                    with gr.Column(scale=5, elem_classes=["glass", "pad"]):
+                        gr.Markdown("`outputs/emotion_grid.csv` — one row per "
+                                    "assembled line.")
+                        emo_tbl = gr.Dataframe(
+                            headers=["Speaker ID", "Start_Time", "End_Time",
+                                     "Emotion"],
+                            interactive=False, elem_classes=["glass"])
+
             # ════════════════ TAB 3 · RENDERING ENGINE ══════════════════════
             with gr.Tab("🚀 Rendering Engine") as tab3:
                 with gr.Row():
@@ -1209,20 +1285,34 @@ def build_ui() -> gr.Blocks:
         )
         match_btn.click(
             fn=_run_matching,
-            inputs=[hf_token_in, srt_orig_in, srt_trans_in, diag_in, spk_hint_in],
+            # ⚠ positional order MUST match _run_matching(token, srt_o, srt_t,
+            # num_speakers, diagnostic) — a bool in the speaker-count slot makes
+            # int(num_speakers) throw, so the stage dies before it starts.
+            inputs=[hf_token_in, srt_orig_in, srt_trans_in, spk_hint_in, diag_in],
             outputs=[match_log, script_df, emotion_log_tb, clone_files, match_status],
         ).then(
             fn=_refresh_speakers,
             inputs=None,
             outputs=[spk_table, spk_pick, fix_row, fix_spk, voz_speaker],
+        ).then(
+            fn=_refresh_tables,
+            inputs=None,
+            outputs=[diar_tbl, emo_tbl],
         )
         auto_btn.click(
             fn=_run_full_auto,
+            # ⚠ positional order MUST match _run_full_auto(media, srt_o, srt_t,
+            # token, lang_o, lang_t, num_speakers, translit, diagnostic): the
+            # speaker hint comes BEFORE transliterate, diagnostic comes LAST.
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
-                    lang_orig_in, lang_target_in, diag_in, spk_hint_in,
-                    translit_in],
+                    lang_orig_in, lang_target_in, spk_hint_in, translit_in,
+                    diag_in],
             outputs=[render_log, final_audio, final_video, render_status,
                      match_status, analysis_status, original_audio],
+        ).then(
+            fn=_refresh_tables,
+            inputs=None,
+            outputs=[diar_tbl, emo_tbl],
         )
         render_btn.click(
             fn=_run_rendering,

@@ -25,8 +25,8 @@
 #   ────────────
 #     Step 1 · extract_audio        FFmpeg / MoviePy ......... CPU
 #     Step 2 · separate_vocals      Demucs v4 htdemucs ....... GPU → flush
-#     Step 3 · diarize + mine       Pyannote 3.1 ............. GPU → flush
-#     Step 4 · emotion scan         SenseVoice-Small ......... GPU → flush
+#     Step 3 · diarize + mine       silero-vad + CAM++ ....... GPU → flush
+#     Step 4 · emotion scan         emotion2vec_plus_large ... GPU → flush
 #     Step 5 · assemble script      pysrt merge .............. CPU
 #
 #   DESIGN RULE — exactly ONE heavy model lives on the GPU at any moment.
@@ -34,7 +34,7 @@
 #   garbage-collects, and empties the CUDA cache before the next stage
 #   boots. This is the defense against Colab T4 Out-Of-Memory kills.
 #
-#   All heavy libraries (torch / demucs / pyannote / funasr) are imported
+#   All heavy libraries (torch / demucs / silero-vad / funasr) are imported
 #   LAZILY inside their step functions, so:
 #     · importing this module is instant and dependency-light,
 #     · the UI launches even on machines without torch,
@@ -81,6 +81,13 @@ FINAL_VIDEO_MP4 = OUTPUTS_DIR / "final_dubbed.mp4"            # Step 8 artifact
 PROMPT_TRANSCRIPTS_JSON = OUTPUTS_DIR / "clone_prompt_transcripts.json"
 SPEAKER_PROFILES_JSON = OUTPUTS_DIR / "speaker_profiles.json"   # names/gender
 STATE_JSON = OUTPUTS_DIR / "state.json"                   # pipeline state
+# ── CSV side-cars (AutoDub Studio 2.0 · review + spreadsheet export) ─────────
+# Written ALONGSIDE the JSON artifacts, never INSTEAD of them: the JSON stays
+# the machine contract Steps 5–7 read, the CSV is for humans and Excel.
+SPEAKER_TURNS_CSV = OUTPUTS_DIR / "speaker_turns.csv"     # Step 3 · VAD+cluster turns
+DIAR_CUES_CSV = OUTPUTS_DIR / "diarization_cues.csv"      # Step 3 · per-cue speaker
+EMOTION_GRID_CSV = OUTPUTS_DIR / "emotion_grid.csv"       # Step 4 · speaker/emotion
+LINE_FIT_CSV = OUTPUTS_DIR / "line_fit_report.csv"        # Step 7 · per-line fit
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg",
               ".mpeg", ".ts", ".flv", ".wmv", ".3gp"}
@@ -102,6 +109,67 @@ SENSEVOICE_EMO_MAP = {
     "FEARSOME": "fearful",     # alias seen in some FunASR builds
     "DISGUSTED": "disgusted",
 }
+
+# emotion2vec+ `labels` entry → canonical emotion.  emotion2vec_plus_large emits
+# NINE classes and returns them as '生气/angry' (Chinese/short-English), so every
+# key is normalised through `_normalise_emotion` — which lowercases, strips the
+# '中文/' prefix and trims — before this table is consulted. That means the
+# short-English, long-English and bare-Chinese spellings all land here.
+#
+#   angry · disgusted · fearful · happy · neutral · sad · surprised   → 1:1
+#   other · unknown · <empty>                                        → neutral
+#
+# The last group is why there is no 'Gasp'/'event' class to map: emotion2vec+
+# has no acoustic-event head at all, so non-speech lands in 'other'. Adding an
+# AED model for it would cost a fourth sequential model load and change nothing
+# downstream — a line that is only a gasp carries no words to synthesise.
+EMOTION2VEC_MAP = {
+    # ── the 7 canonical classes ──
+    "angry": "angry",
+    "disgusted": "disgusted",
+    "fearful": "fearful",
+    "fear": "fearful",
+    "happy": "happy",
+    "happiness": "happy",
+    "neutral": "neutral",
+    "sad": "sad",
+    "sadness": "sad",
+    "surprised": "surprised",
+    "surprise": "surprised",
+    # ── Chinese spellings seen across emotion2vec builds ──
+    "生气": "angry", "愤怒": "angry",
+    "厌恶": "disgusted", "反感": "disgusted",
+    "恐惧": "fearful", "害怕": "fearful",
+    "开心": "happy", "高兴": "happy", "快乐": "happy",
+    "中立": "neutral", "中性": "neutral",
+    "难过": "sad", "悲伤": "sad", "伤心": "sad",
+    "吃惊": "surprised", "惊讶": "surprised",
+    # ── catch-alls: no emotion signal → the neutral default ──
+    "other": "neutral", "其他": "neutral",
+    "unknown": "neutral", "未知": "neutral", "": "neutral",
+}
+
+# emotion2vec+ returns labels such as '生气/angry' or '开心/happy'.
+_EMO_LABEL_SPLIT = re.compile(r"[\s/｜|]")
+
+
+def _normalise_emotion(label: str) -> str:
+    """Map any emotion2vec+ label spelling onto a canonical emotion.
+
+    Accepts '生气/angry', 'angry', '开心/happy', ''. Keeps the LAST non-empty
+    segment (the English tail in every shipped vocabulary) and falls back to
+    the first, so a label that is Chinese-only still resolves. Unknown strings
+    degrade to 'neutral' rather than crashing the grid — Step 5 only ever needs
+    a member of EMOTIONS.
+    """
+    parts = [p for p in _EMO_LABEL_SPLIT.split(str(label or "").strip()) if p]
+    for cand in (parts[-1].lower() if parts else "",
+                 parts[0].lower() if parts else "",
+                 str(label or "").strip()):
+        if cand in EMOTION2VEC_MAP:
+            return EMOTION2VEC_MAP[cand]
+    return "neutral"
+
 
 # SenseVoice language tag → readable name (bonus metadata for the grid)
 LANG_MAP = {"zh": "Chinese", "en": "English", "yue": "Cantonese",
@@ -180,6 +248,44 @@ EMOTION_INSTRUCT = {
     "disgusted": "in a disgusted, repulsed tone",
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  STEP 3 / 4 MODEL IDS — AutoDub Studio 2.0 experimental stack
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Step 3 (speaker identity) no longer uses Pyannote. The 2.0 stack is:
+#    ① silero-vad ............ voice activity  (MIT, ungated, pip or torch.hub)
+#    ② CAMPPlus (FunASR) ..... 192-d speaker embeddings, already in the FunASR
+#                              stack Step 4 uses → ZERO new heavy dependency
+#    ③ sklearn AgglomerativeClustering over cosine distance → speakers
+#
+#  Why this replaces Pyannote's speaker-diarization-3.1:
+#    · size      ~43 MB of GATED weights (3.1 10.9 + segmentation 5.9 +
+#                wespeaker 26.6) → ~41 MB (Silero wheel 11.3 + CAM++ 30.4)
+#    · gating    two gated HF repos + a valid token → NO token, NO gate, NO
+#                huggingface.co/…/'Agree and access repository' checklist
+#    · licence   MIT (silero) + Apache-2.0 (CAM++) + the FunASR stack already
+#                installed. Neither new repo is gated.
+#  NOTE the saving is GATING, not weight: this step is size-neutral. The Step 4
+#  swap below is what actually moves the number (emotion2vec+ is ~1 GB larger
+#  than SenseVoice) — see docs/PIPELINE_2.0_OVERVIEW.md §6.
+#  What is deliberately NOT swapped: gender profiling still uses librosa pYIN
+#  (`_estimate_gender`) — it is validated by selftest §12 and needs no model.
+DIAR_ENGINE = "silero-vad + campplus-192d + agglomerative"
+CAMPPLUS_MODEL = "iic/speech_campplus_sv_en_voxceleb_16k"
+# Shown in Tab 1's live "Pipeline:" chip, which IS re-derived on every switcher
+# flip — so the step 3/4 toolchain named on screen always matches the module
+# actually driving the app.
+STEP34_TOOLS = "Silero-VAD + CAM++ · AgglomerativeClustering · emotion2vec+"
+# The legacy stack needed a Hugging Face token for two GATED repositories.
+# Nothing here does, which is why app.py must stop promising a token is "reused".
+NEEDS_HF_TOKEN = False
+
+# Step 4 (emotion) — emotion2vec_plus_large, FunASR-native, 9 classes.
+EMOTION2VEC_MODEL = "iic/emotion2vec_plus_large"
+
+# ── Legacy identifiers · NOT used by this module any more ────────────────────
+# Kept defined so an external introspection, a stale pickled state or a diff
+# against pipeline2.py still resolves the attribute instead of raising.
 PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
 SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 
@@ -1069,7 +1175,8 @@ def step2_separate_vocals(log: Log, force: bool = False) -> Tuple[Path, Path]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STEP 3 · SPEAKER DIARIZATION + CLONE-PROMPT MINING  (Pyannote 3.1)
+#  STEP 3 · SPEAKER DIARIZATION + CLONE-PROMPT MINING
+#            (Silero-VAD → CAMPPlus 192-d → AgglomerativeClustering)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _score_window(mono, sr: int, a: float, b: float,
@@ -1181,15 +1288,195 @@ def _mine_clone_prompts(log: Log,
     return out
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  STEP 3 PRIMITIVES — Silero-VAD · CAMPPlus embeddings · clustering
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _load_silero_vad(device: str, log: Log):
+    """Load Silero-VAD (MIT, ~2 MB) → (model, True), else (None, False).
+
+    The pip package is tried first; `torch.hub` is the fallback for a machine
+    that has torch but never installed `silero-vad`. Returning the failure
+    instead of raising lets the caller degrade to an energy VAD, so a missing
+    model can never make Step 3 unrunnable.
+
+    The model needs only `torch`: we always hand it an in-memory float32
+    tensor, never a path, so no audio backend (torchcodec/sox/FFmpeg) is needed.
+    """
+    first = ""
+    try:
+        from silero_vad import load_silero_vad       # pip install silero-vad
+        model = load_silero_vad()
+        try:
+            model = model.to(device)
+        except Exception:
+            pass
+        return model, True
+    except Exception as e:
+        first = f"{type(e).__name__}: {e}"
+    try:
+        model, _utils = torch.hub.load("snakers4/silero-vad", "silero_vad",
+                                       trust_repo=True, onnx=False)
+        return model, True
+    except Exception as e:
+        log(f"   ⚠ Silero-VAD unavailable ({first} | "
+            f"{type(e).__name__}: {e})")
+        return None, False
+
+def _vad_regions(mono, sr: int, vad_model, log: Log) -> List[List[float]]:
+    """Speech regions as merged [[start_s, end_s], …].
+
+    Silero-VAD when available, otherwise a pure-numpy energy VAD — the step
+    must still produce a timeline on a machine that has torch but no model.
+    """
+    import numpy as np
+    t0 = time.time()
+    log("🎙 Detecting speech regions (VAD) …")
+    if vad_model is not None:
+        try:
+            from silero_vad import get_speech_timestamps
+            ts = get_speech_timestamps(
+                torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32)),
+                vad_model, sampling_rate=int(sr), return_seconds=False,
+                min_speech_duration_ms=250, min_silence_duration_ms=100,
+                speech_pad_ms=30)
+            ivs = [(t["start"] / float(sr), t["end"] / float(sr)) for t in ts]
+            log(f"   Silero-VAD: {len(ivs)} speech region(s) "
+                f"· {time.time() - t0:.1f}s")
+            return _merge_intervals(ivs)
+        except Exception as e:
+            log(f"   ⚠ Silero inference failed ({type(e).__name__}: {e}) — "
+                f"falling back to energy VAD")
+
+    # ── energy fallback · 20 ms frames, floor from the 95th percentile ────────
+    fl = max(1, int(0.02 * sr))
+    n = (mono.size // fl) * fl
+    if n == 0:
+        return []
+    rms = np.sqrt((mono[:n].reshape(-1, fl) ** 2).mean(axis=1) + 1e-12)
+    active = rms > max(1e-4, 0.12 * float(np.percentile(rms, 95)))
+    ivs: List[Tuple[float, float]] = []
+    run = None
+    for i, on in enumerate(active.tolist()):
+        if on and run is None:
+            run = i
+        elif not on and run is not None:
+            ivs.append((run * 0.02, i * 0.02))
+            run = None
+    if run is not None:
+        ivs.append((run * 0.02, len(active) * 0.02))
+    ivs = [iv for iv in ivs if iv[1] - iv[0] >= 0.25]
+    log(f"   energy-VAD fallback: {len(ivs)} speech region(s) "
+        f"· {time.time() - t0:.1f}s")
+    return _merge_intervals(ivs)
+
+
+def _campplus_embed(model, segs, log: Log):
+    """L2-normalised CAMPPlus embeddings → (np.ndarray[n, d], kept_indices).
+
+    FunASR returns one `spk_embedding` tensor per call. The DIMENSION is READ
+    from the tensor, never assumed: the FunASR docs are explicit that 192 is a
+    property of this checkpoint rather than a universal API guarantee. A
+    segment that fails or yields nothing is skipped and its index returned, so
+    the caller can keep embeddings aligned with their windows.
+    """
+    import numpy as np
+    embs: List = []
+    keep: List[int] = []
+    for i, seg in enumerate(segs):
+        try:
+            res = model.generate(
+                input=np.ascontiguousarray(seg, dtype=np.float32), batch_size=1)
+            vec = res[0].get("spk_embedding") if res else None
+        except Exception:
+            vec = None
+        if vec is None:
+            continue
+        try:                       # torch.Tensor → numpy
+            arr = vec.detach().cpu().numpy().reshape(-1).astype(np.float32)
+        except AttributeError:     # already numpy / list
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        nrm = float(np.linalg.norm(arr)) if arr.size else 0.0
+        if arr.size and nrm > 1e-9:
+            embs.append(arr / nrm)   # unit vector ⇒ cosine == dot product
+            keep.append(i)
+    dim = embs[0].size if embs else 0
+    log(f"   {len(embs)}/{len(segs)} segment embedding(s) · dim={dim}")
+    return (np.vstack(embs) if embs else np.zeros((0, 0), np.float32)), keep
+
+
+def _cluster_speakers(embs, n_hint: int, log: Log):
+    """Cluster cosine-normalised embeddings → one integer label per row.
+
+    `n_hint` is Tab 2's 'Expected speakers' hint and becomes `n_clusters` when
+    supplied. Without it we sweep the cosine distance threshold instead of
+    trusting one hard-coded cut, which reliably over-splits a long recording.
+    Returns an int array aligned with `embs`.
+    """
+    import numpy as np
+    n = int(embs.shape[0])
+    if n == 0:
+        return np.zeros(0, dtype=int)
+    if n == 1:
+        return np.zeros(1, dtype=int)
+    try:
+        from sklearn.cluster import AgglomerativeClustering
+    except ImportError as e:
+        raise RuntimeError(
+            "Step 3 clustering needs scikit-learn → pip install scikit-learn"
+        ) from e
+
+    hint = int(n_hint or 0)
+    if 0 < hint <= n:
+        lab = AgglomerativeClustering(n_clusters=hint, metric="cosine",
+                                      linkage="average").fit_predict(embs)
+        k = hint
+    else:
+        chosen = None
+        for thr in (0.50, 0.60, 0.70, 0.40, 0.80, 0.30, 0.90):
+            lab = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=float(thr),
+                metric="cosine", linkage="average").fit_predict(embs)
+            k = len(set(int(x) for x in lab))
+            if 2 <= k <= 12:
+                chosen = (k, lab)
+                break
+        if chosen is None:            # nothing separable, or one huge cluster
+            chosen = (1, np.zeros(n, dtype=int))
+        k, lab = chosen
+    log(f"   agglomerative clustering → {k} speaker cluster(s)")
+    return np.asarray(lab, dtype=int)
+
+
+def _write_csv(path: Path, header: List[str], rows: List[List]) -> None:
+    """Write a CSV side-car (RFC 4180, via the stdlib `csv` module).
+
+    Deliberately not pandas: the pipeline's contract stays stdlib-only so the
+    CSV is produced even in an environment where pandas was never installed.
+    """
+    import csv
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, lineterminator="\n")
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
 def step3_diarization(hf_token: Optional[str],
                       original_srt_path: Optional[str],
                       log: Log,
                       force: bool = False,
                       expected_speakers: int = 0) -> dict:
     """
-    Pyannote 3.1 diarization of the clean vocal track, cross-referenced with
-    the user's ORIGINAL SRT timeline (max-overlap speaker vote per cue), then
-    clone-prompt mining + full GPU teardown.
+    Speaker identity for AutoDub Studio 2.0: silero-vad → CAMPPlus embeddings →
+    agglomerative clustering, cross-referenced with the user's ORIGINAL SRT
+    timeline (max-overlap speaker vote per cue), then clone-prompt mining +
+    full GPU teardown.
+
+    Signature and every artifact shape are UNCHANGED from the Pyannote version
+    on purpose: `run_script_matching`, Step 5 and app.py's Tab 2 all read
+    `diarization_map.json` by key, so the engine swap stays invisible to them.
+    `hf_token` is still accepted (and now ignored) rather than removed, so the
+    orchestrator and the UI keep one call convention across both builds.
     """
     if DIARIZATION_JSON.exists() and not force:
         log("↩ Step 3 cached (diarization_map.json) — skipping.")
@@ -1197,107 +1484,91 @@ def step3_diarization(hf_token: Optional[str],
 
     try:
         import torch
-        import torchaudio
+        import torchaudio  # noqa: F401  (resample + torchaudio ≥ 2.9 shims)
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
             f"Step 3 needs the ML stack — module '{missing}' is not installed here. "
             "Local CPU fix:  pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cpu  then  "
-            "pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
-    _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9 BEFORE pyannote
+            "pip install silero-vad funasr modelscope scikit-learn  ·  "
+            "Or run on Google Colab (T4).") from e
+    _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
-    _hf_hub_compat()       # patch hf_hub_download to accept use_auth_token (Pyannote compat)
     _torch_load_compat()   # restore legacy torch.load default for trusted checkpoints
     try:
-        from pyannote.audio import Pipeline
+        from funasr import AutoModel
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
-            f"Step 3 needs the ML stack — module '{missing}' is not installed here. "
-            "Fix:  pip install pyannote.audio  ·  Or run on Google Colab (T4).") from e
+            f"Step 3 needs FunASR for CAMPPlus embeddings — module '{missing}' "
+            "is not installed here.  Fix:  pip install funasr modelscope") from e
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"🧠 Loading Pyannote 3.1 · {PYANNOTE_MODEL} · device={device}")
-
-    token = (hf_token or "").strip()
-    # pre-flight: verify token validity + BOTH gated repos BEFORE the
-    # 1 GB weight download. A denied gate would otherwise surface as an
-    # opaque blob-download error after minutes of waiting.
-    if token:
-        import urllib.request
-        for _repo in (PYANNOTE_MODEL, "pyannote/segmentation-3.0"):
-            _req = urllib.request.Request(
-                "https://huggingface.co/api/models/" + _repo,
-                headers={"Authorization": "Bearer " + token})
-            try:
-                with urllib.request.urlopen(_req, timeout=15):
-                    log("   [OK] HF gate open: " + _repo)
-            except Exception as _e:
-                _code = getattr(_e, "code", None)
-                if _code in (401, 403):
-                    raise RuntimeError(
-                        "HuggingFace gate DENIED for '" + _repo + "'. Fix: open "
-                        "huggingface.co/" + _repo + " and click 'Agree and "
-                        "access repository' with the SAME account that owns "
-                        "the token, then re-run. (Token itself is valid.)")
-                elif _code == 404:
-                    raise RuntimeError(
-                        "HuggingFace repo '" + _repo + "' not found - check "
-                        "the model id / your network.")
-                else:  # offline / proxy hiccup - do not hard-block
-                    log("   [!] HF gate probe skipped (" + str(_e) + ") - continuing")
-    # huggingface_hub ≥ 0.25 dropped `use_auth_token` in favour of `token`;
-    # the _hf_hub_compat() patch above also silences Pyannote's internal usage.
-    pipe = None
-    try:
-        pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, token=token) if token \
-            else Pipeline.from_pretrained(PYANNOTE_MODEL)
-    except TypeError:
-        kwargs = {"use_auth_token": token} if token else {}
-        pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, **kwargs)
-    except Exception as e:
-        raise RuntimeError(
-            "Pyannote failed to load. Checklist: ① visit huggingface.co/"
-            "pyannote/speaker-diarization-3.1 AND …/segmentation-3.1 and accept "
-            "the user conditions with the SAME account that owns the token; "
-            "② paste the token in Tab 1 ▸ Advanced. Detail: " + str(e)[:300]
-        ) from e
-
-    if pipe is None:
-        raise RuntimeError(
-            "Pyannote returned None — the model files could not be loaded. "
-            "Checklist: ① visit huggingface.co/pyannote/speaker-diarization-3.1 "
-            "AND huggingface.co/pyannote/segmentation-3.1 and click 'Agree and "
-            "access repository' with the SAME account that owns the token; "
-            "② paste a READ token (hf_…) in Tab 1 ▸ Advanced; "
-            "③ if you already did both, the token may be expired — generate a "
-            "new one at huggingface.co/settings/tokens."
-        )
-
-    pipe.to(torch.device(device))
-    log("🎙 Diarizing the isolated vocal track …")
+    # NOTE: no HF token, no gated-repo pre-flight, no `Pipeline.from_pretrained`.
+    # Silero-VAD (~2 MB, MIT) and CAMPPlus are both ungated, so the whole
+    # "visit huggingface.co/… and click 'Agree and access repository'" class of
+    # failure no longer exists. `hf_token` is deliberately unused above.
     t0 = time.time()
-    # torchaudio ≥ 2.9 regression guard: with file-path input, pyannote's
-    # chunked reader can receive the FULL waveform instead of the requested
-    # 10 s window (tensor-size crash). Feed an in-memory 16 kHz mono dict —
-    # pyannote then slices tensors directly, no file IO at all.
-    try:
-        _mono, _sr = _load_vocals_16k()
-        diar = pipe({"waveform": torch.from_numpy(_mono).unsqueeze(0),
-                     "sample_rate": _sr})
-    except Exception as _ioe:
-        log(f"   ⚠ in-memory feed failed ({_ioe}) — using file fallback")
-        diar = pipe(str(VOCALS_WAV))
-    turns = [{"start": float(t.start), "end": float(t.end), "raw": label}
-             for t, _, label in diar.itertracks(yield_label=True)]
-    del pipe, diar
+    mono, sr = _load_vocals_16k()
+    log(f"🎙 Step 3 · {DIAR_ENGINE} · device={device} · {mono.size / sr:.1f}s audio")
+    log("   " + log_memory())
+
+    # ── ① voice activity ─────────────────────────────────────────────────────
+    vad_model, vad_ok = _load_silero_vad(device, log)
+    log(f"🧠 Silero-VAD: {'loaded' if vad_ok else 'unavailable → energy fallback'}")
+    regions = _vad_regions(mono, sr, vad_model, log)
+    if not regions:
+        raise RuntimeError(
+            "Voice activity detection found no speech in vocals.wav. Check that "
+            "Step 2 produced a non-silent vocal stem.")
+
+    # ── ② sub-segment → CAMPPlus embeddings ──────────────────────────────────
+    # 1.5 s windows on a 0.75 s hop: long enough for a stable speaker vector,
+    # short enough that a turn change inside one VAD region stays separable.
+    win_s, hop_s = 1.5, 0.75
+    segs: List = []
+    owners: List[int] = []              # region index per window
+    for ri, (a, b) in enumerate(regions):
+        if (b - a) < 0.4:
+            segs.append(mono[int(a * sr):int(b * sr)])
+            owners.append(ri)
+            continue
+        t = a
+        while t < b - 0.3:
+            e = min(b, t + win_s)
+            segs.append(mono[int(t * sr):int(e * sr)])
+            owners.append(ri)
+            t += hop_s
+    log(f"✂ {len(regions)} region(s) → {len(segs)} embedding window(s)")
+
+    log(f"🧠 Loading CAMPPlus · {CAMPPLUS_MODEL} · device={device}")
+    sv_model = AutoModel(model=CAMPPLUS_MODEL, device=device,
+                         disable_update=True, disable_pbar=True)
+    embs, kept = _campplus_embed(sv_model, segs, log)
+    del sv_model
     log("   " + clear_gpu_cache())
 
+    # ── ③ cluster → one speaker per VAD region (majority vote) ───────────────
+    labels = _cluster_speakers(embs, int(expected_speakers or 0), log)
+    turns: List[dict] = []
+    if len(labels):
+        by_region: Dict[int, Counter] = defaultdict(Counter)
+        for wi, lab in zip(kept, labels.tolist()):
+            by_region[owners[wi]][int(lab)] += 1
+        for ri, (a, b) in enumerate(regions):
+            votes = by_region.get(ri)
+            if not votes:
+                continue
+            turns.append({"start": float(a), "end": float(b),
+                          "raw": f"SPEAKER_{votes.most_common(1)[0][0]:02d}"})
     if not turns:
-        raise RuntimeError("Diarization returned zero speaker turns.")
+        log("   ⚠ no speaker embedding survived — treating the track as one voice")
+        turns = [{"start": 0.0, "end": mono.size / sr, "raw": "SPEAKER_00"}]
+
     n_raw = len({t["raw"] for t in turns})
-    log(f"   {len(turns)} raw turns · {n_raw} distinct voices · {time.time() - t0:.1f}s")
+    log(f"   {len(turns)} speaker turn(s) · {n_raw} distinct voice(s) "
+        f"· {time.time() - t0:.1f}s")
 
     # ── cross-reference with the ORIGINAL SRT timeline ────────────────────
     if original_srt_path and Path(original_srt_path).exists():
@@ -1370,9 +1641,28 @@ def step3_diarization(hf_token: Optional[str],
     log("♀♂ Profiling speaker pitch so voices can be gender-matched …")
     speakers = profile_speakers(speakers, log)
 
-    result = {"model": PYANNOTE_MODEL, "speakers": speakers, "cues": cue_rows}
+    result = {"model": DIAR_ENGINE, "speakers": speakers, "cues": cue_rows}
     DIARIZATION_JSON.write_text(json.dumps(result, indent=2, ensure_ascii=False),
                                 encoding="utf-8")
+
+    # ── CSV side-cars (human review + spreadsheet export) ─────────────────────
+    # Written ALONGSIDE the JSON, never instead of it: Steps 5–7 read the JSON
+    # by key, so a CSV problem can never break the pipeline. Guarded for the
+    # same reason.
+    try:
+        _write_csv(SPEAKER_TURNS_CSV,
+                   ["Speaker ID", "Start_Time", "End_Time"],
+                   [[canon.get(t["raw"], "Speaker1"), fmt_ts(t["start"]),
+                     fmt_ts(t["end"])] for t in turns])
+        _write_csv(DIAR_CUES_CSV,
+                   ["Speaker ID", "Start_Time", "End_Time", "Text"],
+                   [[r["speaker"], fmt_ts(r["start"]), fmt_ts(r["end"]),
+                     (r.get("text") or "").replace("\n", " ")] for r in cue_rows])
+        log(f"🧾 CSV side-cars → {SPEAKER_TURNS_CSV.name} ({len(turns)} row(s)) · "
+            f"{DIAR_CUES_CSV.name} ({len(cue_rows)} row(s))")
+    except Exception as e:
+        log(f"   ⚠ CSV export skipped: {type(e).__name__}: {e}")
+
     log(f"✅ Step 3 → diarization_map.json · {len(speakers)} identity tag(s) mapped")
     return result
 
@@ -1491,19 +1781,32 @@ def profile_speakers(speakers: Dict[str, dict], log: Log = _noop) -> Dict[str, d
     `_speaker_gender`.
     """
     try:
+        import numpy as np
         import soundfile as sf
     except ImportError:
         return speakers
 
     for spk, info in speakers.items():
-        rel = (info.get("clone_prompts") or [""])[0]
-        path = (BASE_DIR / rel) if rel else None
-        if not path or not path.exists():
+        # Pool EVERY mined clone window, not just the first one. A speaker's
+        # top-3 windows carry up to 30 s of clean speech, so the median F0 and
+        # the IQR gate in `_estimate_gender` stop depending on whether one
+        # particular 5 s sample happened to be unlucky.
+        rels = [r for r in (info.get("clone_prompts") or []) if r]
+        paths = [p for p in (BASE_DIR / r for r in rels) if p.exists()]
+        if not paths:
             info.setdefault("gender", "")
             continue
         try:
-            data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-            prof = _estimate_gender(data.mean(axis=1), int(sr))
+            waves, rates = [], []
+            for p in paths:
+                data, sr = sf.read(str(p), dtype="float32", always_2d=True)
+                waves.append(data.mean(axis=1))
+                rates.append(int(sr))
+            if len(set(rates)) != 1:
+                # Concatenating across sample rates would corrupt the pitch
+                # estimate, so fall back to the single best window instead.
+                waves, rates = waves[:1], rates[:1]
+            prof = _estimate_gender(np.concatenate(waves), rates[0])
         except Exception as e:
             log(f"   ⚠ {spk}: gender profiling skipped ({str(e)[:70]})")
             info.setdefault("gender", "")
@@ -1520,7 +1823,7 @@ def profile_speakers(speakers: Dict[str, dict], log: Log = _noop) -> Dict[str, d
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STEP 4 · PARALINGUISTIC EMOTION SCAN  (Alibaba SenseVoice-Small / FunASR)
+#  STEP 4 · PARALINGUISTIC EMOTION SCAN  (emotion2vec_plus_large / FunASR)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _load_vocals_16k():
@@ -1539,19 +1842,27 @@ def _load_vocals_16k():
 
 def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
     """
-    Run SenseVoice-Small EXCLUSIVELY over the timeline-matched voice segments
-    (the diarized SRT cue windows) to tag each with one of the 7 canonical
-    emotions. Produces:
-      · outputs/emotion_log.txt   — spec format:  [00:50.000] Speaker1 [calm]
+    Tag every timeline-matched voice segment (the diarized SRT cue windows) with
+    one of the 7 canonical emotions, using emotion2vec_plus_large.
+
+    PER-LINE BY DESIGN: one `generate()` call per cue, never a single pass over
+    the whole vocal track — a global call would collapse a whole scene onto one
+    emotion and Step 7's per-line `exaggeration` would come out flat.
+
+    Artifact shapes are UNCHANGED from the SenseVoice version (Step 5 reads them
+    by key), plus a CSV side-car:
+      · outputs/emotion_log.txt   — spec format:  [00:50.000] Speaker1 [angry]
       · outputs/emotion_grid.json — machine grid consumed by Step 5
+      · outputs/emotion_grid.csv  — the same grid for humans / spreadsheets
     """
     if EMOTION_GRID_JSON.exists() and not force:
         log("↩ Step 4 cached (emotion_grid.json) — skipping.")
         return json.loads(EMOTION_GRID_JSON.read_text(encoding="utf-8"))
 
     try:
+        import numpy as np
         import torch
-        import torchaudio
+        import torchaudio  # noqa: F401  (resample + torchaudio ≥ 2.9 shims)
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
@@ -1567,30 +1878,29 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
-            f"Step 4 needs the ML stack — module '{missing}' is not installed here. "
-            "Fix:  pip install funasr modelscope  ·  Or run on Google Colab (T4).") from e
+            f"Step 4 needs FunASR for emotion2vec+ — module '{missing}' is not "
+            "installed here.  Fix:  pip install funasr modelscope") from e
 
     diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
     cues = diar["cues"]
-    asr_language = (PipelineState.load().artifacts.get("source_lang")
-                    or "auto")
-    log(f"🌐 ASR / emotion-scan language: {asr_language}")
+    # emotion2vec+ takes no language hint, so this is metadata only. It keeps
+    # the `language` key Step 5 reads populated with something honest, instead
+    # of the SenseVoice <|en|> tag that no longer exists.
+    src_language = (PipelineState.load().artifacts.get("source_lang") or "auto")
+    lang = "auto" if src_language == "auto" else src_language
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"🧠 Loading SenseVoice-Small · {SENSEVOICE_MODEL} · device={device}")
+    log(f"🧠 Loading emotion2vec+ · {EMOTION2VEC_MODEL} · device={device}")
     log("   " + log_memory())
 
     t0 = time.time()
-    model = AutoModel(model=SENSEVOICE_MODEL,
-                      vad_model="fsmn-vad",
-                      vad_kwargs={"max_single_segment_time": 30_000},
-                      device=device,
-                      disable_update=True,
-                      disable_pbar=True,
-                      trust_remote_code=True)
+    # hub="hf" is REQUIRED. The modelscope resolution path queries a different
+    # emotion2vec export that returns FOUR classes instead of nine, which would
+    # silently fold 'disgusted'/'fearful'/'surprised' onto 'neutral'.
+    model = AutoModel(model=EMOTION2VEC_MODEL, hub="hf", device=device,
+                      disable_update=True, disable_pbar=True)
 
     mono, sr = _load_vocals_16k()
-    tag_re = re.compile(r"<\|([A-Z_]+)\|>")
     grid: List[dict] = []
     fails = 0
 
@@ -1598,20 +1908,26 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
         a = float(cue["start"])
         b = max(float(cue["end"]), a + 0.2)          # sub-0.2 s guard
         seg = mono[int(a * sr): int(b * sr)]
-        if seg.size < int(0.25 * sr):                # < 0.25 s → no signal
-            emotion, lang = "neutral", "en"
-        else:
+        emotion = "neutral"
+        if seg.size >= int(0.25 * sr):               # < 0.25 s → no signal
             try:
-                res = model.generate(input=seg, cache={},
-                                     language=asr_language, use_itn=False,
-                                     merge_vad=False)
-                raw = res[0].get("text", "") if res else ""
-                tags = tag_re.findall(raw)
-                emotion = next((SENSEVOICE_EMO_MAP[t] for t in tags
-                                if t in SENSEVOICE_EMO_MAP), "neutral")
-                lang = next((t for t in tags if t in LANG_MAP), "en")
+                res = model.generate(
+                    input=np.ascontiguousarray(seg, dtype=np.float32),
+                    granularity="utterance", extract_embedding=False)
+                # labels[] and scores[] come back aligned. Take the argmax of
+                # scores rather than blindly trusting labels[0], so a future
+                # checkpoint that returns them unordered stays correct.
+                labels = res[0].get("labels") if res else None
+                scores = res[0].get("scores") if res else None
+                if labels:
+                    best = 0
+                    if scores and len(scores) == len(labels):
+                        best = int(np.argmax(np.asarray(scores, dtype=np.float32)))
+                    emotion = _normalise_emotion(labels[best])
+                else:
+                    fails += 1
             except Exception:
-                emotion, lang, fails = "neutral", "en", fails + 1
+                fails += 1
         grid.append({"index": cue["index"], "start": a, "end": b,
                      "speaker": cue.get("speaker", "Speaker1"),
                      "emotion": emotion, "language": lang})
@@ -1622,39 +1938,30 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
         encoding="utf-8")
     EMOTION_GRID_JSON.write_text(json.dumps(grid, indent=2, ensure_ascii=False),
                                  encoding="utf-8")
-
-    # bonus (feeds Step 7) · transcribe each speaker's cleanest clone prompt
-    # so CosyVoice zero-shot cloning gets its exact conditioning transcript.
     try:
-        prompt_rels = {spk: (info.get("clone_prompts") or [""])[0]
-                       for spk, info in diar.get("speakers", {}).items()
-                       if (info.get("clone_prompts") or [""])[0]}
-        if prompt_rels:
-            log("🈳 Transcribing clone prompts (zero-shot conditioning text) …")
-            ptexts: Dict[str, str] = {}
-            for spk, rel in sorted(prompt_rels.items()):
-                try:
-                    res = model.generate(input=str(BASE_DIR / rel), cache={},
-                                         language="auto", use_itn=False)
-                    raw = res[0].get("text", "") if res else ""
-                    ptexts[spk] = re.sub(r"<\|[^|>]*\|>", " ", raw).strip()
-                    ptexts[spk] = re.sub(r"\s+", " ", ptexts[spk]).strip()
-                    log(f"   {spk}: '{ptexts[spk][:48]}'")
-                except Exception as e:
-                    ptexts[spk] = ""
-                    log(f"   ⚠ {spk}: transcription failed ({str(e)[:80]})")
-            PROMPT_TRANSCRIPTS_JSON.write_text(
-                json.dumps(ptexts, indent=2, ensure_ascii=False),
-                encoding="utf-8")
+        _write_csv(EMOTION_GRID_CSV,
+                   ["Speaker ID", "Start_Time", "End_Time", "Emotion"],
+                   [[g["speaker"], fmt_ts(g["start"]), fmt_ts(g["end"]),
+                     g["emotion"]] for g in grid])
+        log(f"🧾 CSV side-car → {EMOTION_GRID_CSV.name} ({len(grid)} row(s))")
     except Exception as e:
-        log(f"   ⚠ prompt transcription skipped: {e}")
+        log(f"   ⚠ CSV export skipped: {type(e).__name__}: {e}")
+
+    # NOTE: the clone-prompt transcription pass that used to live here is gone.
+    # It existed only because CosyVoice's zero-shot path wants its conditioning
+    # text verbatim, and it ran a second SenseVoice pass purely to produce it.
+    # Chatterbox clones from the audio prompt alone, so under 2.0 that artifact
+    # had no consumer — while still costing one extra model pass per speaker.
+    # `_ensure_prompt_transcripts()` now short-circuits instead of re-deriving.
 
     del model
     log("   " + clear_gpu_cache())
 
     dist = Counter(g["emotion"] for g in grid)
-    log(f"✅ Step 4 → emotion_log.txt · {len(grid)} segments "
-        f"in {time.time() - t0:.1f}s" + (f" · {fails} decode fallbacks" if fails else ""))
+    log(f"✅ Step 4 [{EMOTION2VEC_MODEL.split('/')[-1]}] → emotion_log.txt + "
+        f"emotion_grid.{{json,csv}} · {len(grid)} segment(s) in "
+        f"{time.time() - t0:.1f}s"
+        + (f" · {fails} decode fallback(s)" if fails else ""))
     log("   distribution: " + ", ".join(f"{k}×{v}" for k, v in dist.most_common()))
     return grid
 
@@ -2209,49 +2516,20 @@ def _load_prompt_speech(path: str, target_sr: int = 16_000):
 def _ensure_prompt_transcripts(log: Log) -> Dict[str, str]:
     """
     speaker → transcript of its best clone prompt (zero-shot conditioning).
-    Normally produced during Step 4; re-derives with a quick SenseVoice pass
-    when only the cached path was taken.
-    """
-    if PROMPT_TRANSCRIPTS_JSON.exists():
-        raw = json.loads(PROMPT_TRANSCRIPTS_JSON.read_text(encoding="utf-8"))
-        return {k: re.sub(r"<\|[^|>]*\|>", " ", str(v)).strip()
-                for k, v in raw.items()}
-    diar = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
-    todo = {spk: (info.get("clone_prompts") or [""])[0]
-            for spk, info in diar.get("speakers", {}).items()
-            if (info.get("clone_prompts") or [""])[0]}
-    if not todo:
-        return {}
 
-    log("🈳 Transcribing clone prompts for zero-shot conditioning (SenseVoice) …")
-    import torch
-    _torchaudio_compat()
-    _numpy2_compat()
-    _torch_load_compat()
-    from funasr import AutoModel
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AutoModel(model=SENSEVOICE_MODEL, vad_model="fsmn-vad",
-                      vad_kwargs={"max_single_segment_time": 30_000},
-                      device=device, disable_update=True, disable_pbar=True,
-                      trust_remote_code=True)
-    tag_re = re.compile(r"<\|[^|>]*\|>")
-    out: Dict[str, str] = {}
-    for spk, rel in sorted(todo.items()):
-        try:
-            res = model.generate(input=str(BASE_DIR / rel), cache={},
-                                 language="auto", use_itn=False)
-            raw = res[0].get("text", "") if res else ""
-            out[spk] = tag_re.sub("", raw).strip()
-            log(f"   {spk}: '{out[spk][:48]}'")
-        except Exception as e:
-            out[spk] = ""
-            log(f"   ⚠ {spk}: transcription failed ({str(e)[:80]})")
-    del model
-    log("   " + clear_gpu_cache())
-    PROMPT_TRANSCRIPTS_JSON.write_text(json.dumps(out, indent=2,
-                                                  ensure_ascii=False),
-                                       encoding="utf-8")
-    return out
+    Under 2.0 this is deliberately a NO-OP that never loads a model. The only
+    engine that consumes prompt transcripts is CosyVoice's zero-shot path, and
+    this build publishes Chatterbox alone (ENGINE_ALLOWLIST) — so re-deriving
+    them would cost a full extra model load for an artifact nothing reads.
+
+    A `clone_prompt_transcripts.json` left behind by a pipeline.py run is still
+    honoured, so switching modules mid-project keeps CosyVoice viable.
+    """
+    if not PROMPT_TRANSCRIPTS_JSON.exists():
+        return {}
+    raw = json.loads(PROMPT_TRANSCRIPTS_JSON.read_text(encoding="utf-8"))
+    return {k: re.sub(r"<\|[^|>]*\|>", " ", str(v)).strip()
+            for k, v in raw.items()}
 
 
 def _cosyvoice_speak(model, text: str, instruct: str, prompt_speech,
@@ -2614,7 +2892,13 @@ def engine_error_report(engine_label: str, attempts: List[str],
 
 
 def _emotion_word(instruct: str) -> str:
-    """Normalise a SenseVoice / table emotion label to a bare lowercase word."""
+    """Normalise an emotion2vec+ / table emotion label to a bare lowercase word.
+
+    Accepts everything `EMOTION2VEC_MAP` produces ('angry'), a Chinese/short-
+    English pair ('生气/angry'), or the instruct phrasing Step 7 passes in
+    ('in an angry, tense tone') — this is the lookup `_emotion_to_exaggeration`
+    runs before consulting `_CHATTER_EXAG`.
+    """
     word = re.sub(r"[^A-Za-z]+", "", str(instruct or "")).lower()
     return word or "neutral"
 
@@ -4149,16 +4433,31 @@ class EngineRuntime:
 
 
 def step7_synthesize(log: Log, force: bool = False,
-                     max_speedup: float = 1.15) -> dict:
+                     fit_max_speed: float = 1.35,
+                     fit_min_speed: float = 0.90,
+                     fit_stretch_short: bool = False) -> dict:
     """
     Engine-agnostic synthesis onto per-speaker silent master timelines:
       · one master numpy ZERO-SIGNAL array per speaker, exactly matching the
         duration of the original media (the master audio clock)
       · every row is cloned with the speaker's clean voice profile + emotion
         paralinguistic tags (English · Hindi · Spanish)
-      · OVERPRESSURE FIX — if a generated clip would bleed into the next
-        sequential line, it is time-stretched with librosa (non-pitch-shifting,
-        up to 1.15×) so it snaps inside its slot without moving the clock.
+      · TWO-WAY FIT — each clip is fitted onto its own SRT slot with librosa's
+        PHASE-VOCODER time-stretch (pitch-preserving):
+          · over-long  → compressed, capped at `fit_max_speed` (default 1.35×),
+                         then hard-trimmed with a 30 ms fade as a last resort
+          · short      → optionally stretched, floored at `fit_min_speed`
+                         (default 0.90×). OFF by default.
+
+    `fit_stretch_short` is off on purpose: a line that ends 0.4 s inside its
+    slot leaves 0.4 s of natural silence, whereas slowing the speech to consume
+    it sounds slurred. Only compression is audibly a *fix*, so only compression
+    runs unprompted. Both caps are plain arguments, so Tab 2/3 can expose them
+    as knobs without touching this function.
+
+    (Phase vocoder, NOT WSOLA: `librosa.effects.time_stretch` is phase-vocoder
+    based. It is transparent to roughly 1.3× and gets metallic beyond that,
+    which is why the cap is a tunable rather than a hidden constant.)
     """
     import numpy as np
     import soundfile as sf
@@ -4280,17 +4579,27 @@ def step7_synthesize(log: Log, force: bool = False,
             continue
 
         gen_s = clip.size / sr
-        speed, trimmed = 1.0, False
-        if clip.size > max_samples:
-            # overpressure fix · non-pitch-shifting time stretch (≤ 1.15×)
-            speed = float(min(max_speedup, clip.size / max_samples))
+        # ── TWO-WAY fit onto this line's own slot ────────────────────────────
+        # ratio > 1 ⇒ the clip overruns its slot (would bleed into the next
+        # speaker's window) ⇒ compress. ratio < 1 ⇒ it underruns ⇒ optionally
+        # stretch, clamped at fit_min_speed so a short line is never stretched
+        # into slurred speech just to close a silence.
+        ratio = (clip.size / max_samples) if max_samples else 1.0
+        speed, trimmed, mode = 1.0, False, "fit"
+        if ratio > 1.0:
+            speed = float(min(fit_max_speed, ratio))
+            mode = "compressed"
+        elif ratio < 1.0 and fit_stretch_short:
+            speed = float(max(fit_min_speed, ratio))
+            mode = "stretched"
+        if abs(speed - 1.0) > 1e-3:
             clip = librosa.effects.time_stretch(y=clip, rate=speed)
-            if clip.size > max_samples:          # last resort: hard snap + fade
-                fade = int(0.03 * sr)
-                clip = clip[:max_samples]
-                if clip.size > fade:
-                    clip[-fade:] *= np.linspace(1.0, 0.0, fade).astype(np.float32)
-                trimmed = True
+        if clip.size > max_samples:          # last resort: hard snap + fade
+            fade = int(0.03 * sr)
+            clip = clip[:max_samples]
+            if clip.size > fade:
+                clip[-fade:] *= np.linspace(1.0, 0.0, fade).astype(np.float32)
+            trimmed, mode = True, "trimmed"
 
         pos = int(start * sr)
         end = min(pos + clip.size, n_total)
@@ -4303,12 +4612,16 @@ def step7_synthesize(log: Log, force: bool = False,
 
         report["rows"].append({"index": row.get("index"), "speaker": spk,
                                "start": round(start, 3),
+                               "slot_s": round(avail, 3),
                                "available_s": round(avail, 3),
                                "generated_s": round(gen_s, 3),
-                               "speed": round(speed, 3), "trimmed": trimmed})
-        if speed > 1.0 or i % 25 == 0 or i == len(timeline):
-            note = (f" · stretched ×{speed:.2f}" + (" + trimmed" if trimmed else "")
-                    if speed > 1.0 else "")
+                               "speed": round(speed, 3),
+                               "mode": mode, "trimmed": trimmed})
+        if abs(speed - 1.0) > 1e-3 or i % 25 == 0 or i == len(timeline):
+            note = ("" if abs(speed - 1.0) <= 1e-3
+                    else f" · {mode} ×{speed:.2f}")
+            if trimmed:
+                note += " + trimmed"
             log(f"   {i}/{len(timeline)} · row {row.get('index')} [{spk}] "
                 f"{gen_s:.2f}s → slot {avail:.2f}s{note}")
 
@@ -4339,12 +4652,43 @@ def step7_synthesize(log: Log, force: bool = False,
                  master, sr, subtype="FLOAT")
     report["elapsed_s"] = round(time.time() - t0, 1)
     report["failed_rows"] = failed_rows
+
+    # ── per-line fit accounting (auditable, not just logged) ─────────────────
+    rows = report["rows"]
+    comp = [r for r in rows if r.get("mode") == "compressed"]
+    stretch = [r for r in rows if r.get("mode") == "stretched"]
+    trim = [r for r in rows if r.get("trimmed")]
+    rates = sorted(r["speed"] for r in rows if r["speed"] > 1.0)
+    report["fit"] = {
+        "fit_max_speed": fit_max_speed, "fit_min_speed": fit_min_speed,
+        "stretch_short": bool(fit_stretch_short),
+        "n_rows": len(rows), "n_compressed": len(comp),
+        "n_stretched": len(stretch), "n_trimmed": len(trim),
+        "max_rate": round(rates[-1], 3) if rates else 1.0,
+        "median_rate": round(rates[len(rates) // 2], 3) if rates else 1.0,
+    }
     TTS_REPORT_JSON.write_text(json.dumps(report, indent=2, ensure_ascii=False),
                                encoding="utf-8")
-    stretched = sum(1 for r in report["rows"] if r["speed"] > 1.0)
+    try:
+        _write_csv(LINE_FIT_CSV,
+                   ["Row", "Speaker", "Start", "Slot_s", "Generated_s",
+                    "Rate", "Mode", "Trimmed"],
+                   [[r["index"], r["speaker"], fmt_ts(r["start"]),
+                     f"{r['slot_s']:.3f}", f"{r['generated_s']:.3f}",
+                     f"{r['speed']:.3f}", r["mode"],
+                     "yes" if r["trimmed"] else "no"] for r in rows])
+    except Exception as e:
+        log(f"   ⚠ row-fit CSV skipped: {type(e).__name__}: {e}")
+
     log(f"✅ Step 7 [{eid}] → {len(masters)} padded track(s) · "
-        f"{len(report['rows'])} row(s) rendered in {report['elapsed_s']}s · "
-        f"{stretched} overlap-protection stretch(es)")
+        f"{len(rows)} row(s) rendered in {report['elapsed_s']}s · "
+        f"{len(comp)} compressed · {len(stretch)} stretched · "
+        f"{len(trim)} hard-trimmed")
+    if report["fit"]["max_rate"] > 1.0:
+        log(f"   fit: worst ×{report['fit']['max_rate']:.2f} · "
+            f"median ×{report['fit']['median_rate']:.2f} "
+            f"(caps ×{fit_max_speed:.2f} … ×{fit_min_speed:.2f}, "
+            f"short-line stretch {'ON' if fit_stretch_short else 'off'})")
     return report
 
 

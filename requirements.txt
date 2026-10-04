@@ -15,8 +15,20 @@ gradio>=4.44.0
 torch>=2.1.0
 torchaudio>=2.1.0
 demucs==4.0.1                # Step 2 · Meta Demucs v4 (pinned — known-good)
-pyannote.audio==3.1.1        # Step 3 · Pyannote 3.1 (exact — 4.x exists upstream)
-funasr>=1.1.4,<2             # Step 4 · SenseVoice-Small (bounded range)
+
+# Steps 3 & 4 depend on WHICH pipeline module you launch — app.py's Tab 1
+# switcher picks between them. Everything is listed here so one fresh install
+# can run any of the three without a second `pip install`.
+#
+#   pipeline.py / pipeline2.py · Pyannote 3.1 + SenseVoice-Small
+#     ⚠ Pyannote 3.1 is GATED — accept the repo terms on huggingface and pass
+#       a token via Tab 1 ▸ Advanced (or HUGGING_FACE_HUB_TOKEN).
+#   new_pipeline.py            · Silero-VAD + FunASR CAM++ + scikit-learn
+#     ✅ No gate, no token (NEEDS_HF_TOKEN=False) — a plain install is enough.
+pyannote.audio==3.1.1        # LEGACY ONLY (pipeline/pipeline2 Step 3) — 4.x upstream
+silero-vad>=5.0              # new_pipeline · Step 3 VAD (MIT, ungated; wheel ≈ 11 MB)
+scikit-learn>=1.4            # new_pipeline · Step 3 AgglomerativeClustering
+funasr>=1.1.4,<2             # Step 4 · emotion2vec_plus_large (new) / SenseVoice (legacy)
 modelscope>=1.17,<2          # model hub used by FunASR downloads
 huggingface_hub>=0.25        # Gradio 6.x requires ≥0.25; Pyannote works via _hf_hub_compat() patch
 
@@ -30,7 +42,7 @@ indic-transliteration   # Step 5.5 Roman -> Devanagari
 moviepy>=1.0.3               # Step 1 fallback extractor (if FFmpeg missing)
 ffmpeg-python==0.2.0
 tqdm
-librosa>=0.10.0              # Step 7 · non-pitch-shifting time-stretch (overlap protection)
+librosa>=0.10.0              # Step 7 · two-way phase-vocoder time-stretch (per-line slot fit)
 
 # ── TTS engines · installed LAZILY at load time, on purpose ────────
 # chatterbox-tts and kokoro are deliberately NOT listed here:
