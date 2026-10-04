@@ -290,6 +290,8 @@ Net model cache for `new_pipeline.py` is therefore roughly **+1.0 GB** versus `p
 
 Sizes above come from the HF API (`usedStorage` / per-file `size`) and the ModelScope API (`StorageSize`), not from an estimate.
 
+FunASR reports a failed model download as `<raw hub id> is not registered`, because `download_from_ms` downgrades every exception to a bare `print()`. Step 3 therefore tries ModelScope first and falls back to FunASR's official Hugging Face mirror (`funasr/campplus`), capturing stdout so the real fault (SSL / proxy / offline) reaches the log. Step 4 deliberately has **no** ModelScope fallback: that export returns 4 labels instead of 9, so it fails loudly rather than silently mislabelling.
+
 **Steady-state 2.0 model cache ≈ 4,183 MB (4.08 GiB)** + 84 MB Demucs ⇒ **≈ 4.27 GB (~4.2 GiB)**. Two independent confirmations:
 
 - `README.md:405` states "Model caches (one-time) **~5 GB**" — close, and slightly conservative.

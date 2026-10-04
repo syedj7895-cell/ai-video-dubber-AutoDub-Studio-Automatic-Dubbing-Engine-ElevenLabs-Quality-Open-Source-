@@ -1588,6 +1588,117 @@ if _npl is not None:
     check("legacy PYANNOTE/SENSEVOICE ids are never called as models",
           "PYANNOTE_MODEL" not in _s3 and "SENSEVOICE_MODEL" not in _s4)
 
+    # ── regression: each function must import the names IT uses ──────────────
+    # Both real runtime bugs in this step were `NameError: name 'X' is not
+    # defined` inside a function that treated a name as if it were module-level.
+    # `_vad_regions` lost Silero and silently fell back to energy VAD; a missing
+    # AutoModel import would abort the stage outright. Checking the function's
+    # own source catches the whole class, not just the two we happened to hit.
+    for _fn, _needle in (
+        ("_vad_regions", "import torch"),
+        ("_load_silero_vad", "import torch"),
+        ("_funasr_auto", "from funasr import AutoModel"),
+        ("_funasr_auto", "redirect_stdout"),
+    ):
+        _src = inspect.getsource(getattr(_npl, _fn))
+        check(f"{_fn}() imports/uses its own '{_needle}'", _needle in _src)
+
+    # FunASR reports a failed download as "<raw hub id> is not registered", so a
+    # single AutoModel call can only ever fail confusingly. Step 3 must offer a
+    # second hub; Step 4 must NOT, because ModelScope's export has 4 classes.
+    check("CAM++ has an official Hugging Face fallback id",
+          getattr(_npl, "CAMPPLUS_MODEL_HF", "") == "funasr/campplus")
+    # NOTE `_s3`/`_s4` are .lower() copies — needles must be written lowercase.
+    check("step3 loads CAM++ through the multi-route loader",
+          "_load_campplus(" in _s3
+          and "automodel(model=campplus_model" not in _s3)
+    check("step4 loads emotion2vec through the loader, HF only",
+          "_funasr_auto(" in _s4 and 'hub="hf"' in _s4)
+    check("step4 offers no modelscope fallback (wrong label count)",
+          _npl.EMOTION2VEC_MODEL.split("/")[0] == "iic"
+          and _s4.count("modelscope ·") == 0)
+
+    # Static proof that no name is USED without being IMPORTED. This is the
+    # exact class of bug that produced both runtime failures above: a name that
+    # looks module-level but never was. pyflakes is optional, so skip cleanly.
+    try:
+        from pyflakes.api import checkPath as _pf_check
+        from pyflakes.reporter import Reporter as _pf_rep
+    except ImportError:
+        skip("no used-but-never-imported names", "pyflakes not installed")
+    else:
+        import io as _pfio
+        _root = Path(__file__).resolve().parents[1]
+        _srcs = [_root / _f for _f in ("new_pipeline.py", "app.py")]
+        _srcs = [_p for _p in _srcs if _p.exists()]
+        if not _srcs:
+            skip("no used-but-never-imported names", "sources not found")
+        else:
+            _bad: list = []
+            for _p in _srcs:
+                _out, _err = _pfio.StringIO(), _pfio.StringIO()
+                try:
+                    _pf_check(str(_p), _pf_rep(_out, _err))
+                except Exception:
+                    continue
+                _bad += [_l for _l in (_out.getvalue() + _err.getvalue()).splitlines()
+                         if "undefined name" in _l]
+            check("no used-but-never-imported names in new_pipeline/app",
+                  not _bad)
+
+    # ── _funasr_auto really falls back, and reports funasr's SWALLOWED error ──
+    # FunASR downgrades a failed download to a bare print(), so without
+    # capturing stdout the operator only ever sees "<hub id> is not registered"
+    # and has no idea the actual fault was SSL/proxy/offline.
+    import types as _t2
+    _saved_fun = sys.modules.get("funasr")
+    _fun_mod = _t2.ModuleType("funasr")
+    _am_calls: list = []
+    _am_logs: list = []
+
+    def _mk_auto(fail_on):
+        def _AutoModel(**kw):
+            _am_calls.append(kw.get("model"))
+            if len(_am_calls) - 1 in fail_on:
+                print("Download: %s failed!: SSL certificate expired"
+                      % kw.get("model"))
+                raise AssertionError(f'{kw.get("model")} is not registered')
+            return f"MODEL#{len(_am_calls)}"
+        return _AutoModel
+
+    _am_routes = [("modelscope · iic/x", {"model": "iic/x"}),
+                  ("huggingface · funasr/y", {"model": "funasr/y", "hub": "hf"})]
+
+    try:
+        _fun_mod.AutoModel = _mk_auto({0})          # first hub fails, second works
+        sys.modules["funasr"] = _fun_mod
+        _got = _npl._funasr_auto(_am_routes, "cpu", _am_logs.append, "CAM++")
+        check("_funasr_auto falls back to the second hub", _got == "MODEL#2")
+        check("…trying hubs in the order given",
+              _am_calls == ["iic/x", "funasr/y"])
+        check("…logging the failure and then the success",
+              any("modelscope" in _m and "failed" in _m for _m in _am_logs)
+              and any("huggingface" in _m and "✓" in _m for _m in _am_logs))
+
+        _am_calls.clear()
+        _am_logs.clear()
+        _fun_mod.AutoModel = _mk_auto({0, 1})       # every hub fails
+        try:
+            _npl._funasr_auto(_am_routes, "cpu", _am_logs.append, "CAM++")
+            _boom = None
+        except RuntimeError as _e:
+            _boom = str(_e)
+        check("a total failure raises RuntimeError, not a bare assert",
+              _boom is not None)
+        check("…naming every hub that was tried",
+              bool(_boom) and "modelscope" in _boom and "huggingface" in _boom)
+        check("…and surfacing funasr's swallowed download error",
+              bool(_boom) and "SSL certificate expired" in _boom)
+    finally:
+        sys.modules.pop("funasr", None)
+        if _saved_fun is not None:
+            sys.modules["funasr"] = _saved_fun
+
 
     # ── the four CSV side-cars ──────────────────────────────────────────────
     _CSVS = (("SPEAKER_TURNS_CSV", "speaker_turns.csv"),

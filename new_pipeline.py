@@ -272,6 +272,10 @@ EMOTION_INSTRUCT = {
 #  (`_estimate_gender`) — it is validated by selftest §12 and needs no model.
 DIAR_ENGINE = "silero-vad + campplus-192d + agglomerative"
 CAMPPLUS_MODEL = "iic/speech_campplus_sv_en_voxceleb_16k"
+# Official FunASR mirror on Hugging Face. ModelScope is the primary route for
+# CAM++; this is the automatic fallback when modelscope.cn is unreachable
+# (SSL / proxy / offline), which is the usual reason AutoModel fails.
+CAMPPLUS_MODEL_HF = "funasr/campplus"
 # Shown in Tab 1's live "Pipeline:" chip, which IS re-derived on every switcher
 # flip — so the step 3/4 toolchain named on screen always matches the module
 # actually driving the app.
@@ -1315,6 +1319,7 @@ def _load_silero_vad(device: str, log: Log):
     except Exception as e:
         first = f"{type(e).__name__}: {e}"
     try:
+        import torch  # torch.hub fallback — must be imported, not assumed
         model, _utils = torch.hub.load("snakers4/silero-vad", "silero_vad",
                                        trust_repo=True, onnx=False)
         return model, True
@@ -1329,7 +1334,12 @@ def _vad_regions(mono, sr: int, vad_model, log: Log) -> List[List[float]]:
     Silero-VAD when available, otherwise a pure-numpy energy VAD — the step
     must still produce a timeline on a machine that has torch but no model.
     """
+    # `torch` is imported HERE, not at module scope: this function is the only
+    # place in Step 3 that needs it, and a missing module-scope import turned
+    # into `NameError: name 'torch' is not defined` at inference time — which
+    # silently dropped us to the energy VAD.
     import numpy as np
+    import torch
     t0 = time.time()
     log("🎙 Detecting speech regions (VAD) …")
     if vad_model is not None:
@@ -1369,6 +1379,72 @@ def _vad_regions(mono, sr: int, vad_model, log: Log) -> List[List[float]]:
     log(f"   energy-VAD fallback: {len(ivs)} speech region(s) "
         f"· {time.time() - t0:.1f}s")
     return _merge_intervals(ivs)
+
+
+def _funasr_auto(routes: List[tuple], device: str, log: Log, what: str):
+    """Build a FunASR `AutoModel` from the first route that works.
+
+    Why this exists instead of one `AutoModel(...)` call:
+
+    FunASR does **not** surface download failures. `download_from_ms` catches
+    every exception and downgrades it to a bare `print(...)`, leaving
+    `kwargs["model"]` as the raw hub id; `build_model` then asserts
+    `<id> is not registered`. The message you actually see therefore names the
+    *model* rather than the fault (expired SSL cert, proxy, offline box,
+    missing `modelscope`), which is why this helper captures stdout/stderr
+    around the call and reports both the assertion and what FunASR printed.
+    """
+    import contextlib
+    import io as _io
+
+    # Imported HERE: `step3`/`step4` only probe for funasr above to raise a
+    # step-specific "pip install funasr" message, so this helper cannot rely on
+    # a name they imported. Without this line the call dies with
+    # `NameError: name 'AutoModel' is not defined` — the same class of bug as
+    # the missing `torch` import in `_vad_regions`.
+    try:
+        from funasr import AutoModel
+    except ImportError as e:
+        missing = getattr(e, "name", None) or str(e)
+        raise RuntimeError(
+            f"{what} needs FunASR — module '{missing}' is not installed. "
+            "Fix:  pip install funasr modelscope") from e
+
+    notes: List[str] = []
+    for label, kwargs in routes:
+        buf = _io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                model = AutoModel(device=device, disable_update=True,
+                                  disable_pbar=True, **kwargs)
+            log(f"   ✓ {label} · device={device}")
+            return model
+        except Exception as e:
+            captured = [ln for ln in (buf.getvalue() or "").splitlines() if ln.strip()]
+            funasr_said = captured[-1] if captured else "(nothing printed)"
+            notes.append(f"   ✗ {label}\n"
+                         f"       {type(e).__name__}: {e}\n"
+                         f"       funasr printed: {funasr_said}")
+            log(f"   ⚠ {label} failed — {type(e).__name__}: {e}")
+    raise RuntimeError(
+        f"{what} could not be loaded from any hub:\n" + "\n".join(notes)
+        + "\n\nCheck network reachability of modelscope.cn and huggingface.co, "
+        "or pre-download one of those repos and pass its local directory."
+    )
+
+
+def _load_campplus(device: str, log: Log):
+    """CAM++ speaker embeddings, ModelScope first, Hugging Face as fallback.
+
+    ModelScope is primary because it hosts the English VoxCeleb CAM++ we chose;
+    HF is the fallback because `funasr/campplus` (FunASR's own mirror, shipping
+    both `configuration.json` and `config.yaml`) is usually reachable when
+    modelscope.cn is not.
+    """
+    return _funasr_auto(
+        [(f"modelscope · {CAMPPLUS_MODEL}", {"model": CAMPPLUS_MODEL}),
+         (f"huggingface · {CAMPPLUS_MODEL_HF}", {"model": CAMPPLUS_MODEL_HF, "hub": "hf"})],
+        device, log, "CAM++ speaker embedding")
 
 
 def _campplus_embed(model, segs, log: Log):
@@ -1496,8 +1572,10 @@ def step3_diarization(hf_token: Optional[str],
     _torchaudio_compat()   # shim APIs removed in torchaudio ≥ 2.9
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
     _torch_load_compat()   # restore legacy torch.load default for trusted checkpoints
+    # Dependency probe — gives a step-specific install hint. `_funasr_auto`
+    # does its own import, but this runs first so the message names Step 3.
     try:
-        from funasr import AutoModel
+        from funasr import AutoModel  # noqa: F401
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
@@ -1542,9 +1620,8 @@ def step3_diarization(hf_token: Optional[str],
             t += hop_s
     log(f"✂ {len(regions)} region(s) → {len(segs)} embedding window(s)")
 
-    log(f"🧠 Loading CAMPPlus · {CAMPPLUS_MODEL} · device={device}")
-    sv_model = AutoModel(model=CAMPPLUS_MODEL, device=device,
-                         disable_update=True, disable_pbar=True)
+    log(f"🧠 Loading CAMPPlus · device={device}")
+    sv_model = _load_campplus(device, log)
     embs, kept = _campplus_embed(sv_model, segs, log)
     del sv_model
     log("   " + clear_gpu_cache())
@@ -1873,8 +1950,9 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
     _torchaudio_compat()   # shim removed APIs before funasr's import chain
     _numpy2_compat()       # restore np.NaN / np.float_ aliases for NumPy 2.x
     _torch_load_compat()   # restore legacy torch.load default for trusted checkpoints
+    # Dependency probe — step-specific install hint; `_funasr_auto` imports it.
     try:
-        from funasr import AutoModel
+        from funasr import AutoModel  # noqa: F401
     except ImportError as e:
         missing = getattr(e, "name", None) or str(e)
         raise RuntimeError(
@@ -1896,9 +1974,12 @@ def step4_emotion_analysis(log: Log, force: bool = False) -> List[dict]:
     t0 = time.time()
     # hub="hf" is REQUIRED. The modelscope resolution path queries a different
     # emotion2vec export that returns FOUR classes instead of nine, which would
-    # silently fold 'disgusted'/'fearful'/'surprised' onto 'neutral'.
-    model = AutoModel(model=EMOTION2VEC_MODEL, hub="hf", device=device,
-                      disable_update=True, disable_pbar=True)
+    # silently fold 'disgusted'/'fearful'/'surprised' onto 'neutral'. There is
+    # deliberately NO modelscope fallback here — it would succeed and hand back
+    # the wrong label set. If HF is unreachable we fail loudly instead.
+    model = _funasr_auto([(f"huggingface · {EMOTION2VEC_MODEL}",
+                           {"model": EMOTION2VEC_MODEL, "hub": "hf"})],
+                         device, log, "emotion2vec+ (Step 4)")
 
     mono, sr = _load_vocals_16k()
     grid: List[dict] = []
