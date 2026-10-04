@@ -1603,6 +1603,36 @@ if _npl is not None:
         _src = inspect.getsource(getattr(_npl, _fn))
         check(f"{_fn}() imports/uses its own '{_needle}'", _needle in _src)
 
+    # ── regression: the Silero CUDA/CPU clash ───────────────────────────────
+    # `model.to("cuda")` on the TorchScript bundle relocates the weights but not
+    # the LSTM state the script allocates internally, so the first forward pass
+    # died with  RuntimeError: Expected all tensors to be on the same device, but
+    # got weight is on cuda:0, different from other tensors on cpu  and Step 3
+    # fell back to the energy VAD on every T4 session.
+    _sil_src = inspect.getsource(_npl._load_silero_vad)
+    check("Silero-VAD is never moved onto the step device (no .to(device))",
+          ".to(device)" not in _sil_src)
+    check("new_pipeline defines _module_device()",
+          callable(getattr(_npl, "_module_device", None)))
+    _vad_src = inspect.getsource(_npl._vad_regions)
+    check("_vad_regions builds the waveform on the model's own device",
+          "_module_device(vad_model)" in _vad_src and "audio.to(mdev)" in _vad_src)
+
+    # _module_device must read a real device, and must not explode on an object
+    # that exposes neither parameters() nor buffers() — e.g. the OnnxWrapper.
+    class _FakeDev:
+        def __init__(self, d):
+            self.device = d
+
+    class _FakeMod:
+        def parameters(self):
+            return iter([_FakeDev("cuda:0")])
+
+    check("_module_device reads a module's real device",
+          _npl._module_device(_FakeMod()) == "cuda:0")
+    check("_module_device answers 'cpu' for an opaque object",
+          _npl._module_device(object()) == "cpu")
+
     # FunASR reports a failed download as "<raw hub id> is not registered", so a
     # single AutoModel call can only ever fail confusingly. Step 3 must offer a
     # second hub; Step 4 must NOT, because ModelScope's export has 4 classes.
@@ -1853,6 +1883,39 @@ check("auto_btn orders spk_hint → translit → diag like the signature does",
       and _au_in.index("translit_in") < _au_in.index("diag_in"))
 check("auto_btn leaves diag_in (a bool) in the LAST, diagnostic slot",
       _au_in is not None and _au_in[-1] == "diag_in")
+
+# BUG 3 · Tab 3's STOP button was RENDERED (`stop_btn = gr.Button("🛑 STOP")`)
+# but never bound to any handler, so `_stop_auto` — and the `_stop_event` the
+# auto-pilot polls between stages — could never be triggered from the UI. Its
+# own caption promised "STOP halts between stages". With `demo.queue()` at the
+# default concurrency there was therefore no way to abort a runaway render
+# except killing the Colab cell, which the browser reports as
+# "Connection to the server was lost".
+_stop_click = next((_n for _n in _ast.walk(_app_tree)
+                    if isinstance(_n, _ast.Call)
+                    and isinstance(_n.func, _ast.Attribute)
+                    and _n.func.attr == "click"
+                    and isinstance(_n.func.value, _ast.Name)
+                    and _n.func.value.id == "stop_btn"), None)
+check("Tab 3 STOP button is bound to a click handler", _stop_click is not None)
+check("…and that handler is _stop_auto, the _stop_event setter",
+      _stop_click is not None
+      and any(_k.arg == "fn" and getattr(_k.value, "id", None) == "_stop_auto"
+              for _k in _stop_click.keywords))
+check("_stop_auto reaches the same Event the auto-pilot polls",
+      "_stop_event.set()" in _app_src
+      and "_stop_event.clear()" in _app_src
+      and "_stop_event.is_set()" in _app_src)
+
+# The auto-pilot polls `_stop_event` after EVERY stage and between each of the
+# 15 one-second review ticks, so the button takes effect promptly rather than
+# only after the whole render.
+_auto_src = _app_src.split("def _run_full_auto(", 1)[-1].split("\ndef ", 1)[0]
+check("auto-pilot checks the stop flag after every stage",
+      _auto_src.count("_stop_event.is_set()") >= 5)
+check("auto-pilot polls the stop flag once per review tick",
+      "if _stop_event.is_set():" in _auto_src
+      and "time.sleep(1)" in _auto_src)
 
 # Every generator yield must be as wide as the outputs list it feeds, or
 # Gradio silently drops the tail of the stream.

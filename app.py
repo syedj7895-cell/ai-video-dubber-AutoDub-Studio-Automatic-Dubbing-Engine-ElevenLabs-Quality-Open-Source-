@@ -1336,6 +1336,23 @@ def build_ui() -> gr.Blocks:
             inputs=None,
             outputs=[diar_tbl, emo_tbl],
         )
+        # STOP — rendered beside Auto-pilot but previously left UNBOUND, so the
+        # caption "🛑 STOP halts between stages" was untrue and the only way out
+        # of a runaway render was killing the Colab cell, which the browser
+        # reports as "Connection to the server was lost". `_stop_auto` only flips
+        # the module-level Event the auto-pilot polls between stages, so it
+        # returns instantly.
+        # ⚠ Do NOT give this listener a shared `concurrency_id`. Gradio keys its
+        # queues by `concurrency_id or str(id(fn))`, so two distinct Python
+        # functions are two distinct queues and this click is dispatched while
+        # `_run_full_auto` is still streaming. A shared id would fold it into the
+        # auto-pilot's single-slot group and the button would go dead again —
+        # queued behind the very render it exists to abort.
+        stop_btn.click(
+            fn=_stop_auto,
+            inputs=None,
+            outputs=[render_status],
+        )
         render_btn.click(
             fn=_run_rendering,
             inputs=[diag_in],

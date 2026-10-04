@@ -1296,6 +1296,22 @@ def _mine_clone_prompts(log: Log,
 #  STEP 3 PRIMITIVES — Silero-VAD · CAMPPlus embeddings · clustering
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _module_device(model) -> str:
+    """Best-effort device string ("cpu" / "cuda:0") for a torch module.
+
+    Reads the first parameter, then the first buffer. A lazily-loaded
+    TorchScript module can expose neither, and "cpu" is the honest answer
+    there: it is where a freshly-built tensor is born.
+    """
+    for _getter in ("parameters", "buffers"):
+        try:
+            for _t in getattr(model, _getter)():
+                return str(_t.device)
+        except Exception:
+            pass
+    return "cpu"
+
+
 def _load_silero_vad(device: str, log: Log):
     """Load Silero-VAD (MIT, ~2 MB) → (model, True), else (None, False).
 
@@ -1306,15 +1322,27 @@ def _load_silero_vad(device: str, log: Log):
 
     The model needs only `torch`: we always hand it an in-memory float32
     tensor, never a path, so no audio backend (torchcodec/sox/FFmpeg) is needed.
+
+    `device` is accepted for call-site symmetry with the CAM++ loader and is
+    deliberately NOT applied to the model — see the CPU note below.
     """
     first = ""
     try:
         from silero_vad import load_silero_vad       # pip install silero-vad
+        # ── Silero stays on CPU ON PURPOSE ──────────────────────────────────
+        # `load_silero_vad()` returns a TorchScript module whose LSTM state
+        # (`_h`, `_c`, `_context`) is allocated INSIDE the script and is not a
+        # registered buffer, so moving the module to "cuda" relocates the
+        # weights and leaves that state on the CPU. The first forward pass then
+        # dies with
+        #     RuntimeError: Expected all tensors to be on the same device, but
+        #     got weight is on cuda:0, different from other tensors on cpu
+        # which dropped Step 3 to the energy VAD on every T4 session. The
+        # checkpoint is ~2 MB and a 45 s track is ~0.2 s of CPU work, so the
+        # GPU buys nothing here while the mismatch costs the whole Silero path.
+        # `_vad_regions` still aligns the waveform with `_module_device()`, so
+        # the hub fallback (or a future GPU-capable wrapper) stays correct.
         model = load_silero_vad()
-        try:
-            model = model.to(device)
-        except Exception:
-            pass
         return model, True
     except Exception as e:
         first = f"{type(e).__name__}: {e}"
@@ -1345,8 +1373,19 @@ def _vad_regions(mono, sr: int, vad_model, log: Log) -> List[List[float]]:
     if vad_model is not None:
         try:
             from silero_vad import get_speech_timestamps
+            audio = torch.from_numpy(
+                np.ascontiguousarray(mono, dtype=np.float32))
+            # The waveform must ride on the MODEL's device: `get_speech_timestamps`
+            # slices THIS tensor and hands the slices straight to the forward
+            # pass, so CPU audio + cuda weights is a hard RuntimeError rather
+            # than a warning. Silero is pinned to CPU in `_load_silero_vad`, but
+            # aligning here means the torch.hub fallback — or any future
+            # GPU-capable wrapper — cannot reintroduce the mismatch.
+            mdev = _module_device(vad_model)
+            if str(audio.device) != mdev:
+                audio = audio.to(mdev)
             ts = get_speech_timestamps(
-                torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32)),
+                audio,
                 vad_model, sampling_rate=int(sr), return_seconds=False,
                 min_speech_duration_ms=250, min_silence_duration_ms=100,
                 speech_pad_ms=30)
