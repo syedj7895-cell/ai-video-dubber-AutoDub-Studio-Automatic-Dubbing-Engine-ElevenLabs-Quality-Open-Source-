@@ -1483,6 +1483,56 @@ def _in_colab() -> bool:
         return False
 
 
+def _patch_session_queue(demo) -> str:
+    """Defuse gradio-app/gradio#13895 (a cancelled SSE stream wipes the queue).
+
+    Gradio buffers browser messages per SESSION in
+    `Queue.pending_messages_per_session`, but `routes.sse_stream`'s
+    `except BaseException` deletes that session entry whenever the long-lived
+    event stream is cancelled — a backgrounded tab, a navigation, or the
+    gradio.live proxy closing an idle connection. The frontend then reopens
+    its stream WITHOUT a fresh `queue/join` (it has nothing new to send), the
+    server answers 404 `session_not_found`, and the UI sticks on
+    "server disconnected … attempting reconnection". That is what every
+    Tab 3 click showed even though pre-flight/render are pure `Path.exists()`
+    checks that never touch a model or CosyVoice — the connection layer dies
+    BEFORE the handler runs.
+
+    Workaround from the issue thread: make `__delitem__` a no-op so a
+    cancelled stream can no longer destroy the session's queue; the reconnect
+    finds the queue still there and self-heals. Eviction is unaffected —
+    `popitem()` does not route through `__delitem__`, so the LRU still bounds
+    the map at `max_size`.
+
+    Swaps only the map (always empty here — the server has not accepted a
+    single `queue/join` before `launch`), version-guarded so any Gradio
+    without the attribute just reports OFF instead of breaking the launch.
+    Returns a one-line status for the launch banner.
+    """
+    q = getattr(demo, "_queue", None)
+    inner = (getattr(q, "pending_messages_per_session", None)
+             if q is not None else None)
+    if inner is None:
+        return ("OFF (demo.queue() not run)" if q is None else
+                "OFF (gradio has no per-session queue map)")
+    if type(inner).__name__ == "_StickySessionMap":
+        return "ON (already applied)"
+    try:
+        _sticky = type("_StickySessionMap", (type(inner),), {
+            "__delitem__": lambda self, key: None,  # swallow the cancel-path del
+        })
+        q.pending_messages_per_session = _sticky(
+            max_size=getattr(inner, "max_size", 100))
+    except Exception as e:  # pragma: no cover — never block the launch
+        return f"OFF ({type(e).__name__}: {e})"
+    try:
+        import gradio as _gr
+        _ver = getattr(_gr, "__version__", "?")
+    except Exception:  # pragma: no cover
+        _ver = "?"
+    return f"ON (gradio {_ver})"
+
+
 if __name__ == "__main__":
     print(_launch_banner(), flush=True)
     demo = build_ui()
@@ -1493,4 +1543,9 @@ if __name__ == "__main__":
     )
     if _IS_G6:                                 # v6 home for the visual params
         launch_kwargs.update(theme=_make_theme(), css=CSS, head=HEAD)
-    demo.queue().launch(**launch_kwargs)
+    demo.queue()
+    # gradio#13895: patch AFTER queue() builds the session map, BEFORE launch
+    # opens the first stream. The status line rides the launch banner.
+    print(f" session queue patch (#13895): {_patch_session_queue(demo)}",
+          flush=True)
+    demo.launch(**launch_kwargs)

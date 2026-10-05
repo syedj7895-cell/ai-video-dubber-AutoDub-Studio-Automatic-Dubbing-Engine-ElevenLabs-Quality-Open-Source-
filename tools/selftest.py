@@ -2001,6 +2001,85 @@ for _fn in ("_run_matching", "_run_full_auto"):
           "_speaker_hint(num_speakers)" in _fs
           and "int(num_speakers) if" not in _fs)
 
+# ── § 19d · Tab 3's "server disconnected" toast is gradio#13895 ──────────────
+# Every Tab 3 click (pre-flight, render, auto) showed Gradio's
+# "server disconnected … attempting reconnection" toast on an idle T4 — yet
+# `_run_readiness` is nine `.exists()` calls and CosyVoice only imports inside
+# a real Step 7 render, so no handler could cause it. The failure is
+# transport-level: gradio#13895 lets any cancelled SSE stream (backgrounded
+# tab, gradio.live idle cut) delete the SESSION's
+# `pending_messages_per_session` entry in `routes.sse_stream`'s
+# `except BaseException`, so the frontend's reconnect gets 404
+# `session_not_found` and loops. `_patch_session_queue` must neutralise that
+# delete between `demo.queue()` (which builds the map) and `demo.launch()`.
+_ps_src = _fn_src("_patch_session_queue")
+check("app.py defines _patch_session_queue", _ps_src != "")
+check("the patch neutralises the cancel-path del (no-op __delitem__)",
+      "__delitem__" in _ps_src and "lambda self, key: None" in _ps_src)
+check("…and only swaps the map, never the queue object itself",
+      "q.pending_messages_per_session = _sticky" in _ps_src)
+_main_src = _app_src.split('if __name__ == "__main__":', 1)[-1]
+_qi = _main_src.find("demo.queue()")
+_pi = _main_src.find("_patch_session_queue(demo)")
+_li = _main_src.find("demo.launch(")
+check("patch runs after queue() builds the map, before launch opens streams",
+      _qi != -1 and _pi != -1 and _li != -1 and _qi < _pi < _li)
+check("the launch banner reports the patch status",
+      "session queue patch (#13895)" in _app_src)
+
+# Functional: with the wrapper in place, a cancel-path `del` must leave the
+# session intact while every other map operation still reaches the real cache.
+_ps_node = next((_n for _n in _app_tree.body
+                 if isinstance(_n, _ast.FunctionDef)
+                 and _n.name == "_patch_session_queue"), None)
+if _ps_node is not None:
+    class _FakeLRUCache:
+        """Stands in for gradio.utils.LRUCache (deletion IS effective here,
+        so the test fails loudly if the wrapper stops swallowing it)."""
+        def __init__(self, max_size=100):
+            self.max_size, self._d = max_size, {}
+
+        def __contains__(self, key):
+            return key in self._d
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+        def __setitem__(self, key, value):
+            self._d[key] = value
+
+        def __delitem__(self, key):
+            del self._d[key]
+
+        def get(self, key, default=None):
+            return self._d.get(key, default)
+
+    _ns_ps: dict = {}
+    exec(compile(_ast.Module(body=[_ps_node], type_ignores=[]),
+                 "app.py", "exec"), _ns_ps)
+    _patch = _ns_ps["_patch_session_queue"]
+    _demo_stub = type("_Demo", (), {})()
+    _demo_stub._queue = type("_Queue", (), {})()
+    _demo_stub._queue.pending_messages_per_session = _FakeLRUCache()
+    _status = _patch(_demo_stub)
+    _map = _demo_stub._queue.pending_messages_per_session
+    check("patch reports ON when the queue has a session map",
+          _status.startswith("ON"))
+    check("…and the wrapper subclasses the original map type",
+          isinstance(_map, _FakeLRUCache))
+    _map["s1"] = "m1"                      # a session registers after launch
+    del _map["s1"]                         # …then its stream is cancelled
+    check("a cancel-path del can no longer wipe the session queue",
+          "s1" in _map)
+    _map["s2"] = "m2"
+    check("…while set/get/in still reach the real map",
+          _map.get("s2") == "m2" and "s2" in _map)
+    check("patch is idempotent (second call reports already applied)",
+          _patch(_demo_stub) == "ON (already applied)")
+    check("patch reports OFF instead of raising when queue() was never run",
+          _patch(type("_NoQ", (), {})()).startswith("OFF"))
+
+passed = sum(results)
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)
