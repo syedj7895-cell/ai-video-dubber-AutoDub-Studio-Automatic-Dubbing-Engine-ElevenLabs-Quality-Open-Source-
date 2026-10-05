@@ -7,6 +7,7 @@
 #  Run:  python tools/selftest.py
 # ═══════════════════════════════════════════════════════════════════════════
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -2079,7 +2080,63 @@ if _ps_node is not None:
     check("patch reports OFF instead of raising when queue() was never run",
           _patch(type("_NoQ", (), {})()).startswith("OFF"))
 
-passed = sum(results)
+# Layer 2 · the SAME cancel path then calls clean_events(session_hash=…),
+# which sets alive=False on the session's RUNNING jobs and drops its queued
+# events — so one proxy blip mid-Step-7 would kill the render even with the
+# session map sticky. Only the two SSE-teardown sites call it session-wide
+# (/cancel uses remove_from_queue + cancel_tasks), so swallowing
+# session-scoped calls cannot break intentional cancellation.
+check("the patch also wraps clean_events (layer 2 of the cancel path)",
+      "_sticky_clean" in _ps_src and "q.clean_events = _sticky_clean" in _ps_src)
+check("…session-scoped teardown is swallowed, event-scoped still runs",
+      "session_hash is not None and event_id is None" in _ps_src)
+
+
+class _FakeQueue2:
+    """Queue stub carrying BOTH maps, with an async clean_events recorder —
+    deletion IS effective here, so the test fails loudly if the wrapper
+    stops swallowing session-scoped teardown. clean_events is a real method
+    so that `getattr(q, "clean_events")` is BOUND, exactly like Gradio's
+    Queue instance attribute the patch captures."""
+
+    def __init__(self):
+        self.pending_messages_per_session = _FakeLRUCache()
+        self.cleaned = []
+
+    async def clean_events(self, *, session_hash=None, event_id=None):
+        self.cleaned.append((session_hash, event_id))
+
+
+_ns_l2: dict = {}
+exec(compile(_ast.Module(body=[_ps_node], type_ignores=[]), "app.py", "exec"),
+     _ns_l2)
+_demo_l2 = type("_Demo2", (), {})()
+_demo_l2._queue = _FakeQueue2()
+_status_l2 = _ns_l2["_patch_session_queue"](_demo_l2)
+check("layer-2 patch reports ON when the queue has clean_events",
+      _status_l2.startswith("ON"))
+asyncio.run(_demo_l2._queue.clean_events(session_hash="s1"))
+check("a session-scoped clean_events (SSE teardown) is swallowed",
+      _demo_l2._queue.cleaned == [])
+asyncio.run(_demo_l2._queue.clean_events(event_id="e1"))
+check("…while an event-scoped clean_events still reaches the queue",
+      _demo_l2._queue.cleaned == [(None, "e1")])
+
+# VRAM pre-flight (Tab 3) · Gemini's "free GPU memory before rendering",
+# in its implementable form: a kernel restart would kill the Gradio server
+# mid-session, so the pipeline flushes whatever Tabs 1–2 left on the GPU and
+# REPORTS it before Step 6/7 — an OOM during the TTS engine load otherwise
+# kills python app.py, which the browser can only report as "Connection to
+# the server was lost".
+_vram_src = {name: (Path(_ROOT) / f"{name}.py").read_text(encoding="utf-8")
+             for name in ("pipeline", "pipeline2", "new_pipeline")}
+for _name, _text in _vram_src.items():
+    _rr = _text.split("def run_rendering(", 1)[-1].split("\ndef ", 1)[0]
+    check(f"[{_name}] Tab 3 run_rendering opens with a VRAM pre-flight",
+          "🧹 VRAM pre-flight" in _rr and "clear_gpu_cache()" in _rr)
+    check(f"[{_name}] pre-flight reports VRAM state before Step 6 runs",
+          "log_memory()" in _rr.split("step6_split_speaker_scripts", 1)[0])
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

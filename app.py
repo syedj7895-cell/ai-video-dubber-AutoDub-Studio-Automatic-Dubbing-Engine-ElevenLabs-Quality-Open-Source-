@@ -1484,30 +1484,43 @@ def _in_colab() -> bool:
 
 
 def _patch_session_queue(demo) -> str:
-    """Defuse gradio-app/gradio#13895 (a cancelled SSE stream wipes the queue).
+    """Defuse gradio-app/gradio#13895 — BOTH halves of the cancel path.
 
-    Gradio buffers browser messages per SESSION in
-    `Queue.pending_messages_per_session`, but `routes.sse_stream`'s
-    `except BaseException` deletes that session entry whenever the long-lived
-    event stream is cancelled — a backgrounded tab, a navigation, or the
-    gradio.live proxy closing an idle connection. The frontend then reopens
-    its stream WITHOUT a fresh `queue/join` (it has nothing new to send), the
-    server answers 404 `session_not_found`, and the UI sticks on
-    "server disconnected … attempting reconnection". That is what every
-    Tab 3 click showed even though pre-flight/render are pure `Path.exists()`
-    checks that never touch a model or CosyVoice — the connection layer dies
-    BEFORE the handler runs.
+    When an SSE stream is cancelled (backgrounded tab, a navigation, the
+    gradio.live proxy closing an idle connection), `routes.sse_stream`'s
+    `except BaseException` does TWO destructive things:
 
-    Workaround from the issue thread: make `__delitem__` a no-op so a
-    cancelled stream can no longer destroy the session's queue; the reconnect
-    finds the queue still there and self-heals. Eviction is unaffected —
-    `popitem()` does not route through `__delitem__`, so the LRU still bounds
-    the map at `max_size`.
+      1. `del pending_messages_per_session[session]` — deletes the SESSION's
+         message queue, so the frontend's reconnect (it reopens the stream
+         WITHOUT a fresh `queue/join`, having nothing new to send) gets 404
+         `session_not_found` and loops on "server disconnected … attempting
+         reconnection".
+      2. `await clean_events(session_hash=…)` — marks every RUNNING job of
+         that session `alive = False` and drops its queued events. So even
+         with (1) defused, one proxy blip mid-Step-7 silently kills the
+         render: `process_events` filters `awake_events` to the alive ones,
+         finds none, and returns — console frozen at the split/TTS boundary,
+         no completion ever delivered. This was the layer still leaking after
+         the sticky-map fix.
 
-    Swaps only the map (always empty here — the server has not accepted a
-    single `queue/join` before `launch`), version-guarded so any Gradio
-    without the attribute just reports OFF instead of breaking the launch.
-    Returns a one-line status for the launch banner.
+    Workarounds, both derived from the issue thread's analysis:
+      · the session map is replaced by a subclass whose `__delitem__` is a
+        no-op (eviction still bounds the cache — `popitem()` does not route
+        through `__delitem__`);
+      · `Queue.clean_events` is wrapped so session-scoped calls (the only
+        shape both SSE-teardown sites use) become no-ops, while explicit
+        event_id-scoped cleanup still reaches Gradio. The UI's 🛑 STOP and
+        Gradio's `/cancel` route use `remove_from_queue` + `cancel_tasks`,
+        NOT `clean_events`, so intentional cancellation is unaffected.
+
+    With both defused, a dropped stream is survivable: the job keeps
+    running, messages keep buffering into the sticky session queue, and the
+    reconnected stream drains the backlog and resumes the console.
+
+    Applied between `demo.queue()` (which builds the queue) and
+    `demo.launch()`; version-guarded so any Gradio without these internals
+    just reports OFF instead of breaking the launch. Returns a one-line
+    status for the launch banner.
     """
     q = getattr(demo, "_queue", None)
     inner = (getattr(q, "pending_messages_per_session", None)
@@ -1525,12 +1538,26 @@ def _patch_session_queue(demo) -> str:
             max_size=getattr(inner, "max_size", 100))
     except Exception as e:  # pragma: no cover — never block the launch
         return f"OFF ({type(e).__name__}: {e})"
+    # Layer 2 · a cancelled stream must not kill the session's running jobs.
+    try:
+        _orig_clean = getattr(q, "clean_events", None)
+        if _orig_clean is not None:
+
+            async def _sticky_clean(*, session_hash=None, event_id=None):
+                if session_hash is not None and event_id is None:
+                    return  # SSE teardown → keep the in-flight job alive
+                return await _orig_clean(session_hash=session_hash,
+                                         event_id=event_id)
+
+            q.clean_events = _sticky_clean
+    except Exception:  # pragma: no cover — layer 1 alone still helps
+        pass
     try:
         import gradio as _gr
         _ver = getattr(_gr, "__version__", "?")
     except Exception:  # pragma: no cover
         _ver = "?"
-    return f"ON (gradio {_ver})"
+    return f"ON (gradio {_ver}; sticky map + job-preserving cleanup)"
 
 
 if __name__ == "__main__":

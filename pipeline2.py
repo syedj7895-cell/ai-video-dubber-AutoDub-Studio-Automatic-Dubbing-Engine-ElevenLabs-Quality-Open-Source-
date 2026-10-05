@@ -4507,6 +4507,18 @@ def run_rendering(force: bool = False,
         if not FINAL_SCRIPT_JSON.exists():
             raise RuntimeError("Run Tab 2 first — final_script.json missing.")
 
+        # ── VRAM pre-flight ───────────────────────────────────────────────
+        # Steps 1–5 tear each model down as they finish, but an aborted or
+        # diagnostic-mode run can leave weights resident, and PyTorch's
+        # caching allocator never returns cached blocks on its own. Step 7's
+        # TTS engine is the single largest allocation of the pipeline, so
+        # flush whatever Tabs 1–2 left behind and report it — an OOM during
+        # the engine load otherwise surfaces as a dead process, which the
+        # browser can only report as "Connection to the server was lost".
+        yield log("🧹 VRAM pre-flight — releasing anything Tabs 1–2 left behind")
+        yield log("   " + clear_gpu_cache())
+        yield log("   " + log_memory())
+
         # ── Step 6 · split speaker scripts ─────────────────────────────────
         yield log("─" * 62)
         scripts_ok = False
