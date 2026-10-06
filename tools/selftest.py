@@ -2137,6 +2137,59 @@ for _name, _text in _vram_src.items():
     check(f"[{_name}] pre-flight reports VRAM state before Step 6 runs",
           "log_memory()" in _rr.split("step6_split_speaker_scripts", 1)[0])
 
+# ── § 20 · 🆕 New project — the top-corner reset must cover a full rerun ──────
+# A finished project left outputs/, uploads/ and PipelineState behind, and
+# run_import_and_analysis only cascade-invalidates when the source FILE NAME
+# differs — so a second audio (or a re-run under the same name) reused the
+# old project's caches, tables and players; the only escape was a restart.
+# The button must therefore (a) exist hidden, (b) be revealed only by the
+# post-render chains, (c) touch every per-project widget and NOTHING that is
+# a preference or a credential.
+_np_out = _wired("new_proj_btn", "outputs")
+check("new_proj_btn declared with visible=pipeline.FINAL_MIX_WAV.exists()",
+      "new_proj_btn = gr.Button(" in _APP
+      and "visible=bool(pipeline.FINAL_MIX_WAV.exists())" in _APP)
+check("new_proj_btn sits in the top bar above the tabs",
+      0 < _APP.find("gr.HTML(HERO)") < _APP.find("new_proj_btn = gr.Button(")
+      < _APP.find("with gr.Tabs():"))
+check("new_proj_btn.click wired with outputs", _np_out is not None)
+check("_reset_project returns one value per wired output",
+      _np_out is not None and _ret_widths("_reset_project") == [len(_np_out)])
+for _w in ("media_in", "srt_orig_in", "srt_trans_in", "import_log",
+           "analysis_status", "vocals_preview", "music_preview",
+           "match_log", "script_df", "emotion_log_tb", "clone_files",
+           "match_status", "spk_table", "spk_pick", "fix_row", "fix_spk",
+           "voz_speaker", "diar_tbl", "emo_tbl", "render_log",
+           "render_status", "final_audio", "original_audio", "final_video",
+           "ready_html"):
+    check(f"_reset_project clears {_w}", bool(_np_out) and _w in _np_out)
+for _w in ("hf_token_in", "pipe_in", "tts_engine_in", "translit_in",
+           "diag_in", "lang_orig_in", "lang_target_in", "persist_on",
+           "persist_token", "voz_pitch", "voz_rate", "voz_volume",
+           "voz_speed", "voz_partner", "voz_weight"):
+    check(f"_reset_project leaves {_w} alone", bool(_np_out) and _w not in _np_out)
+_np_src = _fn_src("_reset_project")
+check("_reset_project wipes outputs/ and uploads/ recursively",
+      "OUTPUTS_DIR" in _np_src and "UPLOADS_DIR" in _np_src
+      and "shutil.rmtree" in _np_src)
+check("_reset_project clears every cached step", "state.done.clear()" in _np_src)
+check("_reset_project reports locked files instead of raising",
+      "except OSError" in _np_src)
+_pa = _APP.split("_PROJECT_ARTIFACT_KEYS = ", 1)[-1].split("\n\n", 1)[0]
+check("_PROJECT_ARTIFACT_KEYS holds project keys only",
+      all(f'"{k}"' in _pa for k in ("source", "source_path", "source_lang",
+                                    "target_lang", "translit"))
+      and not any(f'"{k}"' in _pa
+                  for k in ("prosody", "kokoro", "tts_engine")))
+_ai = _APP.find("auto_btn.click(")
+_ri = _APP.find("render_btn.click(")
+check("render chain reveals the button after the master mix",
+      0 < _ri and _APP.find("fn=_new_project_visible", _ri) != -1)
+check("auto-pilot chain reveals the button too",
+      0 < _ai < _APP.find("fn=_new_project_visible"))
+check("_new_project_visible gates on FINAL_MIX_WAV",
+      "FINAL_MIX_WAV.exists()" in _fn_src("_new_project_visible"))
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

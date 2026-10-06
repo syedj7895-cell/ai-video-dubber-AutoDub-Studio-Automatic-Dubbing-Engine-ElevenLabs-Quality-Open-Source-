@@ -24,6 +24,7 @@ import html
 import importlib
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -300,7 +301,11 @@ gradio-dropdown, .gradio-dropdown, [data-testid="dropdown"],
   font-size: 1.2rem !important; }
 /* ensure the dropdown container doesn't clip the popup */
 .form, .gradio-dropdown, [data-testid="dropdown"] {
-  overflow: visible !important; }>>>>>>> REPLACE
+  overflow: visible !important; }
+
+/* top-right 🆕 New project reset — its own row under the hero */
+.corner-bar { justify-content: flex-end !important; align-items: center;
+  gap: 10px; margin-bottom: 10px; }
 
 @media (prefers-reduced-motion: reduce) {
   .gradio-container::before, .chip .dot, .tabitem { animation: none !important; }
@@ -560,6 +565,109 @@ def _stop_auto():
     """Callback for the STOP button — flips the global stop flag."""
     _stop_event.set()
     return _chip("err", "STOP signalled — halting after current stage")
+
+
+def _new_project_visible():
+    """🆕 New project button → visible exactly while a master mix exists.
+
+    Chained with `.then()` off render_btn / auto_btn, so it lights up the
+    moment Step 8 has written outputs/final_mix.wav — and `_reset_project`,
+    which deletes that file, hands `visible=False` back through its own
+    outputs. Reading the disk (instead of adding a yielded flag) keeps every
+    yield arity in `_run_rendering` / `_run_full_auto` untouched.
+    """
+    return gr.update(visible=bool(pipeline.FINAL_MIX_WAV.exists()))
+
+
+# Keys inside PipelineState.artifacts that belong to the CURRENT PROJECT.
+# Everything else in there (prosody steering, kokoro speed/blend, the chosen
+# TTS engine) is a persisted PREFERENCE and must survive a reset.
+_PROJECT_ARTIFACT_KEYS = ("source", "source_path", "source_lang",
+                          "target_lang", "translit")
+
+
+def _reset_project():
+    """🆕 New project · wipe the finished project, blank its widgets.
+
+    Deletes outputs/* (step audio, tables, clone prompts, master mix,
+    side-car CSVs …) and uploads/*, then rewrites state.json with every
+    cached step cleared but the preference keys kept — so the NEXT analysis
+    starts at Step 1 even when the new file shares the old file's name
+    (`run_import_and_analysis` only auto-invalidates on a DIFFERENT name).
+
+    Safe to click mid-stage: a file the pipeline holds open simply fails to
+    delete and is reported in the status chip instead of raising.
+    """
+    failed: list = []
+
+    def _wipe(root):
+        if not root.is_dir():
+            return
+        for entry in sorted(root.iterdir()):
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+            except OSError as e:
+                failed.append(f"{entry.name} ({e.strerror or e})")
+
+    _wipe(pipeline.OUTPUTS_DIR)   # state.json stays; rewritten immediately
+    _wipe(pipeline.UPLOADS_DIR)
+
+    state = pipeline.PipelineState.load()
+    state.done.clear()
+    for key in _PROJECT_ARTIFACT_KEYS:
+        state.artifacts.pop(key, None)
+    try:
+        state.save()
+    except OSError as e:
+        failed.append(f"state.json ({e.strerror or e})")
+
+    # Wiped first, so every refresh helper reads the EMPTY project:
+    # speaker_overview()/_script_rows()/_sidecar_rows() return [] on missing
+    # files, which empties the tables instead of showing the old project.
+    spk_table, spk_pick, fix_row, fix_spk, voz_speaker = _refresh_speakers()
+    diar_tbl, emo_tbl = _refresh_tables()
+    msg = (_chip("err", "⚠ Still busy — wait for the running stage, then "
+                 "retry · " + "; ".join(failed[:3]))
+           if failed else
+           _chip("ok", "New project ready — upload your next master file."))
+
+    return (
+        gr.update(visible=False),                    # new_proj_btn — hide
+        msg,                                          # new_proj_msg
+        None,                                         # media_in
+        None,                                         # srt_orig_in
+        None,                                         # srt_trans_in
+        "Auto",                                       # spk_hint_in
+        "",                                           # import_log
+        _chip("idle", "Waiting for a master file"),   # analysis_status
+        None,                                         # vocals_preview
+        None,                                         # music_preview
+        "",                                           # match_log
+        [],                                           # script_df
+        "",                                           # emotion_log_tb
+        None,                                         # clone_files
+        _chip("idle", "Not started"),                 # match_status
+        "",                                           # spk_name
+        "",                                           # spk_gender
+        "",                                           # fix_msg
+        "",                                           # spk_save_msg
+        "",                                           # voz_voice
+        "",                                           # voz_msg
+        None,                                         # voz_preview
+        "",                                           # upload_progress
+        "",                                           # upload_msg
+        "",                                           # render_log
+        _chip("idle", "Not rendered yet"),            # render_status
+        None,                                         # final_audio
+        None,                                         # original_audio
+        None,                                         # final_video
+        _checklist({}),                               # ready_html
+        spk_table, spk_pick, fix_row, fix_spk, voz_speaker,
+        diar_tbl, emo_tbl,
+    )
 
 
 def _original_audio():
@@ -930,6 +1038,21 @@ def build_ui() -> gr.Blocks:
 
         gr.HTML(HERO)
 
+        # ── 🆕 New project · top-right corner ────────────────────────────────
+        # Built hidden unless outputs/final_mix.wav already exists (a project
+        # rendered in an earlier session), then flipped on by
+        # `_new_project_visible` chained with `.then()` off render_btn /
+        # auto_btn — so it is on screen exactly while a finished project is
+        # waiting to be reset. Default concurrency id (str(id(fn))): it must
+        # never fold into the render/auto queue, see the gradio#13895 note.
+        with gr.Row(elem_classes=["corner-bar"]):
+            new_proj_btn = gr.Button(
+                "➕ New project",
+                variant="secondary",
+                visible=bool(pipeline.FINAL_MIX_WAV.exists()),
+                elem_id="new-project-btn")
+            new_proj_msg = gr.HTML("")
+
         with gr.Tabs():
 
             # ════════════════ TAB 1 · FILE IMPORT & ANALYSIS ════════════════
@@ -1299,6 +1422,22 @@ def build_ui() -> gr.Blocks:
                                        elem_classes=["glass", "pad"])
 
         # ── event wiring ────────────────────────────────────────────────────
+        # 🆕 New project — top-corner reset. 37 outputs: every per-project
+        # widget on Tabs 1–3 plus the button itself. Own concurrency queue
+        # (default str(id(fn))) — never fold it into the render/auto group.
+        new_proj_btn.click(
+            fn=_reset_project,
+            inputs=None,
+            outputs=[new_proj_btn, new_proj_msg, media_in, srt_orig_in,
+                     srt_trans_in, spk_hint_in, import_log, analysis_status,
+                     vocals_preview, music_preview, match_log, script_df,
+                     emotion_log_tb, clone_files, match_status, spk_name,
+                     spk_gender, fix_msg, spk_save_msg, voz_voice, voz_msg,
+                     voz_preview, upload_progress, upload_msg, render_log,
+                     render_status, final_audio, original_audio, final_video,
+                     ready_html, spk_table, spk_pick, fix_row, fix_spk,
+                     voz_speaker, diar_tbl, emo_tbl],
+        )
         analyze_btn.click(
             fn=_run_analysis,
             inputs=[media_in, srt_orig_in, srt_trans_in, hf_token_in,
@@ -1335,6 +1474,11 @@ def build_ui() -> gr.Blocks:
             fn=_refresh_tables,
             inputs=None,
             outputs=[diar_tbl, emo_tbl],
+        ).then(
+            # Auto-pilot's Step 8 → same top-corner 🆕 button reveal.
+            fn=_new_project_visible,
+            inputs=None,
+            outputs=[new_proj_btn],
         )
         # STOP — rendered beside Auto-pilot but previously left UNBOUND, so the
         # caption "🛑 STOP halts between stages" was untrue and the only way out
@@ -1358,6 +1502,12 @@ def build_ui() -> gr.Blocks:
             inputs=[diag_in],
             outputs=[render_log, final_audio, final_video, render_status,
                      original_audio],
+        ).then(
+            # Step 8 wrote outputs/final_mix.wav → reveal the top-corner
+            # 🆕 New project button (own queue, default concurrency id).
+            fn=_new_project_visible,
+            inputs=None,
+            outputs=[new_proj_btn],
         )
         # The source track exists from Step 1, so fill the player as soon as the
         # tab is opened instead of making people render first. Guarded because
