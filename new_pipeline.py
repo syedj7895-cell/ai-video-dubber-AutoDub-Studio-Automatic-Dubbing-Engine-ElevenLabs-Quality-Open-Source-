@@ -86,6 +86,10 @@ STATE_JSON = OUTPUTS_DIR / "state.json"                   # pipeline state
 # the machine contract Steps 5–7 read, the CSV is for humans and Excel.
 SPEAKER_TURNS_CSV = OUTPUTS_DIR / "speaker_turns.csv"     # Step 3 · VAD+cluster turns
 DIAR_CUES_CSV = OUTPUTS_DIR / "diarization_cues.csv"      # Step 3 · per-cue speaker
+# Step 3 · candidate-cut + MERGE/FOLD/UNCERTAIN diagnostics (finding 17). One
+# row per evaluated cut level and per cleanup operation, so an over-count can
+# be READ off real data instead of guessed at.
+CLUSTER_REPORT_CSV = OUTPUTS_DIR / "cluster_report.csv"
 EMOTION_GRID_CSV = OUTPUTS_DIR / "emotion_grid.csv"       # Step 4 · speaker/emotion
 LINE_FIT_CSV = OUTPUTS_DIR / "line_fit_report.csv"        # Step 7 · per-line fit
 
@@ -1183,6 +1187,83 @@ def step2_separate_vocals(log: Log, force: bool = False) -> Tuple[Path, Path]:
 #            (Silero-VAD → CAMPPlus 192-d → AgglomerativeClustering)
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ── Diarization tuning knobs (finding 17: 3 real speakers → 4–8 reported) ────
+# Every value below is NAMED (not inlined) so outputs/cluster_report.csv can be
+# read against them and re-calibrated on a real recording instead of guessed.
+#
+# Silero: minimum pause that splits one speech region into two. The old 100 ms
+# cut breaths and micro-pauses into their own regions, so one speaker's sentence
+# became several tiny regions whose single short-window embeddings were noise →
+# phantom clusters. Real turn changes carry ≥300 ms of silence; 200 ms keeps
+# them split while re-gluing breath-level gaps.
+VAD_MIN_SILENCE_MS = 200
+
+# CAMPPlus window / hop. 1.5 s / 0.75 s was too short: emotion, loudness and
+# microphone shifts made ONE person land in several acoustic clusters. ~2.5 s
+# matches what speaker-verification practice uses for a stable 192-d vector,
+# and 1.0 s hop still keeps a mid-region turn change separable.
+EMB_WIN_S = 2.5
+EMB_HOP_S = 1.0
+
+# A corroborating embedding taken across an entire (long) VAD region. Capped so
+# memory stays flat. VAD splits on SILENCE, not on speaker changes — so if the
+# region really holds two voices this fingerprint disagrees with the region's
+# short-window majority and is flagged UNCERTAIN in step3 rather than trusted.
+EMB_WHOLE_MIN_S = 4.0
+EMB_WHOLE_MAX_S = 5.0
+
+# Auto-cut candidate levels for `_cluster_speakers`. ALL are fitted, scored and
+# compared; the old code accepted the FIRST level that produced 2–12 groups —
+# 0.50 came first, so a fragmented 7 was "good enough" and 3 never examined.
+CUT_LEVELS = (0.50, 0.60, 0.70, 0.40, 0.80, 0.30, 0.90)
+# Candidates whose score is within this of the best are considered "equally
+# good" — the SMALLER speaker count wins among them (prefer the simpler
+# explanation, never a hard-coded 3).
+_CUT_TIE_EPS = 0.02
+# Per-single-window cluster penalty in the cut score: one row is never a voice.
+_CUT_TINY_PENALTY = 0.03
+
+# Cleanup pass (B/C/D): centroid cosine at/above which two clusters are the
+# SAME voice and must merge (fragmented speakers). Conservative on purpose —
+# FunASR's own clustering merges at 0.78, but that is pre-Demucs audio, so we
+# start higher and log every pair's similarity into cluster_report.csv to tune
+# against real data.
+CLUSTER_MERGE_SIM = 0.80
+# Fold floor: a tiny cluster whose nearest centroid sits BELOW this similarity
+# is ambiguous — still folded (it may not invent a speaker) but flagged
+# UNCERTAIN so it can never decide a count or a region vote.
+CLUSTER_FOLD_SIM = 0.55
+# Clearly-different tiny voice: nearest-centroid cosine BELOW this means the
+# cluster is clearly not any existing speaker — preserved as its own speaker
+# when it has ≥ 2 windows and ≥ 1.5 s (PDF rule: fold fragments, but never
+# merge away a real person who only spoke briefly).
+CLUSTER_DISTINCT_SIM = 0.30
+# A window whose best-vs-second-best centroid margin is below this, OR whose
+# similarity to its own centroid is below the floor, is MIXED/WEAK evidence
+# (overlapping speech, Demucs artifact): kept on the timeline, excluded from
+# speaker-count decisions and from region votes.
+CLUSTER_MIXED_MARGIN = 0.05
+CLUSTER_MIN_SELF_SIM = 0.30
+# Tiny cluster = less speech than max(2 s, CLUSTER_TINY_FRAC × total speech).
+CLUSTER_TINY_SEC = 2.0
+CLUSTER_TINY_FRAC = 0.04
+
+_CLUSTER_REPORT_HEADER = ["stage", "action", "threshold", "k", "sizes",
+                          "durations_s", "within_sim", "between_sim",
+                          "tiny", "score", "note"]
+# Rows accumulate here (cleared per Step 3 run) and are written as
+# outputs/cluster_report.csv in step3's guarded side-car block.
+_CLUSTER_REPORT: List[List] = []
+
+
+def _cluster_report(action: str, stage: str = "cut", threshold="",
+                    k="", sizes="", durations_s="", within_sim="",
+                    between_sim="", tiny="", score="", note="") -> None:
+    """Append one diagnostic row for outputs/cluster_report.csv."""
+    _CLUSTER_REPORT.append([stage, action, threshold, k, sizes, durations_s,
+                            within_sim, between_sim, tiny, score, note])
+
+
 def _score_window(mono, sr: int, a: float, b: float,
                   other_ivs: List[Tuple[float, float]]):
     """
@@ -1387,10 +1468,12 @@ def _vad_regions(mono, sr: int, vad_model, log: Log) -> List[List[float]]:
             ts = get_speech_timestamps(
                 audio,
                 vad_model, sampling_rate=int(sr), return_seconds=False,
-                min_speech_duration_ms=250, min_silence_duration_ms=100,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=VAD_MIN_SILENCE_MS,
                 speech_pad_ms=30)
             ivs = [(t["start"] / float(sr), t["end"] / float(sr)) for t in ts]
             log(f"   Silero-VAD: {len(ivs)} speech region(s) "
+                f"· pause-split ≥{VAD_MIN_SILENCE_MS} ms "
                 f"· {time.time() - t0:.1f}s")
             return _merge_intervals(ivs)
         except Exception as e:
@@ -1520,12 +1603,61 @@ def _campplus_embed(model, segs, log: Log):
     return (np.vstack(embs) if embs else np.zeros((0, 0), np.float32)), keep
 
 
+def _cluster_sizes(labels) -> str:
+    """'3,12,1' — per-cluster row counts, sorted by cluster id (CSV helper)."""
+    import numpy as np
+    labels = np.asarray(labels)
+    uniq = sorted(int(c) for c in np.unique(labels))
+    return ",".join(str(int((labels == c).sum())) for c in uniq)
+
+
+def _cluster_quality(embs, labels):
+    """(within, between, tiny) quality triple for one candidate cut.
+
+    within  — mean cosine of every row to its OWN centroid (higher = windows
+              agree about who they are).
+    between — per cluster, the cosine to its NEAREST OTHER centroid, then the
+              mean of those (lower = the explanation is cleanly separated).
+              Nearest-neighbour rather than all pairs on purpose: splitting
+              one voice into two tight fragments is penalised hard, while the
+              all-pairs mean barely notices.
+    tiny    — clusters holding a single row (never a voice on their own).
+    """
+    import numpy as np
+    embs = np.asarray(embs, dtype=np.float32)
+    labels = np.asarray(labels, dtype=int)
+    uniq = [int(c) for c in np.unique(labels)]
+    pos = {c: i for i, c in enumerate(uniq)}
+    cents = []
+    for c in uniq:
+        v = embs[labels == c].mean(axis=0)
+        nv = float(np.linalg.norm(v))
+        cents.append(v / nv if nv > 1e-9 else v)
+    cents = np.vstack(cents)
+    own = np.sum(embs * cents[[pos[int(x)] for x in labels]], axis=1)
+    within = float(own.mean()) if own.size else 0.0
+    if len(uniq) > 1:
+        sims = cents @ cents.T
+        np.fill_diagonal(sims, -np.inf)
+        between = float(sims.max(axis=1).mean())
+    else:
+        between = 0.0
+    tiny = int(sum(1 for c in uniq if int((labels == c).sum()) <= 1))
+    return within, between, tiny
+
+
 def _cluster_speakers(embs, n_hint: int, log: Log):
     """Cluster cosine-normalised embeddings → one integer label per row.
 
     `n_hint` is Tab 2's 'Expected speakers' hint and becomes `n_clusters` when
-    supplied. Without it we sweep the cosine distance threshold instead of
-    trusting one hard-coded cut, which reliably over-splits a long recording.
+    supplied — a hard constraint no later stage may weaken. Without it, EVERY
+    candidate cut level in `CUT_LEVELS` is fitted and SCORED
+    (within − nearest-other separation − tiny-cluster penalty) and the best
+    score wins; candidates within `_CUT_TIE_EPS` of the best are "equally
+    good" and the SMALLER speaker count takes it. The old code accepted the
+    FIRST cut that yielded 2–12 groups — 0.50 came first, so a fragmented 7
+    was "good enough" and 3 was never considered (finding 17). Every candidate
+    is appended to `_CLUSTER_REPORT` for outputs/cluster_report.csv.
     Returns an int array aligned with `embs`.
     """
     import numpy as np
@@ -1546,21 +1678,193 @@ def _cluster_speakers(embs, n_hint: int, log: Log):
         lab = AgglomerativeClustering(n_clusters=hint, metric="cosine",
                                       linkage="average").fit_predict(embs)
         k = hint
+        _cluster_report("selected", threshold=f"hint={k}", k=k,
+                        sizes=_cluster_sizes(lab),
+                        note="Expected speakers — hard constraint")
+        log(f"   agglomerative clustering → {k} speaker cluster(s) "
+            f"· expected-speakers hint")
+        return np.asarray(lab, dtype=int)
+
+    # Auto: fit EVERY candidate cut, score all of them, choose the best —
+    # never "the first one that produced a legal-looking group count".
+    cands: List[tuple] = []
+    for thr in CUT_LEVELS:
+        lab = AgglomerativeClustering(
+            n_clusters=None, distance_threshold=float(thr),
+            metric="cosine", linkage="average").fit_predict(embs)
+        lab = np.asarray(lab, dtype=int)
+        k = len(set(int(x) for x in lab))
+        within, between, tiny = _cluster_quality(embs, lab)
+        score = within - between - _CUT_TINY_PENALTY * tiny
+        ok = 2 <= k <= 12
+        _cluster_report("candidate", threshold=float(thr), k=k,
+                        sizes=_cluster_sizes(lab),
+                        within_sim=round(within, 4),
+                        between_sim=round(between, 4),
+                        tiny=tiny, score=round(score, 4),
+                        note="" if ok else "rejected · k outside 2–12")
+        log(f"   cut {thr:.2f} → {k} cluster(s) · within={within:.3f} "
+            f"nearest-other={between:.3f} tiny={tiny} score={score:.3f}"
+            + ("" if ok else "  (rejected: k outside 2–12)"))
+        if ok:
+            cands.append((float(score), k, float(thr), lab))
+    if not cands:                     # nothing separable, or one huge cluster
+        chosen = (1, np.zeros(n, dtype=int))
+        _cluster_report("selected", k=1,
+                        note="no cut produced 2–12 clusters → single voice")
     else:
-        chosen = None
-        for thr in (0.50, 0.60, 0.70, 0.40, 0.80, 0.30, 0.90):
-            lab = AgglomerativeClustering(
-                n_clusters=None, distance_threshold=float(thr),
-                metric="cosine", linkage="average").fit_predict(embs)
-            k = len(set(int(x) for x in lab))
-            if 2 <= k <= 12:
-                chosen = (k, lab)
-                break
-        if chosen is None:            # nothing separable, or one huge cluster
-            chosen = (1, np.zeros(n, dtype=int))
-        k, lab = chosen
+        best = max(c[0] for c in cands)
+        near = [c for c in cands if c[0] >= best - _CUT_TIE_EPS]
+        # equally good → fewer speakers; then higher score; then lower cut.
+        score, k, thr, lab = sorted(near, key=lambda c: (c[1], -c[0], c[2]))[0]
+        within, between, tiny = _cluster_quality(embs, lab)
+        chosen = (k, lab)
+        _cluster_report("selected", threshold=thr, k=k,
+                        sizes=_cluster_sizes(lab),
+                        within_sim=round(within, 4),
+                        between_sim=round(between, 4),
+                        tiny=tiny, score=round(score, 4),
+                        note="best score; ties → fewer speakers "
+                             "(sizes ∝ speech time, uniform hop)")
+        log(f"   auto-cut selected thr={thr:.2f} → {k} speaker cluster(s) "
+            f"· score={score:.3f}")
+    k, lab = chosen
     log(f"   agglomerative clustering → {k} speaker cluster(s)")
     return np.asarray(lab, dtype=int)
+
+
+def _cleanup_clusters(embs, labels, durs, n_hint: int, log: Log):
+    """Post-clustering verification pass → (labels, uncertain).
+
+    The report's cleanup layer on top of whatever `_cluster_speakers` produced
+    (finding 17):
+
+      MERGE     two cluster centroids ≥ CLUSTER_MERGE_SIM — one voice the cut
+                fragmented into several acoustic groups;
+      FOLD      a cluster with less speech than max(2 s, 4 % of total) folds
+                into its nearest centroid (≥ CLUSTER_FOLD_SIM), or folds with
+                an UNCERTAIN flag when ambiguous;
+      KEEP      a tiny cluster CLEARLY unlike anyone (nearest centroid
+                < CLUSTER_DISTINCT_SIM) with ≥ 2 windows and ≥ 1.5 s stays its
+                own speaker — fold fragments, never erase a person;
+      UNCERTAIN per-window margin/self-similarity check afterwards: mixed or
+                weak windows (overlap, Demucs residue) keep their timeline
+                label but are returned in `uncertain` so step3 can exclude
+                them from count decisions and region votes;
+      hint      `n_hint > 0` (Expected speakers) is a hard floor: structural
+                ops stop at N, so the final count is exactly N.
+
+    Every operation is logged and appended to `_CLUSTER_REPORT`
+    (outputs/cluster_report.csv). Returns (labels, uncertain-bool array).
+    """
+    import numpy as np
+    embs = np.asarray(embs, dtype=np.float32)
+    labels = np.asarray(labels, dtype=int).copy()
+    n = int(labels.shape[0])
+    if n == 0:
+        return labels, np.zeros(0, dtype=bool)
+    durs_list = [] if durs is None else list(durs)
+    durs_arr = np.asarray([float(d) for d in durs_list], dtype=np.float64)
+    if durs_arr.size != n:
+        durs_arr = np.ones(n, dtype=np.float64)
+    uncertain = np.zeros(n, dtype=bool)
+    floor = max(1, int(n_hint or 0))
+    k_before = len(np.unique(labels))
+    kept_ids: set = set()
+
+    def _centers():
+        """(sorted ids, unit centroids, row counts, total seconds) per cluster."""
+        uniq = sorted(int(c) for c in np.unique(labels))
+        cents, rows, secs = {}, {}, {}
+        for c in uniq:
+            rows[c] = int((labels == c).sum())
+            secs[c] = float(durs_arr[labels == c].sum())
+            v = embs[labels == c].mean(axis=0)
+            nv = float(np.linalg.norm(v))
+            cents[c] = v / nv if nv > 1e-9 else v
+        return uniq, cents, rows, secs
+
+    def _snap(action, threshold="", note=""):
+        uniq, _cu, rows, secs = _centers()
+        _cluster_report(action, stage="cleanup", threshold=threshold,
+                        k=len(uniq),
+                        sizes=",".join(str(rows[c]) for c in uniq),
+                        durations_s=",".join(f"{secs[c]:.1f}" for c in uniq),
+                        note=note)
+
+    # ① MERGE — same voice, fragmented by the cut.
+    while True:
+        uniq, cents, rows, secs = _centers()
+        if len(uniq) <= floor:
+            break
+        best = None
+        for i, a in enumerate(uniq):
+            for b in uniq[i + 1:]:
+                sim = float(np.dot(cents[a], cents[b]))
+                if best is None or sim > best[0]:
+                    best = (sim, a, b)
+        if best is None or best[0] < CLUSTER_MERGE_SIM:
+            break
+        sim, a, b = best
+        winner, loser = ((a, b) if (secs[a], rows[a]) >= (secs[b], rows[b])
+                         else (b, a))
+        labels[labels == loser] = winner
+        note = f"cluster {loser} → {winner} · centroid cosine {sim:.3f}"
+        log(f"   MERGE: {note}")
+        _snap("MERGE", threshold=CLUSTER_MERGE_SIM, note=note)
+    # ② FOLD tiny clusters — or KEEP a clearly-distinct small voice.
+    while True:
+        uniq, cents, rows, secs = _centers()
+        if len(uniq) <= floor:
+            break
+        tiny_floor = max(CLUSTER_TINY_SEC,
+                         CLUSTER_TINY_FRAC * float(sum(secs.values())))
+        cands = [c for c in uniq if c not in kept_ids and secs[c] < tiny_floor]
+        if not cands:
+            break
+        c = min(cands, key=lambda x: (secs[x], rows[x]))
+        sim, target = max((float(np.dot(cents[c], cents[o])), o)
+                          for o in uniq if o != c)
+        if sim < CLUSTER_DISTINCT_SIM and rows[c] >= 2 and secs[c] >= 1.5:
+            kept_ids.add(c)
+            note = (f"cluster {c} · distinct small voice ({secs[c]:.1f}s, "
+                    f"nearest cosine {sim:.3f})")
+            log(f"   KEEP: {note}")
+            _snap("KEEP", threshold=CLUSTER_DISTINCT_SIM, note=note)
+            continue
+        idx = labels == c
+        labels[idx] = target
+        if sim >= CLUSTER_FOLD_SIM:
+            action, note = "FOLD", f"cluster {c} → {target} · cosine {sim:.3f}"
+        else:
+            action = "UNCERTAIN"
+            note = f"cluster {c} → {target} · ambiguous cosine {sim:.3f}"
+            uncertain[idx] = True
+        log(f"   {action}: {note}")
+        _snap(action, threshold=CLUSTER_FOLD_SIM, note=note)
+
+    # Deterministic compaction: label 0 = longest talker (Speaker ordering
+    # still comes from time-ranking later — this only removes id gaps).
+    uniq, _c0, rows, secs = _centers()
+    order = sorted(uniq, key=lambda c: (-secs[c], -rows[c], c))
+    remap = {old: new for new, old in enumerate(order)}
+    labels = np.array([remap[int(x)] for x in labels], dtype=int)
+
+    # ③ UNCERTAIN windows — weak own-centroid match or no clear winner.
+    uniq, cents, _r, _s = _centers()
+    C = np.vstack([cents[c] for c in uniq])           # label ids are 0..k-1 now
+    sims = embs @ C.T
+    own = sims[np.arange(n), labels]
+    uncertain |= own < CLUSTER_MIN_SELF_SIM
+    if len(uniq) > 1:
+        part = np.partition(sims, -2, axis=1)
+        uncertain |= (part[:, -1] - part[:, -2]) < CLUSTER_MIXED_MARGIN
+    n_unc = int(uncertain.sum())
+    log(f"   cleanup: {k_before} → {len(uniq)} cluster(s) "
+        f"· {n_unc} uncertain window(s)")
+    _snap("FINAL",
+          note=f"{k_before} → {len(uniq)} clusters · {n_unc} uncertain windows")
+    return labels, uncertain
 
 
 def _write_csv(path: Path, header: List[str], rows: List[List]) -> None:
@@ -1641,23 +1945,39 @@ def step3_diarization(hf_token: Optional[str],
             "Step 2 produced a non-silent vocal stem.")
 
     # ── ② sub-segment → CAMPPlus embeddings ──────────────────────────────────
-    # 1.5 s windows on a 0.75 s hop: long enough for a stable speaker vector,
-    # short enough that a turn change inside one VAD region stays separable.
-    win_s, hop_s = 1.5, 0.75
+    # ~2.5 s windows on a 1.0 s hop: long enough that emotion/loudness shifts
+    # don't shatter ONE person into several acoustic clusters (the old 1.5 s
+    # did), short enough that a turn change inside a VAD region stays
+    # separable (finding 17). Long regions additionally get ONE corroborating
+    # fingerprint over their whole span (capped): VAD splits on silence, not
+    # speakers, so if that fingerprint disagrees with the region's own short
+    # windows step3 flags it UNCERTAIN below instead of trusting it.
+    win_s, hop_s = EMB_WIN_S, EMB_HOP_S
     segs: List = []
     owners: List[int] = []              # region index per window
+    win_durs: List[float] = []          # seconds per window, parallel to segs
+    whole_idx: set = set()              # seg indices spanning a whole region
     for ri, (a, b) in enumerate(regions):
         if (b - a) < 0.4:
             segs.append(mono[int(a * sr):int(b * sr)])
             owners.append(ri)
+            win_durs.append(float(b - a))
             continue
         t = a
         while t < b - 0.3:
             e = min(b, t + win_s)
             segs.append(mono[int(t * sr):int(e * sr)])
             owners.append(ri)
+            win_durs.append(float(e - t))
             t += hop_s
-    log(f"✂ {len(regions)} region(s) → {len(segs)} embedding window(s)")
+        if (b - a) >= EMB_WHOLE_MIN_S:
+            e = min(b, a + EMB_WHOLE_MAX_S)
+            whole_idx.add(len(segs))
+            segs.append(mono[int(a * sr):int(e * sr)])
+            owners.append(ri)
+            win_durs.append(float(e - a))
+    log(f"✂ {len(regions)} region(s) → {len(segs)} embedding window(s) "
+        f"· {win_s:.1f}s window / {hop_s:.1f}s hop")
 
     log(f"🧠 Loading CAMPPlus · device={device}")
     sv_model = _load_campplus(device, log)
@@ -1665,15 +1985,41 @@ def step3_diarization(hf_token: Optional[str],
     del sv_model
     log("   " + clear_gpu_cache())
 
-    # ── ③ cluster → one speaker per VAD region (majority vote) ───────────────
+    # ── ③ cluster → cleanup → one speaker per VAD region (majority vote) ─────
+    # The cleanup pass (MERGE / FOLD / KEEP + mixed-window flags) runs BEFORE
+    # any counting: the old pipeline trusted the raw cut, so one fragmented
+    # voice became Speakers 4–8 (finding 17). Uncertain windows keep their
+    # label for the timeline but don't vote — unless a region holds nothing
+    # else, because the timeline must stay complete.
+    _CLUSTER_REPORT.clear()
     labels = _cluster_speakers(embs, int(expected_speakers or 0), log)
     turns: List[dict] = []
     if len(labels):
+        durs = [win_durs[i] for i in kept]
+        labels, uncertain = _cleanup_clusters(
+            embs, labels, durs, int(expected_speakers or 0), log)
+        # A whole-region fingerprint that disagrees with the region's own
+        # short-window majority is flagged, not trusted: VAD regions are
+        # bounded by silence, so one region CAN contain a turn change.
+        certain: Dict[int, Counter] = defaultdict(Counter)
+        for pos, wi in enumerate(kept):
+            if wi in whole_idx or uncertain[pos]:
+                continue
+            certain[owners[wi]][int(labels[pos])] += 1
+        for pos, wi in enumerate(kept):
+            if wi not in whole_idx:
+                continue
+            maj = certain.get(owners[wi])
+            if maj and maj.most_common(1)[0][0] != int(labels[pos]):
+                uncertain[pos] = True
         by_region: Dict[int, Counter] = defaultdict(Counter)
-        for wi, lab in zip(kept, labels.tolist()):
-            by_region[owners[wi]][int(lab)] += 1
+        all_region: Dict[int, Counter] = defaultdict(Counter)
+        for pos, (wi, lab) in enumerate(zip(kept, labels.tolist())):
+            all_region[owners[wi]][int(lab)] += 1
+            if not uncertain[pos]:
+                by_region[owners[wi]][int(lab)] += 1
         for ri, (a, b) in enumerate(regions):
-            votes = by_region.get(ri)
+            votes = by_region.get(ri) or all_region.get(ri)
             if not votes:
                 continue
             turns.append({"start": float(a), "end": float(b),
@@ -1774,8 +2120,12 @@ def step3_diarization(hf_token: Optional[str],
                    ["Speaker ID", "Start_Time", "End_Time", "Text"],
                    [[r["speaker"], fmt_ts(r["start"]), fmt_ts(r["end"]),
                      (r.get("text") or "").replace("\n", " ")] for r in cue_rows])
+        if _CLUSTER_REPORT:
+            _write_csv(CLUSTER_REPORT_CSV, list(_CLUSTER_REPORT_HEADER),
+                       [list(r) for r in _CLUSTER_REPORT])
         log(f"🧾 CSV side-cars → {SPEAKER_TURNS_CSV.name} ({len(turns)} row(s)) · "
-            f"{DIAR_CUES_CSV.name} ({len(cue_rows)} row(s))")
+            f"{DIAR_CUES_CSV.name} ({len(cue_rows)} row(s)) · "
+            f"{CLUSTER_REPORT_CSV.name} ({len(_CLUSTER_REPORT)} row(s))")
     except Exception as e:
         log(f"   ⚠ CSV export skipped: {type(e).__name__}: {e}")
 
@@ -1829,7 +2179,8 @@ def _estimate_gender(wave, sr: int) -> dict:
     import numpy as np
 
     blank = {"gender": "", "f0_hz": 0.0, "centroid_hz": 0.0,
-             "voiced_ratio": 0.0, "voiced_frac": 0.0, "confidence": 0.0}
+             "voiced_ratio": 0.0, "voiced_frac": 0.0, "confidence": 0.0,
+             "reason": ""}
     y = np.asarray(wave, dtype=np.float32).reshape(-1)
     if y.size < sr // 2:                    # under 0.5 s there is no evidence
         return blank
@@ -1851,12 +2202,13 @@ def _estimate_gender(wave, sr: int) -> dict:
                 "voiced_frac": round(voiced_frac, 3), **extra}
 
     if not flag.any() or voiced_frac < _MIN_VOICED_FRAC:
-        return _undetermined()              # not a voice — never invent a gender
+        # not a voice — never invent a gender (reason for report K / Tab 2)
+        return _undetermined(reason="insufficient voiced frames")
 
     f0v = np.asarray(f0, dtype=float)[flag]
     f0v = f0v[np.isfinite(f0v) & (f0v > 0.0)]
     if not f0v.size:
-        return _undetermined()
+        return _undetermined(reason="no usable F0 samples")
 
     f0_med = float(np.median(f0v))
     f0_iqr = float(np.percentile(f0v, 75) - np.percentile(f0v, 25))
@@ -1867,34 +2219,42 @@ def _estimate_gender(wave, sr: int) -> dict:
         # A window this wide almost certainly mixes two speakers.
         return _undetermined(f0_hz=round(f0_med, 1),
                             f0_iqr_hz=round(f0_iqr, 1),
-                            centroid_hz=round(centroid, 0))
+                            centroid_hz=round(centroid, 0),
+                            reason="excessive pitch spread (mixed window?)")
 
     if f0_med <= _F0_MALE_MAX:
-        gender, conf = "male", 0.90
+        gender, conf, reason = "male", 0.90, "median F0"
     elif f0_med >= _F0_FEMALE_MIN:
-        gender, conf = "female", 0.90
+        gender, conf, reason = "female", 0.90, "median F0"
     elif centroid <= _CENTROID_MALE_MAX:
-        gender, conf = "male", 0.55         # decisive spectrum, low confidence
+        # decisive spectrum, low confidence
+        gender, conf, reason = "male", 0.55, "spectral centroid"
     elif centroid >= _CENTROID_FEMALE_MIN:
-        gender, conf = "female", 0.55       # decisive spectrum, low confidence
+        # decisive spectrum, low confidence
+        gender, conf, reason = "female", 0.55, "spectral centroid"
     else:
-        gender, conf = "", 0.0              # genuinely ambiguous — no guess
+        gender, conf, reason = "", 0.0, "middle pitch zone — weak evidence"
 
     return {"gender": gender, "f0_hz": round(f0_med, 1),
             "f0_iqr_hz": round(f0_iqr, 1),
             "centroid_hz": round(centroid, 0),
             "voiced_ratio": voiced_ratio,
             "voiced_frac": round(voiced_frac, 3),
-            "confidence": round(conf, 2)}
+            "confidence": round(conf, 2),
+            "reason": reason}
 
 
 def profile_speakers(speakers: Dict[str, dict], log: Log = _noop) -> Dict[str, dict]:
     """Attach an acoustic gender estimate to each diarized speaker (Step 3).
 
-    The estimate is written into `diarization_map.json` under each speaker, and
-    is only ever a *default*: a gender saved by the user in Tab 2
-    (`speaker_profiles.json`) always wins at casting time — see
-    `_speaker_gender`.
+    Each mined clone window is judged SEPARATELY by `_estimate_gender` and the
+    samples VOTE (report J): concatenating them into one giant waveform let
+    the IQR gate reject a legitimately expressive speaker as "?" and let one
+    unlucky window decide everyone. A strict majority of the DETERMINED
+    samples wins; disagreement returns UNDETERMINED with the tally as
+    `gender_reason` (report K) — never a coin flip. The estimate is only ever
+    a *default*: a gender saved by the user in Tab 2 (`speaker_profiles.json`)
+    always wins at casting time — see `_speaker_gender`.
     """
     try:
         import numpy as np
@@ -1903,37 +2263,66 @@ def profile_speakers(speakers: Dict[str, dict], log: Log = _noop) -> Dict[str, d
         return speakers
 
     for spk, info in speakers.items():
-        # Pool EVERY mined clone window, not just the first one. A speaker's
-        # top-3 windows carry up to 30 s of clean speech, so the median F0 and
-        # the IQR gate in `_estimate_gender` stop depending on whether one
-        # particular 5 s sample happened to be unlucky.
         rels = [r for r in (info.get("clone_prompts") or []) if r]
         paths = [p for p in (BASE_DIR / r for r in rels) if p.exists()]
         if not paths:
             info.setdefault("gender", "")
+            info.setdefault("gender_reason", "no clone-prompt sample")
             continue
-        try:
-            waves, rates = [], []
-            for p in paths:
+        votes: List[dict] = []
+        for p in paths:
+            try:
                 data, sr = sf.read(str(p), dtype="float32", always_2d=True)
-                waves.append(data.mean(axis=1))
-                rates.append(int(sr))
-            if len(set(rates)) != 1:
-                # Concatenating across sample rates would corrupt the pitch
-                # estimate, so fall back to the single best window instead.
-                waves, rates = waves[:1], rates[:1]
-            prof = _estimate_gender(np.concatenate(waves), rates[0])
-        except Exception as e:
-            log(f"   ⚠ {spk}: gender profiling skipped ({str(e)[:70]})")
+                votes.append(_estimate_gender(data.mean(axis=1), int(sr)))
+            except Exception as e:
+                log(f"   ⚠ {spk}: sample {getattr(p, 'name', p)} skipped "
+                    f"({str(e)[:60]})")
+        if not votes:
             info.setdefault("gender", "")
+            info.setdefault("gender_reason", "clone-prompt read failed")
             continue
-        info.update(prof)
-        if prof["gender"]:
-            log(f"   ♀♂ {spk} → {prof['gender']} · F0 {prof['f0_hz']:.0f} Hz "
-                f"· centroid {prof['centroid_hz']:.0f} Hz "
-                f"· confidence {prof['confidence']:.2f}")
+        determined = [v for v in votes if v.get("gender")]
+        male = sum(1 for v in determined if v["gender"] == "male")
+        female = len(determined) - male
+        if not determined:
+            gender = ""
+            reasons = sorted({str(v.get("reason") or "no evidence")
+                              for v in votes})
+            reason = (f"0/{len(votes)} samples determined · "
+                      + " / ".join(reasons))
+        elif male > female:
+            gender, reason = "male", f"sample vote {male}/{len(determined)} male"
+        elif female > male:
+            gender = "female"
+            reason = f"sample vote {female}/{len(determined)} female"
         else:
-            log(f"   ♀♂ {spk} → undetermined · F0 {prof['f0_hz']:.0f} Hz "
+            gender = ""
+            reason = f"samples disagree ({male} male / {female} female)"
+        pool = determined or votes
+        ref = [v for v in determined if v["gender"] == gender] if gender else pool
+
+        def _med(key):
+            vals = [v[key] for v in ref if v.get(key)]
+            return round(float(np.median(vals)), 1) if vals else 0.0
+
+        info.update({
+            "gender": gender,
+            "f0_hz": _med("f0_hz"),
+            "f0_iqr_hz": _med("f0_iqr_hz"),
+            "centroid_hz": _med("centroid_hz"),
+            "voiced_ratio": _med("voiced_ratio"),
+            "voiced_frac": _med("voiced_frac"),
+            "confidence": (round(float(np.mean(
+                [v.get("confidence", 0.0) for v in ref])), 2) if gender else 0.0),
+            "gender_reason": reason,
+            "gender_votes": ",".join((v.get("gender") or "?") for v in votes),
+        })
+        if gender:
+            log(f"   ♀♂ {spk} → {gender} · {reason} · F0 {info['f0_hz']:.0f} Hz "
+                f"· centroid {info['centroid_hz']:.0f} Hz "
+                f"· confidence {info['confidence']:.2f}")
+        else:
+            log(f"   ♀♂ {spk} → undetermined · {reason} "
                 f"— voices will rotate instead of defaulting")
     return speakers
 
@@ -3205,7 +3594,8 @@ def voice_cast_reason(spk: str, info: Optional[dict] = None,
         return "Tab 2 override"
     if str((info or {}).get("gender", "")).strip():
         return "auto-detected"
-    return "undetermined"
+    why = str((info or {}).get("gender_reason", "")).strip()
+    return f"undetermined · {why}" if why else "undetermined"
 
 
 def allocate_speaker_voices(speakers_info: Dict[str, dict],

@@ -2190,6 +2190,184 @@ check("auto-pilot chain reveals the button too",
 check("_new_project_visible gates on FINAL_MIX_WAV",
       "FINAL_MIX_WAV.exists()" in _fn_src("_new_project_visible"))
 
+# ── § 21 · Step 3 over-count fix — scored cuts, cluster cleanup, gender vote ──
+# Finding 17: a 3-speaker recording surfaced as 4–8 speakers. Causes: the
+# first legal cut level (0.50) was ACCEPTED without ever comparing what 3 or 4
+# would look like; 1.5 s windows shattered one voice into acoustic clusters;
+# nothing verified the clusters before counting them; and gender concatenated
+# samples so the IQR gate rejected expressive speakers as "?". Locks: every
+# cut scored with prefer-fewer ties; MERGE/FOLD/KEEP/UNCERTAIN cleanup with
+# the Expected-speakers floor; mixed-window flags; per-sample gender majority
+# with a reason; cluster_report.csv. Inputs are synthetic — no models, net.
+if _npl is not None:
+    # ── named knobs: the calibration surface must exist, not be inlined ─────
+    check("VAD pause-split is conservative (200–250 ms)",
+          200 <= int(_npl.VAD_MIN_SILENCE_MS) <= 250)
+    check("_vad_regions uses the named VAD constant",
+          "min_silence_duration_ms=VAD_MIN_SILENCE_MS"
+          in inspect.getsource(_npl._vad_regions))
+    check("embedding window ≈2.5 s with a 1.0–1.25 s hop",
+          2.2 <= _npl.EMB_WIN_S <= 2.8 and 1.0 <= _npl.EMB_HOP_S <= 1.25)
+    check("step3 windows from the named constants (no inlined 1.5/0.75)",
+          "win_s, hop_s = EMB_WIN_S, EMB_HOP_S" in _s3_src)
+    check("step3 wires the cleanup pass between cluster and vote",
+          "_cleanup_clusters(" in _s3_src and "_CLUSTER_REPORT.clear()" in _s3_src)
+    check("step3 publishes cluster_report.csv",
+          _npl.CLUSTER_REPORT_CSV.name == "cluster_report.csv"
+          and "CLUSTER_REPORT_CSV" in _s3_src)
+    check("_cleanup_clusters signature is (embs, labels, durs, n_hint, log)",
+          list(inspect.signature(_npl._cleanup_clusters).parameters)
+          == ["embs", "labels", "durs", "n_hint", "log"])
+    check("auto-cut iterates CUT_LEVELS instead of first-hit acceptance",
+          "for thr in CUT_LEVELS" in inspect.getsource(_npl._cluster_speakers))
+
+    _rng = np.random.default_rng(7)
+    _D = 64
+
+    def _u(v):
+        return v / np.linalg.norm(v)
+
+    def _bundle(c, n, spread=0.03):
+        return np.vstack([_u(c + spread * _rng.normal(size=_D))
+                          for _ in range(n)])
+
+    def _orth(c):
+        e = _rng.normal(size=_D)
+        return _u(e - (e @ c) * c)
+
+    # ── auto-cut: 3 voices, each split into 2 fragments (distance ≈0.55) ────
+    # At thr 0.50 the OLD first-hit sweep saw 6 legal clusters and stopped;
+    # only comparing all candidates shows 3 explains the data better.
+    _basis = np.linalg.qr(_rng.normal(size=(_D, 3)))[0].T
+    _rows = []
+    for _c in _basis:
+        _c = _u(_c)
+        _e = _orth(_c)
+        for _f in (_u(_c + 0.616 * _e), _u(_c - 0.616 * _e)):
+            _rows += [_u(_f + 0.03 * _rng.normal(size=_D)) for _ in range(8)]
+    _embs = np.vstack(_rows).astype(np.float32)
+    _npl._CLUSTER_REPORT.clear()
+    _log21: list = []
+    _lab = _npl._cluster_speakers(_embs, 0, _log21.append)
+    check("auto-cut finds the 3-speaker explanation (old first-hit: 6)",
+          len(set(_lab.tolist())) == 3)
+    check("…scoring EVERY candidate level into _CLUSTER_REPORT",
+          sum(1 for r in _npl._CLUSTER_REPORT
+              if r[0] == "cut" and r[1] == "candidate") == len(_npl.CUT_LEVELS)
+          and any(r[1] == "selected" for r in _npl._CLUSTER_REPORT))
+    check("…and logging the selected cut",
+          any("auto-cut selected" in line for line in _log21))
+    check("…every report row matches the header width",
+          all(len(r) == len(_npl._CLUSTER_REPORT_HEADER)
+              for r in _npl._CLUSTER_REPORT))
+
+    # ── cleanup: 7 fragmented clusters → 3, every op logged ─────────────────
+    # sim(f,c) = 1/√(1+t²): t=0.45 → 0.91 MERGE · t=1.0 → 0.71 FOLD ·
+    # t=2.0 → 0.45 UNCERTAIN · t=0.6 → 0.86 MERGE.
+    _cA, _cB, _cC = (_u(v) for v in _basis)
+    _fA, _fB, _fC, _fD = (_u(_cA + 0.45 * _orth(_cA)),
+                           _u(_cB + 1.00 * _orth(_cB)),
+                           _u(_cC + 2.00 * _orth(_cC)),
+                           _u(_cB + 0.60 * _orth(_cB)))
+    _x = np.vstack([_bundle(_cA, 40), _bundle(_cB, 30), _bundle(_cC, 20),
+                    _bundle(_fA, 5), _bundle(_fB, 3), _bundle(_fC, 1),
+                    _bundle(_fD, 2)]).astype(np.float32)
+    _lab7 = np.array([0]*40 + [1]*30 + [2]*20 + [3]*5 + [4]*3 + [5]*1 + [6]*2)
+    _durs = [1.0] * len(_lab7)
+    _npl._CLUSTER_REPORT.clear()
+    _lab3, _unc3 = _npl._cleanup_clusters(_x, _lab7, _durs, 0, _log21.append)
+    check("3 speakers fragmented into 7 clusters collapse back to 3",
+          len(set(_lab3.tolist())) == 3)
+    _acts = [r[1] for r in _npl._CLUSTER_REPORT if r[0] == "cleanup"]
+    check("…through logged MERGE / FOLD / UNCERTAIN / FINAL operations",
+          all(a in _acts for a in ("MERGE", "FOLD", "UNCERTAIN", "FINAL")))
+    check("…with compact labels 0..k-1 (longest talker = 0)",
+          set(_lab3.tolist()) == {0, 1, 2})
+    check("cleanup keeps every window on the timeline (nothing dropped)",
+          len(_lab3) == len(_lab7) and _unc3.shape == _lab7.shape)
+
+    # ── Expected speakers is a HARD floor (report G) ────────────────────────
+    for _want in (3, 4):
+        _lh, _ = _npl._cleanup_clusters(_x, _lab7, _durs, _want, _log21.append)
+        check(f"Expected speakers = {_want} survives cleanup exactly",
+              len(set(_lh.tolist())) == _want)
+    _lh = _npl._cluster_speakers(_embs, 3, _log21.append)
+    check("…and the hint path still forces exactly 3 clusters",
+          len(set(_lh.tolist())) == 3)
+
+    # ── never merge a real voice away; KEEP a distinct small one ────────────
+    _basis4 = np.linalg.qr(_rng.normal(size=(_D, 4)))[0].T
+    _cA4, _cB4, _cD4 = (_u(v) for v in (_basis4[0], _basis4[1], _basis4[3]))
+    _big = np.vstack([_bundle(_cA4, 30), _bundle(_cB4, 30),
+                      _bundle(_cD4, 2)]).astype(np.float32)
+    _lbig = np.array([0]*30 + [1]*30 + [2]*2)
+    _npl._CLUSTER_REPORT.clear()
+    _lk, _ = _npl._cleanup_clusters(_big, _lbig, [1.0]*62, 0, _log21.append)
+    check("two distinct speakers are never merged (7→3 must not cheat)",
+          len(set(_lk.tolist())) == 3)
+    check("…and a clearly-distinct small voice is KEPT, not absorbed",
+          "KEEP" in [r[1] for r in _npl._CLUSTER_REPORT if r[0] == "cleanup"])
+
+    # ── mixed window: equidistant between two voices → UNCERTAIN ────────────
+    _mix = np.vstack([_bundle(_cA4, 20), _bundle(_cB4, 20),
+                      _u(_cA4 + _cB4)[None, :]]).astype(np.float32)
+    _lmix = np.array([0]*20 + [1]*20 + [0])
+    _lmix2, _umix = _npl._cleanup_clusters(_mix, _lmix, [1.0]*41, 0,
+                                           _log21.append)
+    check("a window equidistant between two voices is flagged uncertain",
+          bool(_umix[-1]))
+    check("…while clean windows stay certain",
+          int(_umix[:-1].sum()) == 0)
+    check("…and its timeline label is preserved",
+          _lmix2.shape == _lmix.shape)
+
+    # ── gender: per-sample vote with a reason (report J/K) ──────────────────
+    # `_voice` exists iff §12's `import librosa` succeeded — same condition,
+    # no second import (pyflakes: redefinition of unused 'librosa').
+    if "_voice" not in globals():
+        skip("gender sample voting", "librosa absent (§12 skipped)")
+    else:
+        check("gender: silence explains itself",
+              _npl._estimate_gender(np.zeros(16_000, dtype=np.float32),
+                                    16_000)["reason"] == "insufficient voiced frames")
+        _gm = _npl._estimate_gender(_voice(115), 16_000)
+        check("gender: a decided sample carries its decision reason",
+              _gm["gender"] == "male" and _gm["reason"] == "median F0")
+        _g_files = []
+        try:
+            import soundfile as _sf21
+            for _nm, _sig in (("m1", _voice(115)), ("m2", _voice(140)),
+                              ("f1", _voice(240, bright=2600)),
+                              ("f2", _voice(280, bright=3000))):
+                _p = _npl.OUTPUTS_DIR / f"_selftest21_{_nm}.wav"
+                _sf21.write(str(_p), _sig, 16_000)
+                _g_files.append(_p)
+            _m1, _m2, _f1, _f2 = (str(p) for p in _g_files)
+            _spk21 = {
+                "Speaker1": {"clone_prompts": [_m1, _m2]},
+                "Speaker2": {"clone_prompts": [_f1]},
+                "Speaker3": {"clone_prompts": [_m1, _f1]},
+                "Speaker4": {"clone_prompts": []},
+            }
+            _r21 = _npl.profile_speakers(_spk21, _log21.append)
+            check("two male samples vote male",
+                  _r21["Speaker1"]["gender"] == "male"
+                  and "2/2" in _r21["Speaker1"]["gender_reason"])
+            check("a single female sample is accepted (1/1)",
+                  _r21["Speaker2"]["gender"] == "female")
+            check("disagreeing samples stay UNDETERMINED with the tally",
+                  _r21["Speaker3"]["gender"] == ""
+                  and "disagree" in _r21["Speaker3"]["gender_reason"]
+                  and _r21["Speaker3"]["gender_votes"] == "male,female")
+            check("a speaker without samples says why",
+                  _r21["Speaker4"].get("gender_reason") == "no clone-prompt sample")
+            check("voice_cast_reason surfaces the reason for Tab 2",
+                  _npl.voice_cast_reason("Speaker3", _r21["Speaker3"], {})
+                  .startswith("undetermined · samples disagree"))
+        finally:
+            for _p in _g_files:
+                _p.unlink(missing_ok=True)
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)
