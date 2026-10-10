@@ -77,6 +77,11 @@ FINAL_SCRIPT_JSON = OUTPUTS_DIR / "final_script.json"     # Step 5 artifact
 SPEAKER_SCRIPTS_JSON = OUTPUTS_DIR / "speaker_scripts.json"   # Step 6 artifact
 TTS_REPORT_JSON = OUTPUTS_DIR / "tts_report.json"             # Step 7 artifact
 FINAL_MIX_WAV = OUTPUTS_DIR / "final_mix.wav"                 # Step 8 artifact
+# Tab 3 · vocal-only export — Step 7's padded voice masters summed WITHOUT the
+# Demucs bed or the duck engine, written on demand by export_vocal_only() and
+# read by the "Final mix: vocal only" section. An additive outputs/* artifact:
+# 🆕 New project wipes it with everything else.
+FINAL_VOCALS_WAV = OUTPUTS_DIR / "final_mix_vocals.wav"   # vocal-only export
 FINAL_VIDEO_MP4 = OUTPUTS_DIR / "final_dubbed.mp4"            # Step 8 artifact
 PROMPT_TRANSCRIPTS_JSON = OUTPUTS_DIR / "clone_prompt_transcripts.json"
 SPEAKER_PROFILES_JSON = OUTPUTS_DIR / "speaker_profiles.json"   # names/gender
@@ -5337,6 +5342,65 @@ def step8_mixdown(log: Log, force: bool = False, duck_db: float = -6.0,
     else:
         log("ℹ source was audio-only — delivering the master mix without video.")
     return result
+
+
+def export_vocal_only(log: Log, force: bool = False) -> dict:
+    """🎤 TAB 3 · 'Final mix: vocal only' — Step 7's voice masters, no music.
+
+    Layers every outputs/track_speaker*.wav onto one timeline the way Step 8
+    opens its mixdown — SAME layering, SAME 0.99 peak-normalise — but stops
+    before the Demucs bed and the duck engine, so what lands on disk is the
+    dubbed voices ALONE. (Ducking only ever attenuated the music, so the voice
+    layers are identical either way.) A convenience export: pure numpy +
+    soundfile, no models, never touches final_mix.wav, marks no pipeline step —
+    the render itself is never re-run.
+
+    Cached as outputs/final_mix_vocals.wav unless `force=True`; raises the
+    same guard as Step 8 when Step 7 hasn't produced any tracks yet. Returns
+    {"vocals": path, "sr": Hz, "seconds": s} for the status chip.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    if FINAL_VOCALS_WAV.exists() and not force:
+        info = sf.info(str(FINAL_VOCALS_WAV))
+        sr = int(info.samplerate or 0)
+        log(f"↩ Vocal-only export cached ({FINAL_VOCALS_WAV.name}) — "
+            f"force=True rebuilds it.")
+        return {"vocals": str(FINAL_VOCALS_WAV), "sr": sr,
+                "seconds": (info.frames / sr) if sr else 0.0}
+
+    track_files = sorted(OUTPUTS_DIR.glob("track_speaker*.wav"))
+    if not track_files:
+        raise RuntimeError("No padded speaker tracks — run Step 7 first.")
+
+    t0 = time.time()
+    sr = int(sf.info(str(track_files[0])).samplerate or 44100)
+    n = 0
+    for tp in track_files:                       # longest track, at sr
+        i = sf.info(str(tp))
+        n = max(n, int(round(i.frames * sr / float(i.samplerate or sr))))
+    voices = np.zeros(n, dtype=np.float32)
+    for tp in track_files:
+        v, vsr = sf.read(str(tp), dtype="float32", always_2d=True)
+        v = v.mean(axis=1)
+        if int(vsr) != sr:
+            v = _resample_1d(v, int(vsr), sr)
+        end = min(n, v.size)
+        voices[:end] += v[:end]
+        log(f"   ➕ {tp.name} layered (vocal-only)")
+    peak = float(np.abs(voices).max()) if voices.size else 0.0
+    if peak > 0.99:
+        voices *= 0.99 / peak
+        log(f"   🔉 peak normalised ({peak:.2f} → 0.99)")
+    elif peak <= 1e-6:
+        log("   ⚠ summed voice tracks are silent — writing it as-is")
+    sf.write(str(FINAL_VOCALS_WAV), voices.astype(np.float32), sr,
+             subtype="PCM_16")
+    log(f"🎤 Vocal-only export → {FINAL_VOCALS_WAV.name} · "
+        f"{len(track_files)} voice track(s) · {n / sr:.2f}s @ {sr} Hz · "
+        f"no instrumental bed · {time.time() - t0:.1f}s")
+    return {"vocals": str(FINAL_VOCALS_WAV), "sr": sr, "seconds": n / float(sr)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -2368,6 +2368,87 @@ if _npl is not None:
             for _p in _g_files:
                 _p.unlink(missing_ok=True)
 
+# ── § 22 · Tab 3 · 'Final mix: vocal only' (additive section + export) ───────
+check("app.py declares the 'Final mix: vocal only' section",
+      "Final mix: vocal only" in _APP)
+check("app.py declares the vocal-only player widget",
+      "final_vocals = gr.Audio(" in _APP)
+check("_build_vocal_only/_vocal_only_player take no inputs",
+      _fn_params("_build_vocal_only") == []
+      and _fn_params("_vocal_only_player") == [])
+check("vox_build_btn wired with two outputs",
+      _click_outputs("vox_build_btn") == 2)
+check("…to fn=_build_vocal_only, and tab3 re-select to _vocal_only_player",
+      "fn=_build_vocal_only" in _APP and "fn=_vocal_only_player" in _APP)
+check("vox_build_btn outputs are exactly (vox_status, final_vocals)",
+      _wired("vox_build_btn", "outputs") == ["vox_status", "final_vocals"])
+_vox_sel = any(
+    isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
+    and _n.func.attr == "select"
+    and isinstance(_n.func.value, _ast.Name) and _n.func.value.id == "tab3"
+    and any(_k.arg == "fn" and getattr(_k.value, "id", None)
+            == "_vocal_only_player" for _k in _n.keywords)
+    for _n in _ast.walk(_app_tree))
+check("Tab 3 re-select restores the vocal-only player from disk", _vox_sel)
+check("both new widgets blank on ➕ New project",
+      bool(_np_out) and "vox_status" in _np_out
+      and "final_vocals" in _np_out)
+check("the handlers degrade gracefully on a module without the export",
+      'getattr(pipeline, "FINAL_VOCALS_WAV"' in _APP
+      and 'getattr(pipeline, "export_vocal_only"' in _APP)
+if _npl is None:
+    skip("vocal-only export (new_pipeline side)", _np_err)
+else:
+    check("FINAL_VOCALS_WAV is outputs/final_mix_vocals.wav",
+          _npl.FINAL_VOCALS_WAV
+          == _npl.OUTPUTS_DIR / "final_mix_vocals.wav")
+    check("new_pipeline exposes export_vocal_only",
+          callable(getattr(_npl, "export_vocal_only", None)))
+    _orig_dir22, _orig_vox22 = _npl.OUTPUTS_DIR, _npl.FINAL_VOCALS_WAV
+    try:
+        with _tf.TemporaryDirectory() as _td22:
+            _td = Path(_td22)
+            _npl.OUTPUTS_DIR = _td
+            _npl.FINAL_VOCALS_WAV = _td / "final_mix_vocals.wav"
+            _msgs22 = []
+            try:
+                _npl.export_vocal_only(_msgs22.append)
+                check("the vocal-only export refuses to run before Step 7",
+                      False)
+            except RuntimeError:
+                check("the vocal-only export refuses to run before Step 7",
+                      True)
+            # t1: 0.4 s of 220 Hz @ 8 kHz; t2: the same tone across 0.8 s @
+            # 16 kHz — the overlap pushes the sum past 0.99 (normalisation)
+            # and t2 must be resampled onto t1's rate.
+            _t8 = np.arange(int(0.4 * 8000)) / 8000.0
+            _t16 = np.arange(int(0.8 * 16000)) / 16000.0
+            sf.write(str(_td / "track_speaker1.wav"),
+                     (0.5 * np.sin(2 * np.pi * 220 * _t8)).astype(np.float32),
+                     8000, subtype="PCM_16")
+            sf.write(str(_td / "track_speaker2.wav"),
+                     (0.5 * np.sin(2 * np.pi * 220 * _t16)).astype(np.float32),
+                     16000, subtype="PCM_16")
+            _res22 = _npl.export_vocal_only(_msgs22.append)
+            _d22, _sr22 = sf.read(_res22["vocals"])
+            check("tracks layer on the first track's rate, longest wins",
+                  _sr22 == 8000 and _d22.size == int(0.8 * 8000)
+                  and _res22["sr"] == 8000
+                  and abs(_res22["seconds"] - 0.8) < 0.01)
+            check("overlapping voice layers are peak-normalised to 0.99",
+                  0.985 < float(_d22.max()) <= 0.9905)
+            _mt22 = _npl.FINAL_VOCALS_WAV.stat().st_mtime_ns
+            _c22 = []
+            _npl.export_vocal_only(_c22.append)
+            check("a rebuild without force is served from the cache",
+                  any("cached" in _m for _m in _c22)
+                  and _npl.FINAL_VOCALS_WAV.stat().st_mtime_ns == _mt22)
+            _npl.export_vocal_only(_c22.append, force=True)
+            check("force=True rebuilds the vocal-only export",
+                  _npl.FINAL_VOCALS_WAV.stat().st_mtime_ns > _mt22)
+    finally:
+        _npl.OUTPUTS_DIR, _npl.FINAL_VOCALS_WAV = _orig_dir22, _orig_vox22
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

@@ -664,6 +664,8 @@ def _reset_project():
         None,                                         # final_audio
         None,                                         # original_audio
         None,                                         # final_video
+        _chip("idle", "Not built yet"),               # vox_status
+        None,                                         # final_vocals
         _checklist({}),                               # ready_html
         spk_table, spk_pick, fix_row, fix_spk, voz_speaker,
         diar_tbl, emo_tbl,
@@ -703,6 +705,46 @@ def _run_rendering(diagnostic):
         yield f"❌ Unexpected error: {e}", None, None, \
             _chip("err", "Unexpected error"), src
 
+
+
+def _vocal_only_player():
+    """🎤 Tab 3 · 'Final mix: vocal only' → (status chip, player) from disk.
+
+    A pure disk read — no pipeline run — so the section restores itself when
+    the tab opens without touching any render yield arity. The `getattr` keeps
+    this safe on a swappable pipeline binding (app.py's `_sidecar` helpers
+    guard the same way): a module older than this feature says so in the chip
+    instead of raising.
+    """
+    p = getattr(pipeline, "FINAL_VOCALS_WAV", None)
+    if p is None:
+        return _chip("idle", "Vocal-only export needs the new_pipeline "
+                             "module — bind it and retry"), None
+    if p.exists():
+        return _chip("ok", "Vocal-only master ready — play or download "
+                           "below"), str(p)
+    return _chip("idle", "Not built yet — click ✨ after a render"), None
+
+
+def _build_vocal_only():
+    """🎤 Tab 3 · build outputs/final_mix_vocals.wav from Step 7's tracks.
+
+    Pure numpy + soundfile — no model loads, so it is near-instant and safe to
+    click any time after Step 7 wrote outputs/track_speaker*.wav. Every
+    failure (wrong module, Step 7 not run yet, a locked file) lands in the
+    status chip instead of raising.
+    """
+    fn = getattr(pipeline, "export_vocal_only", None)
+    if fn is None:
+        return (_chip("err", "This pipeline module has no vocal-only "
+                             "export — bind new_pipeline and retry"), None)
+    try:
+        res = fn(pipeline.Log())
+    except Exception as e:
+        return _chip("err", f"{type(e).__name__}: {e}"), None
+    return (_chip("ok", f"Vocal-only master ready — {res['seconds']:.2f}s @ "
+                       f"{res['sr']} Hz · play or download below"),
+            str(res["vocals"]))
 
 
 def _spk_overview_rows():
@@ -1421,8 +1463,28 @@ def build_ui() -> gr.Blocks:
                                              "(when the source was a video)",
                                        elem_classes=["glass", "pad"])
 
+                # ── 🎤 Final mix: vocal only — NEW, purely additive section.
+                # The master mix above is untouched: this exports Step 7's
+                # padded voice masters alone (no instrumental bed, no ducking)
+                # on demand, without re-running any render step.
+                gr.Markdown("#### 🎤 Final mix: vocal only")
+                gr.Markdown("Step 7's padded per-speaker masters summed on one "
+                            "timeline — **no instrumental bed, no ducking** — "
+                            "built on demand from the existing Step 7 "
+                            "artifacts, so the render is never re-run.")
+                with gr.Row():
+                    vox_build_btn = gr.Button(value="", icon=icon("sparkles"),
+                                              variant="secondary",
+                                              elem_classes=["icon-btn"],
+                                              scale=1)
+                    vox_status = gr.HTML(_chip("idle", "Not built yet"))
+                gr.HTML('<div class="btn-caption">✨ Build vocal-only export '
+                        '(final_mix_vocals.wav)</div>')
+                final_vocals = gr.Audio(label="🎤 The dubbed voices alone",
+                                        elem_classes=["glass", "pad"])
+
         # ── event wiring ────────────────────────────────────────────────────
-        # 🆕 New project — top-corner reset. 37 outputs: every per-project
+        # 🆕 New project — top-corner reset. 39 outputs: every per-project
         # widget on Tabs 1–3 plus the button itself. Own concurrency queue
         # (default str(id(fn))) — never fold it into the render/auto group.
         new_proj_btn.click(
@@ -1435,6 +1497,7 @@ def build_ui() -> gr.Blocks:
                      spk_gender, fix_msg, spk_save_msg, voz_voice, voz_msg,
                      voz_preview, upload_progress, upload_msg, render_log,
                      render_status, final_audio, original_audio, final_video,
+                     vox_status, final_vocals,
                      ready_html, spk_table, spk_pick, fix_row, fix_spk,
                      voz_speaker, diar_tbl, emo_tbl],
         )
@@ -1516,6 +1579,18 @@ def build_ui() -> gr.Blocks:
         if hasattr(tab3, "select"):
             tab3.select(fn=_original_audio, inputs=None,
                         outputs=[original_audio])
+        # 🎤 Final mix: vocal only — OWN queue (default concurrency id: a
+        # numpy-only export that never folds into the render group) and a
+        # SECOND tab-select listener. Nothing above is re-wired: the section
+        # is purely additive.
+        vox_build_btn.click(
+            fn=_build_vocal_only,
+            inputs=None,
+            outputs=[vox_status, final_vocals],
+        )
+        if hasattr(tab3, "select"):
+            tab3.select(fn=_vocal_only_player, inputs=None,
+                        outputs=[vox_status, final_vocals])
         preflight_btn.click(
             fn=_run_readiness,
             inputs=None,
