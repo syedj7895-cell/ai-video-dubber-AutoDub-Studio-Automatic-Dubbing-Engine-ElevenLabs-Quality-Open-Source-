@@ -4235,6 +4235,21 @@ def step7_synthesize(log: Log, force: bool = False,
                        for l in lines),
                       key=lambda d: (d["start"], d.get("index") or 0))
 
+    # ── OFF-CLOCK PRE-SCAN ──────────────────────────────────────────────────
+    # The master clock is outputs/audio.wav; a script/SRT row that starts at
+    # or past its end can never be placed (empty master slice + non-empty clip
+    # → numpy "operands could not be broadcast together with shapes (0,) (N,)
+    # (0,)" killed the whole render). Count them up-front so the cause is
+    # visible BEFORE minutes of TTS, then skip each one in the loop below.
+    off_clock = [r for r in timeline if float(r["start"]) >= duration]
+    if off_clock:
+        first = off_clock[0]
+        log(f"⚠ {len(off_clock)} script row(s) start at/beyond the "
+            f"{duration:.2f}s master clock — first: row {first.get('index')} "
+            f"@ {float(first['start']):.2f}s. The SRT/script timeline does "
+            f"NOT match outputs/audio.wav; those rows will be SKIPPED. Use an "
+            f"SRT matching this audio (or 💚 New project) if unexpected.")
+
     report = {"engine": eid, "sample_rate": sr,
               "duration_s": round(duration, 3), "rows": []}
     t0 = time.time()
@@ -4242,6 +4257,18 @@ def step7_synthesize(log: Log, force: bool = False,
     for i, row in enumerate(timeline, 1):
         spk = row["spk"]
         start = float(row["start"])
+        # OFF-CLOCK GUARD — placing this row would slice an empty region of
+        # the master (pos ≥ n_total) and crash the in-place add below; skip it
+        # loudly instead. The cheapest possible check, BEFORE any synthesis is
+        # paid for. A negative timestamp clamps to the master head.
+        pos = int(start * sr)
+        if pos >= n_total:
+            failed_rows += 1
+            log(f"   ⚠ row {row.get('index')} starts at {start:.2f}s — "
+                f"beyond the {duration:.2f}s master clock; skipped.")
+            continue
+        if pos < 0:
+            pos = 0
         # time slice available before the NEXT sequential line starts
         avail = ((float(timeline[i]["start"]) - start) if i < len(timeline)
                  else (duration - start))
@@ -4292,7 +4319,6 @@ def step7_synthesize(log: Log, force: bool = False,
                     clip[-fade:] *= np.linspace(1.0, 0.0, fade).astype(np.float32)
                 trimmed = True
 
-        pos = int(start * sr)
         end = min(pos + clip.size, n_total)
         seg = clip[: end - pos].astype(np.float32)
         f = int(0.005 * sr)                      # 5 ms de-click fades

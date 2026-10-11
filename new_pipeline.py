@@ -1717,6 +1717,9 @@ def _cluster_speakers(embs, n_hint: int, log: Log):
         chosen = (1, np.zeros(n, dtype=int))
         _cluster_report("selected", k=1,
                         note="no cut produced 2–12 clusters → single voice")
+        log("   ⚠ no cut separated this recording into 2–12 voices → ONE "
+            "speaker. If it really has more, set Tab 2's 👥 Expected "
+            "speakers to the true count (hard floor) and re-run Step 3.")
     else:
         best = max(c[0] for c in cands)
         near = [c for c in cands if c[0] >= best - _CUT_TIE_EPS]
@@ -1903,8 +1906,28 @@ def step3_diarization(hf_token: Optional[str],
     orchestrator and the UI keep one call convention across both builds.
     """
     if DIARIZATION_JSON.exists() and not force:
-        log("↩ Step 3 cached (diarization_map.json) — skipping.")
-        return json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
+        cached = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
+        n_cached = int(cached.get("expected_speakers") or 0)
+        n_want = int(expected_speakers or 0)
+        if n_cached == n_want:
+            # Surface the CACHED count: a stale map silently keeping the old
+            # speaker count is invisible unless the log says so.
+            log(f"↩ Step 3 cached (diarization_map.json) — skipping · "
+                f"{len(cached.get('speakers', {}))} speaker(s) in the cached "
+                f"map (change 👥 Expected speakers to re-cluster).")
+            return cached
+        # The dropdown is only actionable if CHANGING it re-runs the cluster —
+        # otherwise the cached map keeps the old count forever. Speaker labels
+        # are baked into Steps 4–8, so their caches go too.
+        log(f"♻ Expected speakers changed ({n_cached or 'auto'} → "
+            f"{n_want or 'auto'}) — re-running Step 3 clustering and "
+            f"clearing the speaker-dependent Steps 4–8 caches.")
+        for _p in (EMOTION_LOG_TXT, EMOTION_GRID_JSON, FINAL_SCRIPT_JSON,
+                   SPEAKER_SCRIPTS_JSON, TTS_REPORT_JSON, FINAL_MIX_WAV,
+                   FINAL_VIDEO_MP4, FINAL_VOCALS_WAV):
+            _p.unlink(missing_ok=True)
+        for _t in OUTPUTS_DIR.glob("track_speaker*.wav"):
+            _t.unlink(missing_ok=True)
 
     try:
         import torch
@@ -2036,6 +2059,11 @@ def step3_diarization(hf_token: Optional[str],
     n_raw = len({t["raw"] for t in turns})
     log(f"   {len(turns)} speaker turn(s) · {n_raw} distinct voice(s) "
         f"· {time.time() - t0:.1f}s")
+    if n_raw == 1:
+        log("   ⚠ only ONE distinct voice in this recording — if it has "
+            "more speakers, set Tab 2's 👥 Expected speakers to the real "
+            "count (hard floor) and re-run Step 3; the cut decisions are "
+            "logged in outputs/cluster_report.csv.")
 
     # ── cross-reference with the ORIGINAL SRT timeline ────────────────────
     if original_srt_path and Path(original_srt_path).exists():
@@ -2108,7 +2136,8 @@ def step3_diarization(hf_token: Optional[str],
     log("♀♂ Profiling speaker pitch so voices can be gender-matched …")
     speakers = profile_speakers(speakers, log)
 
-    result = {"model": DIAR_ENGINE, "speakers": speakers, "cues": cue_rows}
+    result = {"model": DIAR_ENGINE, "speakers": speakers, "cues": cue_rows,
+              "expected_speakers": int(expected_speakers or 0)}
     DIARIZATION_JSON.write_text(json.dumps(result, indent=2, ensure_ascii=False),
                                 encoding="utf-8")
 
@@ -5049,6 +5078,21 @@ def step7_synthesize(log: Log, force: bool = False,
                        for l in lines),
                       key=lambda d: (d["start"], d.get("index") or 0))
 
+    # ── OFF-CLOCK PRE-SCAN ──────────────────────────────────────────────────────────
+    # The master clock is outputs/audio.wav; a script/SRT row that starts at
+    # or past its end can never be placed (empty master slice + non-empty clip
+    # → numpy "operands could not be broadcast together with shapes (0,) (N,)
+    # (0,)" killed the whole render). Count them up-front so the cause is
+    # visible BEFORE minutes of TTS, then skip each one in the loop below.
+    off_clock = [r for r in timeline if float(r["start"]) >= duration]
+    if off_clock:
+        first = off_clock[0]
+        log(f"⚠ {len(off_clock)} script row(s) start at/beyond the "
+            f"{duration:.2f}s master clock — first: row {first.get('index')} "
+            f"@ {float(first['start']):.2f}s. The SRT/script timeline does "
+            f"NOT match outputs/audio.wav; those rows will be SKIPPED. Use an "
+            f"SRT matching this audio (or 💚 New project) if unexpected.")
+
     report = {"engine": eid, "sample_rate": sr,
               "duration_s": round(duration, 3), "rows": []}
     t0 = time.time()
@@ -5056,6 +5100,18 @@ def step7_synthesize(log: Log, force: bool = False,
     for i, row in enumerate(timeline, 1):
         spk = row["spk"]
         start = float(row["start"])
+        # OFF-CLOCK GUARD — placing this row would slice an empty region of
+        # the master (pos ≥ n_total) and crash the in-place add below; skip it
+        # loudly instead. The cheapest possible check, BEFORE any synthesis is
+        # paid for. A negative timestamp clamps to the master head.
+        pos = int(start * sr)
+        if pos >= n_total:
+            failed_rows += 1
+            log(f"   ⚠ row {row.get('index')} starts at {start:.2f}s — "
+                f"beyond the {duration:.2f}s master clock; skipped.")
+            continue
+        if pos < 0:
+            pos = 0
         # time slice available before the NEXT sequential line starts
         avail = ((float(timeline[i]["start"]) - start) if i < len(timeline)
                  else (duration - start))
@@ -5116,7 +5172,6 @@ def step7_synthesize(log: Log, force: bool = False,
                 clip[-fade:] *= np.linspace(1.0, 0.0, fade).astype(np.float32)
             trimmed, mode = True, "trimmed"
 
-        pos = int(start * sr)
         end = min(pos + clip.size, n_total)
         seg = clip[: end - pos].astype(np.float32)
         f = int(0.005 * sr)                      # 5 ms de-click fades

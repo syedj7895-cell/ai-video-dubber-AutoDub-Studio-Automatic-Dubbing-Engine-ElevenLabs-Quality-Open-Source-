@@ -2449,6 +2449,44 @@ else:
     finally:
         _npl.OUTPUTS_DIR, _npl.FINAL_VOCALS_WAV = _orig_dir22, _orig_vox22
 
+# ── § 23 · off-clock script rows + one-speaker diagnostics ──────────────────────
+# A translated SRT whose timeline runs past outputs/audio.wav crashed Step 7
+# with numpy "(0,) (14967,) (0,)" — the row's master slice was empty while its
+# clip was not — and a collapsed (or stale) Step 3 silently shipped ONE
+# speaker with no way to re-cluster except restarting the session.
+for _name23 in ("pipeline", "pipeline2", "new_pipeline"):
+    _src23 = _vram_src[_name23]
+    check(f"[{_name23}] step7 pre-scans rows past the master clock",
+          "off_clock = [r for r in timeline" in _src23
+          and "master clock — first: row" in _src23)
+    check(f"[{_name23}] …off-clock rows are skipped before placement",
+          "if pos >= n_total:" in _src23
+          and "master clock; skipped." in _src23)
+    check(f"[{_name23}] the old unguarded pos re-assignment is gone",
+          _src23.count("pos = int(start * sr)") == 1)
+if _npl is not None:
+    _s3_23 = inspect.getsource(_npl.step3_diarization)
+    check("step3's cache hit reports the speaker count it is reusing",
+          "speaker(s) in the cached" in _s3_23)
+    check("step3 records which hint produced the cached map",
+          '"expected_speakers": int(expected_speakers or 0)' in _s3_23)
+    check("changing Expected speakers re-runs Step 3 (the hint is actionable)",
+          "re-running Step 3 clustering" in _s3_23
+          and "clearing the speaker-dependent Steps 4–8 caches" in _s3_23)
+    check("step3 warns when only ONE voice came back",
+          "only ONE distinct voice" in _s3_23)
+    check("_cluster_speakers' single-voice fallback says how to override it",
+          "Expected speakers" in inspect.getsource(_npl._cluster_speakers))
+    # functional: identical windows → no cut separates anything → the
+    # fallback must pick ONE voice (not crash) AND say how to override it.
+    _cl23: list = []
+    _lab23 = _npl._cluster_speakers(np.ones((12, 8), dtype=np.float32), 0,
+                                    _cl23.append)
+    check("degenerate (unseparable) windows fall back to exactly one voice",
+          set(int(x) for x in _lab23.tolist()) == {0})
+    check("…and the log tells the user to set Expected speakers",
+          any("Expected speakers" in _m for _m in _cl23))
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

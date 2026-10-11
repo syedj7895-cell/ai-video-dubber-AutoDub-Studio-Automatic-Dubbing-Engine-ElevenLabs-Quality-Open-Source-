@@ -1170,8 +1170,8 @@ def build_ui() -> gr.Blocks:
                             choices=["Auto", "1", "2", "3", "4", "5",
                                      "6", "7", "8", "9", "10"],
                             value="Auto", label="👥 Expected speakers",
-                            info="Hint only - helps merge stray voice clusters; "
-                                 "not a strict limit",
+                            info="Sets the exact speaker count (hard floor); "
+                                 "changing it re-runs Step 3 clustering",
                             interactive=True, allow_custom_value=False)
                         translit_in = gr.Checkbox(
                             value=True,
