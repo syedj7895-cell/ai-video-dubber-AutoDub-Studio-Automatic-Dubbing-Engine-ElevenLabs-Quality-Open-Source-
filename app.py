@@ -96,6 +96,16 @@ _GRADIO_MAJOR = int(str(gr.__version__).split(".")[0])
 _IS_G6 = _GRADIO_MAJOR >= 6
 _COPY_KW = {} if _IS_G6 else {"show_copy_button": True}
 
+# Every gr.Audio gets an EXPLICIT waveform (finding 19): Gradio 6 redesigned
+# the Audio player and made the peaks display opt-in, and the notebook's
+# unpinned `gradio>=4.44.0` silently moved every user to 6.x between runs —
+# all six players lost their waveform at once while the repo diff showed no
+# removal. Pinning the options here works on 4.x/5.x/6.x and tints the peaks
+# with the glass theme (indigo body, violet playhead).
+_WAVE = {"waveform_options": gr.WaveformOptions(
+    waveform_color="rgba(99, 102, 241, 0.45)",
+    waveform_progress_color="#a855f7")}
+
 # JS-only copy-to-clipboard (Gradio 6 removed show_copy_button; this works
 # on 4.x / 5.x / 6.x and falls back to execCommand on non-https origins).
 _COPY_JS = ("(text) => {"
@@ -1239,8 +1249,10 @@ def build_ui() -> gr.Blocks:
                             fn=None, inputs=[import_log], js=_COPY_JS)
                 with gr.Row():
                     vocals_preview = gr.Audio(label="🎤 Isolated vocals",
+                                              **_WAVE,
                                               elem_classes=["glass", "pad"])
                     music_preview = gr.Audio(label="🎼 Isolated music",
+                                             **_WAVE,
                                              elem_classes=["glass", "pad"])
 
             # ════════════════ TAB 2 · SCRIPT MATCHING & ASSEMBLY ════════════
@@ -1352,6 +1364,7 @@ def build_ui() -> gr.Blocks:
                     voz_save_btn = gr.Button("💾 Save voice settings",
                                              variant="secondary")
                 voz_preview = gr.Audio(label="🎧 Audition", interactive=False,
+                                       **_WAVE,
                                        elem_classes=["glass", "pad"])
                 voz_msg = gr.HTML("")
                 gr.Markdown("### ⚙️ Fix a line's speaker")
@@ -1454,10 +1467,12 @@ def build_ui() -> gr.Blocks:
                         gr.Button("Copy console", variant="secondary").click(
                             fn=None, inputs=[render_log], js=_COPY_JS)
                 final_audio = gr.Audio(label="🎧 Final master mix",
+                                       **_WAVE,
                                        elem_classes=["glass", "pad"])
                 gr.Markdown("#### 🔉 Original audio")
                 original_audio = gr.Audio(
                     label="🔈 The source as uploaded — before dubbing",
+                    **_WAVE,
                     elem_classes=["glass", "pad"])
                 final_video = gr.Video(label="🎬 Final dubbed video "
                                              "(when the source was a video)",
@@ -1481,6 +1496,7 @@ def build_ui() -> gr.Blocks:
                 gr.HTML('<div class="btn-caption">✨ Build vocal-only export '
                         '(final_mix_vocals.wav)</div>')
                 final_vocals = gr.Audio(label="🎤 The dubbed voices alone",
+                                        **_WAVE,
                                         elem_classes=["glass", "pad"])
 
         # ── event wiring ────────────────────────────────────────────────────

@@ -2487,6 +2487,95 @@ if _npl is not None:
     check("…and the log tells the user to set Expected speakers",
           any("Expected speakers" in _m for _m in _cl23))
 
+# ── § 24 · finding 19 · window-run timeline + explicit waveforms ──────────────
+# (a) The OLD builder voted ONE label per VAD region, so a speaker who only
+#     interjects inside a longer region never won a region and vanished from
+#     the timeline — production log: 4 clean clusters → 2 voices. A VAD region
+#     is speech-vs-silence, not one person; `_turns_from_windows` must keep
+#     every cluster identity as its own run of windows.
+# (b) All six gr.Audio players must pin their waveform explicitly: Gradio 6
+#     redesigned the Audio widget and the notebook's unpinned
+#     `gradio>=4.44.0` silently moved every Colab user onto it between runs —
+#     every player lost its waveform with zero repo diff.
+if _npl is not None:
+    _tfw = getattr(_npl, "_turns_from_windows", None)
+    check("step3's timeline builder is a pure, testable helper", _tfw is not None)
+    if _tfw is not None:
+        # 4 clusters; cluster 1 is a minority INSIDE region 0, cluster 3 a
+        # minority inside region 1 — the old per-region vote erased both
+        # (region 0 → SPEAKER_00, region 1 → SPEAKER_02 only).
+        _regions24 = [(0.0, 10.0), (10.0, 20.0)]
+        _owners24 = [0] * 6 + [1] * 4
+        _wt24 = [(0.0, 2.5), (1.0, 3.5), (2.0, 4.5), (3.0, 5.5), (4.0, 6.5),
+                 (5.0, 7.5), (10.0, 12.5), (11.0, 13.5), (12.0, 14.5),
+                 (13.0, 15.5)]
+        _lab24 = [0, 0, 1, 0, 0, 0, 2, 2, 3, 2]
+        _unc24 = [False] * 10
+        _turns24 = _tfw(_regions24, list(range(10)), _owners24, _wt24,
+                        _lab24, _unc24, set())
+        check("…a minority interjection keeps its own turn (4 voices, not 2)",
+              {t["raw"] for t in _turns24}
+              == {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02", "SPEAKER_03"})
+        check("…every turn stays inside its VAD region",
+              all(any(a <= t["start"] < t["end"] <= b for a, b in _regions24)
+                  for t in _turns24))
+        _s24 = sorted(_turns24, key=lambda t: t["start"])
+        check("…and the timeline never overlaps itself (windows overlap by hop)",
+              all(_s24[i]["end"] <= _s24[i + 1]["start"]
+                  for i in range(len(_s24) - 1)))
+        check("…turns keep the contract Steps 4–7 read",
+              all(set(t) == {"start", "end", "raw"}
+                  and isinstance(t["start"], float)
+                  and isinstance(t["end"], float) for t in _turns24))
+        # An uncertain (mixed) window inherits its NEAREST certain neighbour,
+        # so a 1-window minority flagged mixed folds into the neighbour
+        # (expected) instead of voting its whole region away (the old bug).
+        _turns25 = _tfw(_regions24, list(range(10)), _owners24, _wt24,
+                        _lab24, [False, True, True] + [False] * 7, set())
+        check("uncertain (mixed) windows inherit their nearest certain label",
+              {t["raw"] for t in _turns25}
+              == {"SPEAKER_00", "SPEAKER_02", "SPEAKER_03"})
+        # Whole-region corroboration fingerprints are EXCLUDED from the
+        # timeline: their span duplicates the region's own short windows, so
+        # including them would stretch a turn backwards over a speaker change.
+        _turns26 = _tfw(_regions24, list(range(10)), _owners24, _wt24,
+                        _lab24, _unc24, {5})
+        check("whole-region corroborating windows never enter the timeline",
+              max(t["end"] - t["start"] for t in _turns26) <= 3.5
+              and {t["raw"] for t in _turns26}
+              == {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02", "SPEAKER_03"})
+        # A region whose short windows ALL failed embedding still keeps its
+        # timeline presence via the whole-region fingerprint (the old vote
+        # kept that region alive; dropping it would silently shorten the map).
+        check("a region without short windows keeps its fingerprint turn",
+              _tfw([(0.0, 10.0)], [0], [0], [(0.0, 5.0)], [4], [False], {0})
+              == [{"start": 0.0, "end": 5.0, "raw": "SPEAKER_04"}])
+        check("no kept windows at all → empty timeline (caller falls back)",
+              _tfw([(0.0, 10.0)], [], [], [], [], [], set()) == [])
+    _s3_24 = inspect.getsource(_npl.step3_diarization)
+    check("the old per-region majority vote is gone from step3",
+          "by_region" not in _s3_24 and "all_region" not in _s3_24)
+    check("step3 records window times for the timeline builder",
+          "win_times" in _s3_24
+          and "_turns_from_windows(regions, kept, owners, win_times" in _s3_24)
+    check("step3 names any cluster that never reached the timeline",
+          "never reached the" in _s3_24
+          and "cluster_report.csv" in _s3_24)
+
+check("app.py pins an explicit waveform option for every Audio player",
+      "waveform_options" in _APP
+      and "gr.WaveformOptions" in _APP)
+_aud24 = [l for l in _APP.splitlines() if "gr.Audio(" in l]
+_wf24 = []
+for _l in _aud24:
+    _i24 = _APP.find(_l)
+    _wf24.append("**_WAVE" in _APP[_i24:_i24 + 400])
+check(f"…all {len(_aud24)} gr.Audio widget(s) carry **_WAVE",
+      len(_aud24) == 6 and all(_wf24))
+check("…the waveform is pinned once, shared, with the glass theme colors",
+      _APP.count("_WAVE = {\"waveform_options\"") == 1
+      and "#a855f7" in _APP)
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

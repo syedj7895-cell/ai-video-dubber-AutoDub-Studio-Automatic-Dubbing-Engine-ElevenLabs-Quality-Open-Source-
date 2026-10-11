@@ -1888,6 +1888,81 @@ def _write_csv(path: Path, header: List[str], rows: List[List]) -> None:
         writer.writerows(rows)
 
 
+def _turns_from_windows(regions, kept, owners, win_times, labels,
+                        uncertain, whole_idx):
+    """Rebuild the speaker timeline from per-window cluster labels (finding 19).
+
+    A VAD region is speech-vs-silence, NOT one person: the old builder gave
+    EVERY region its single most-voted label, so a speaker who only interjects
+    inside a longer region never won a region and vanished from the timeline —
+    4 clean clusters rendered as 2 voices in production (5-speaker corpus,
+    27 regions, 158 windows). Here each region keeps EVERY cluster identity:
+
+      * windows are walked in time order (whole-region corroboration
+        fingerprints are excluded — their span duplicates the region's own
+        short windows, they exist only to flag UNCERTAIN),
+      * an uncertain (mixed) window INHERITS its nearest certain neighbour's
+        label instead of erasing its region's minority,
+      * every maximal run of consecutive same-label windows becomes one turn,
+        clipped where the next run begins (windows overlap by the hop).
+
+    Downstream stays contract-identical: a list of
+    {"start": float, "end": float, "raw": "SPEAKER_NN"} dicts. Pure function —
+    no audio, no model, no log — so the selftest can drive it directly.
+
+    `kept` maps position → seg index (as returned by `_campplus_embed`); only
+    the short windows enter the timeline, and a region whose short windows
+    were ALL dropped falls back to its kept whole-region fingerprint (the old
+    vote kept that region alive and dropping it would silently shorten the
+    timeline).
+    """
+    from collections import Counter
+    per_region: Dict[int, List[tuple]] = {}
+    for pos, wi in enumerate(kept):
+        if wi in whole_idx:
+            continue
+        per_region.setdefault(owners[wi], []).append(
+            (*win_times[wi], int(labels[pos]), bool(uncertain[pos])))
+    for pos, wi in enumerate(kept):                  # fallback: whole fingerprints
+        if wi in whole_idx and not per_region.get(owners[wi]):
+            per_region.setdefault(owners[wi], []).append(
+                (*win_times[wi], int(labels[pos]), bool(uncertain[pos])))
+
+    turns: List[dict] = []
+    for ri, (a, b) in enumerate(regions):
+        wins = sorted(per_region.get(ri, []))
+        if not wins:
+            continue
+        certain_pos = [i for i, w in enumerate(wins) if not w[3]]
+        if certain_pos:
+            fallback = Counter(wins[i][2] for i in certain_pos).most_common(1)[0][0]
+        else:
+            fallback = Counter(w[2] for w in wins).most_common(1)[0][0]
+        resolved: List[int] = []
+        for i, w in enumerate(wins):
+            if not w[3]:
+                resolved.append(w[2])
+            elif certain_pos:                        # inherit nearest certain
+                near = min(certain_pos, key=lambda j: abs(j - i))
+                resolved.append(wins[near][2])
+            else:
+                resolved.append(fallback)
+        runs: List[List] = []                        # [start, end, label]
+        for w, lab in zip(wins, resolved):
+            if runs and runs[-1][2] == lab:
+                runs[-1][1] = max(runs[-1][1], w[1])
+            else:
+                runs.append([w[0], w[1], lab])
+        for i, (st, en, lab) in enumerate(runs):
+            if i + 1 < len(runs):                    # windows overlap by hop
+                en = min(en, runs[i + 1][0])
+            if en <= st:                             # clipped to nothing
+                continue
+            turns.append({"start": max(a, float(st)), "end": min(b, float(en)),
+                          "raw": f"SPEAKER_{lab:02d}"})
+    return turns
+
+
 def step3_diarization(hf_token: Optional[str],
                       original_srt_path: Optional[str],
                       log: Log,
@@ -1984,12 +2059,14 @@ def step3_diarization(hf_token: Optional[str],
     segs: List = []
     owners: List[int] = []              # region index per window
     win_durs: List[float] = []          # seconds per window, parallel to segs
+    win_times: List[tuple] = []         # (start_s, end_s) per window, parallel
     whole_idx: set = set()              # seg indices spanning a whole region
     for ri, (a, b) in enumerate(regions):
         if (b - a) < 0.4:
             segs.append(mono[int(a * sr):int(b * sr)])
             owners.append(ri)
             win_durs.append(float(b - a))
+            win_times.append((float(a), float(b)))
             continue
         t = a
         while t < b - 0.3:
@@ -1997,6 +2074,7 @@ def step3_diarization(hf_token: Optional[str],
             segs.append(mono[int(t * sr):int(e * sr)])
             owners.append(ri)
             win_durs.append(float(e - t))
+            win_times.append((float(t), float(e)))
             t += hop_s
         if (b - a) >= EMB_WHOLE_MIN_S:
             e = min(b, a + EMB_WHOLE_MAX_S)
@@ -2004,6 +2082,7 @@ def step3_diarization(hf_token: Optional[str],
             segs.append(mono[int(a * sr):int(e * sr)])
             owners.append(ri)
             win_durs.append(float(e - a))
+            win_times.append((float(a), float(e)))
     log(f"✂ {len(regions)} region(s) → {len(segs)} embedding window(s) "
         f"· {win_s:.1f}s window / {hop_s:.1f}s hop")
 
@@ -2013,12 +2092,13 @@ def step3_diarization(hf_token: Optional[str],
     del sv_model
     log("   " + clear_gpu_cache())
 
-    # ── ③ cluster → cleanup → one speaker per VAD region (majority vote) ─────
+    # ── ③ cluster → cleanup → window-run timeline (per-region runs) ──────────
     # The cleanup pass (MERGE / FOLD / KEEP + mixed-window flags) runs BEFORE
     # any counting: the old pipeline trusted the raw cut, so one fragmented
-    # voice became Speakers 4–8 (finding 17). Uncertain windows keep their
-    # label for the timeline but don't vote — unless a region holds nothing
-    # else, because the timeline must stay complete.
+    # voice became Speakers 4–8 (finding 17). The timeline then keeps EVERY
+    # cluster identity: each VAD region is walked window by window and split
+    # at speaker changes instead of being majority-voted to one label, which
+    # silently erased interjecting voices (4 clusters → 2 voices, finding 19).
     _CLUSTER_REPORT.clear()
     labels = _cluster_speakers(embs, int(expected_speakers or 0), log)
     turns: List[dict] = []
@@ -2040,18 +2120,8 @@ def step3_diarization(hf_token: Optional[str],
             maj = certain.get(owners[wi])
             if maj and maj.most_common(1)[0][0] != int(labels[pos]):
                 uncertain[pos] = True
-        by_region: Dict[int, Counter] = defaultdict(Counter)
-        all_region: Dict[int, Counter] = defaultdict(Counter)
-        for pos, (wi, lab) in enumerate(zip(kept, labels.tolist())):
-            all_region[owners[wi]][int(lab)] += 1
-            if not uncertain[pos]:
-                by_region[owners[wi]][int(lab)] += 1
-        for ri, (a, b) in enumerate(regions):
-            votes = by_region.get(ri) or all_region.get(ri)
-            if not votes:
-                continue
-            turns.append({"start": float(a), "end": float(b),
-                          "raw": f"SPEAKER_{votes.most_common(1)[0][0]:02d}"})
+        turns = _turns_from_windows(regions, kept, owners, win_times,
+                                    labels.tolist(), uncertain, whole_idx)
     if not turns:
         log("   ⚠ no speaker embedding survived — treating the track as one voice")
         turns = [{"start": 0.0, "end": mono.size / sr, "raw": "SPEAKER_00"}]
@@ -2064,6 +2134,27 @@ def step3_diarization(hf_token: Optional[str],
             "more speakers, set Tab 2's 👥 Expected speakers to the real "
             "count (hard floor) and re-run Step 3; the cut decisions are "
             "logged in outputs/cluster_report.csv.")
+    # Any cluster whose windows NEVER reached the timeline is an erasure in
+    # progress (every one of its windows was mixed/uncertain and inherited a
+    # neighbour). Name it with its share of the audio so it's actionable
+    # instead of a silent 1-voice dub.
+    if len(labels):
+        turn_raws = {t["raw"] for t in turns}
+        lab_durs: Dict[int, float] = defaultdict(float)
+        for pos, wi in enumerate(kept):
+            if wi in whole_idx:
+                continue
+            lab_durs[int(labels[pos])] += win_durs[wi]
+        lost = [c for c in sorted(lab_durs)
+                if f"SPEAKER_{c:02d}" not in turn_raws]
+        if lost:
+            detail = ", ".join(
+                f"SPEAKER_{c:02d} ({lab_durs[c]:.1f}s)" for c in lost)
+            log(f"   ⚠ cluster(s) with no clean window never reached the "
+                f"timeline: {detail} — every window of theirs was "
+                f"mixed/uncertain (overlapping speech); check "
+                f"outputs/cluster_report.csv and consider 👥 Expected "
+                f"speakers = {len(lab_durs)}.")
 
     # ── cross-reference with the ORIGINAL SRT timeline ────────────────────
     if original_srt_path and Path(original_srt_path).exists():
