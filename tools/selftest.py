@@ -2576,6 +2576,51 @@ check("…the waveform is pinned once, shared, with the glass theme colors",
       _APP.count("_WAVE = {\"waveform_options\"") == 1
       and "#a855f7" in _APP)
 
+# ── § 25 · finding 20 · the 👥 hint must actually decide the count ─────────────
+# (a) A stale diarization_map.json claiming expected_speakers = N while holding
+#     a different number of speakers matched the dropdown forever (same hint,
+#     wrong SIZE) and returned without clustering; (b) hint > surviving
+#     embedding windows fell to auto-detect SILENTLY; (c) a cluster whose turns
+#     never overlapped an original-SRT cue got NO canonical name and folded
+#     into Speaker1 — 5 clusters rendered as 3 identities, and with a cloning
+#     engine that cluster's lines were synthesized from Speaker1's (male)
+#     clone prompt: a mixed-gender original becoming an all-male dub.
+if _npl is not None:
+    _dcu = getattr(_npl, "_diar_cache_usable", None)
+    check("the diarization cache has a testable staleness guard", callable(_dcu))
+    if callable(_dcu):
+        _map5 = {"expected_speakers": 5,
+                 "speakers": {f"Speaker{i}": {} for i in range(1, 6)}}
+        _map3 = {"expected_speakers": 5,
+                 "speakers": {f"Speaker{i}": {} for i in range(1, 4)}}
+        check("…matching hint AND matching size → cache usable",
+              _dcu(_map5, 5) is True)
+        check("…same hint but wrong SIZE (5 claimed, 3 held) → re-cluster",
+              _dcu(_map3, 5) is False)
+        check("…hint changed (4 cached, 5 wanted) → re-cluster",
+              _dcu({**_map5, "expected_speakers": 4}, 5) is False)
+        check("…auto run accepts a stored auto map",
+              _dcu({"expected_speakers": 0,
+                    "speakers": {"Speaker1": {}, "Speaker2": {}}}, 0) is True)
+        check("…auto and hint maps never satisfy each other",
+              _dcu(_map5, 0) is False
+              and _dcu({"expected_speakers": 0, "speakers": {}}, 5) is False)
+        check("…a malformed/empty cache never satisfies a real hint",
+              _dcu({}, 5) is False)
+    _cs25 = inspect.getsource(_npl._cluster_speakers)
+    check("hint > kept windows warns instead of silently auto-detecting",
+          "hint > n" in _cs25 and "INSTEAD of the hard" in _cs25)
+    _s3_25 = inspect.getsource(_npl.step3_diarization)
+    check("step3's cache hit goes through the staleness guard",
+          "_diar_cache_usable(cached, n_want)" in _s3_25
+          and "Cached map is stale" in _s3_25)
+    check("…cue-less clusters keep their own identity tag (no Speaker1 fold)",
+          "won no original-SRT cue overlap" in _s3_25
+          and "ranked = ranked + missed" in _s3_25
+          and 'canon.get(t["raw"], "Speaker1")' in _s3_25)
+    check("…step3 logs the female/male/undetermined cast summary",
+          "gender summary →" in _s3_25)
+
 passed = sum(results)
 print(f"\n{passed}/{len(results)} checks passed")
 sys.exit(0 if passed == len(results) else 1)

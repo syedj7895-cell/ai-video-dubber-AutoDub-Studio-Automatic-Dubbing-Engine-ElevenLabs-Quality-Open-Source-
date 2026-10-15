@@ -1689,6 +1689,16 @@ def _cluster_speakers(embs, n_hint: int, log: Log):
         log(f"   agglomerative clustering → {k} speaker cluster(s) "
             f"· expected-speakers hint")
         return np.asarray(lab, dtype=int)
+    if hint > n:
+        # A cluster cannot exist without at least one surviving embedding
+        # window, so the hard hint would crash AgglomerativeClustering here —
+        # auto-detect runs INSTEAD, silently delivering another count
+        # (finding 20). Say so loudly; the window count above names the cause.
+        log(f"   ⚠ 👥 Expected speakers = {hint} but only {n} embedding "
+            f"window(s) survived — running auto-detect INSTEAD of the hard "
+            f"hint. If the speaker count comes out wrong, this is why; check "
+            f"the window count above (short audio / dropped windows) and "
+            f"re-run Step 3.")
 
     # Auto: fit EVERY candidate cut, score all of them, choose the best —
     # never "the first one that produced a legal-looking group count".
@@ -1963,6 +1973,24 @@ def _turns_from_windows(regions, kept, owners, win_times, labels,
     return turns
 
 
+def _diar_cache_usable(cached: dict, n_want: int) -> bool:
+    """True when `diarization_map.json` may be reused for a run wanting `n_want`.
+
+    The cache used to compare ONLY the stored hint (`n_cached == n_want`), so a
+    map written by an older build that claimed 👥 Expected speakers = 5 but
+    actually produced 3 speakers kept returning forever: the dropdown said 5,
+    the cache said 5, "match" — and the 3-speaker map survived every re-run
+    with zero clustering (finding 20). The map must ALSO actually contain
+    `n_want` speakers, or it is stale by definition. `n_want == 0` (auto-
+    detect) accepts any stored count, as before.
+    """
+    n_have = len((cached or {}).get("speakers") or {})
+    n_want = int(n_want or 0)
+    if int((cached or {}).get("expected_speakers") or 0) != n_want:
+        return False
+    return n_want == 0 or n_have == n_want
+
+
 def step3_diarization(hf_token: Optional[str],
                       original_srt_path: Optional[str],
                       log: Log,
@@ -1984,7 +2012,7 @@ def step3_diarization(hf_token: Optional[str],
         cached = json.loads(DIARIZATION_JSON.read_text(encoding="utf-8"))
         n_cached = int(cached.get("expected_speakers") or 0)
         n_want = int(expected_speakers or 0)
-        if n_cached == n_want:
+        if _diar_cache_usable(cached, n_want):
             # Surface the CACHED count: a stale map silently keeping the old
             # speaker count is invisible unless the log says so.
             log(f"↩ Step 3 cached (diarization_map.json) — skipping · "
@@ -1994,9 +2022,18 @@ def step3_diarization(hf_token: Optional[str],
         # The dropdown is only actionable if CHANGING it re-runs the cluster —
         # otherwise the cached map keeps the old count forever. Speaker labels
         # are baked into Steps 4–8, so their caches go too.
-        log(f"♻ Expected speakers changed ({n_cached or 'auto'} → "
-            f"{n_want or 'auto'}) — re-running Step 3 clustering and "
-            f"clearing the speaker-dependent Steps 4–8 caches.")
+        if n_cached == n_want:
+            # Same hint, wrong SIZE: the map claims 👥 = N but holds another
+            # number of speakers (an older build's collapse, finding 20).
+            log(f"♻ Cached map is stale — it holds "
+                f"{len(cached.get('speakers', {}))} speaker(s) but 👥 "
+                f"Expected speakers = {n_want or 'auto'} — re-running Step 3 "
+                f"clustering and clearing the speaker-dependent Steps 4–8 "
+                f"caches.")
+        else:
+            log(f"♻ Expected speakers changed ({n_cached or 'auto'} → "
+                f"{n_want or 'auto'}) — re-running Step 3 clustering and "
+                f"clearing the speaker-dependent Steps 4–8 caches.")
         for _p in (EMOTION_LOG_TXT, EMOTION_GRID_JSON, FINAL_SCRIPT_JSON,
                    SPEAKER_SCRIPTS_JSON, TTS_REPORT_JSON, FINAL_MIX_WAV,
                    FINAL_VIDEO_MP4, FINAL_VOCALS_WAV):
@@ -2178,8 +2215,23 @@ def step3_diarization(hf_token: Optional[str],
             raw_totals[k] += v
         cue_rows.append({**c, "raw": best})
 
-    # canonical identity tags — most total speech becomes Speaker1
+    # canonical identity tags — most total speech becomes Speaker1. A cluster
+    # whose turns NEVER overlap an original-SRT cue earns nothing in
+    # `raw_totals`; without the duration-ranked tail below it got NO canonical
+    # name, so its cues and turns silently folded into `Speaker1` (5 clusters
+    # rendered as 3 identities — and a female cluster's lines re-cast with
+    # Speaker1's male clone prompt, finding 20).
     ranked = sorted(raw_totals.items(), key=lambda kv: -kv[1])
+    turn_secs: Dict[str, float] = defaultdict(float)
+    for t in turns:
+        turn_secs[t["raw"]] += float(t["end"]) - float(t["start"])
+    missed = sorted(((r, sec) for r, sec in turn_secs.items()
+                     if r not in raw_totals), key=lambda kv: -kv[1])
+    if missed:
+        log(f"   ⚠ {len(missed)} voice(s) won no original-SRT cue overlap — "
+            f"kept as their own identity tags by speech duration: "
+            + ", ".join(f"{r} ({sec:.1f}s)" for r, sec in missed))
+    ranked = ranked + missed
     canon = {raw: f"Speaker{i + 1}" for i, (raw, _) in enumerate(ranked)}
     # optional user hint: keep the N largest voice clusters and fold the
     # rest into their nearest big cluster (temporal-overlap affinity)
@@ -2226,6 +2278,13 @@ def step3_diarization(hf_token: Optional[str],
     # ── gender profiling — casting must not be a coin flip ────────────────
     log("♀♂ Profiling speaker pitch so voices can be gender-matched …")
     speakers = profile_speakers(speakers, log)
+    n_fem = sum(1 for i in speakers.values()
+                if str((i or {}).get("gender") or "") == "female")
+    n_mal = sum(1 for i in speakers.values()
+                if str((i or {}).get("gender") or "") == "male")
+    log(f"♀♂ gender summary → {n_fem} female · {n_mal} male · "
+        f"{len(speakers) - n_fem - n_mal} undetermined "
+        f"(override any row in Tab 2 before Step 7)")
 
     result = {"model": DIAR_ENGINE, "speakers": speakers, "cues": cue_rows,
               "expected_speakers": int(expected_speakers or 0)}
